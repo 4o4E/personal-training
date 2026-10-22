@@ -132,6 +132,22 @@ class TrainingRepository(
         }
         enqueueSync()
     }
+    /** 一次确认对应完整一轮，事务中验证全部引用，避免只保存分化却缺少部分训练日。 */
+    suspend fun saveRound(program: Program, plans: List<Plan>) = withContext(Dispatchers.IO) {
+        initialize()
+        gate.withLock {
+            val documents = listOf(document(Kind.program, program.id, program)) + plans.map { document(Kind.plan, it.id, it) }
+            val combined = cache.values.associate { it.document.key() to it.document } + documents.associateBy { it.key() }
+            documents.forEach { value ->
+                validateDocument(value, { kind -> combined.values.filter { it.kind == kind && !it.deleted } }, { kind, id -> combined["${kind.name}/$id"] })
+            }
+            val entries = documents.map { Cached(it, true) }
+            database.withTransaction { dao.putAll(entries.map { it.row() }) }
+            install(entries)
+        }
+        enqueueSync()
+    }
+
     suspend fun remove(original: Document) = save(original.copy(deleted = true), original)
 
     /** 实际组与计时在同一事务内更新；读取和修改也在同一锁内，快速连续操作不会互相覆盖。 */

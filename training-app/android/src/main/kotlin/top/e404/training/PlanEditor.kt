@@ -1,12 +1,10 @@
 package top.e404.training
 
-import android.app.DatePickerDialog
 import androidx.compose.foundation.layout.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import kotlinx.serialization.builtins.nullable
 import java.time.LocalDate
@@ -60,14 +58,15 @@ import top.e404.training.shared.*
     if (details) ExerciseDetail(exercise, state, viewModel.repository) { details = false }
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable fun PlanEditor(original: Document, state: AppData, viewModel: TrainingViewModel, onDismiss: () -> Unit) {
     var draft by rememberSaveable(stateSaver = jsonSaver(Plan.serializer())) { mutableStateOf(original.value<Plan>()) }
+    var choosingDate by rememberSaveable { mutableStateOf(false) }
     var pickerType by rememberSaveable { mutableStateOf<String?>(null) }
     var replacingId by rememberSaveable { mutableStateOf<String?>(null) }
     var itemDraft by rememberSaveable(stateSaver = jsonSaver(PlanItem.serializer().nullable)) { mutableStateOf<PlanItem?>(null) }
     var itemPosition by rememberSaveable { mutableStateOf(0) }
     var details by remember { mutableStateOf<Exercise?>(null) }
-    val context = LocalContext.current
     val programs = remember(state.documents[Kind.program]) { state.records(Kind.program).map { it.value<Program>() } }
     val gyms = remember(state.documents[Kind.gym]) { state.records(Kind.gym).map { it.value<Gym>() } }
     val exercises = remember(state.documents[Kind.exercise]) { state.records(Kind.exercise).associate { it.id to it.value<Exercise>() } }
@@ -86,10 +85,7 @@ import top.e404.training.shared.*
             draft = draft.copy(gymId = id, items = draft.items.map { it.copy(equipmentId = null) })
         })
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            OutlinedButton(onClick = {
-                val day = draft.date?.let(LocalDate::parse) ?: LocalDate.now(ZoneOffset.ofHours(8))
-                DatePickerDialog(context, { _, year, month, date -> draft = draft.copy(date = LocalDate.of(year, month + 1, date).toString()) }, day.year, day.monthValue - 1, day.dayOfMonth).show()
-            }) { Text(draft.date ?: "指定训练日期") }
+            OutlinedButton(onClick = { choosingDate = true }) { Text(draft.date ?: "指定训练日期") }
             if (draft.date != null) TextButton(onClick = { draft = draft.copy(date = null) }) { Text("清除日期") }
         }
         Text(if (draft.date == null) "未指定日期，按分化顺序安排，不假定每天训练。" else "休息不会自动跳过这次训练。", style = MaterialTheme.typography.bodySmall)
@@ -133,6 +129,17 @@ import top.e404.training.shared.*
             draft = draft.copy(items = remaining.toMutableList().apply { add(position, updated) })
             itemDraft = null; replacingId = null
         }
+    }
+    if (choosingDate) {
+        val day = draft.date?.let(LocalDate::parse) ?: LocalDate.now(ZoneOffset.ofHours(8))
+        val picker = rememberDatePickerState(initialSelectedDateMillis = day.toEpochDay() * 86_400_000L)
+        DatePickerDialog(onDismissRequest = { choosingDate = false },
+            confirmButton = { TextButton(enabled = picker.selectedDateMillis != null, onClick = {
+                draft = draft.copy(date = LocalDate.ofEpochDay(picker.selectedDateMillis!! / 86_400_000L).toString())
+                choosingDate = false
+            }) { Text("确定日期") } },
+            dismissButton = { TextButton(onClick = { choosingDate = false }) { Text("取消") } }
+        ) { DatePicker(picker) }
     }
     details?.let { ExerciseDetail(it, state, viewModel.repository) { details = null } }
 }

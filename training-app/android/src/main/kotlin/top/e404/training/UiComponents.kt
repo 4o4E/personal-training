@@ -33,14 +33,16 @@ fun numericText(value: Double): String = if (value % 1.0 == 0.0) value.toLong().
 fun intInput(text: String, name: String): Int = text.toIntOrNull() ?: throw IllegalArgumentException("请输入有效的$name")
 fun doubleInput(text: String, name: String): Double = text.toDoubleOrNull() ?: throw IllegalArgumentException("请输入有效的$name")
 
-@Composable fun FormDialog(title: String, onDismiss: () -> Unit, onSave: (() -> Unit)? = null, content: @Composable ColumnScope.() -> Unit) {
-    Dialog(onDismissRequest = onDismiss, properties = DialogProperties(usePlatformDefaultWidth = false)) {
+@Composable fun FormDialog(title: String, onDismiss: () -> Unit, onSave: (() -> Unit)? = null, dismissLabel: String = "关闭", dismissOnClickOutside: Boolean = true, scrollKey: Int = 0, content: @Composable ColumnScope.() -> Unit) {
+    val scroll = rememberScrollState()
+    LaunchedEffect(scrollKey) { scroll.scrollTo(0) }
+    Dialog(onDismissRequest = onDismiss, properties = DialogProperties(usePlatformDefaultWidth = false, dismissOnClickOutside = dismissOnClickOutside)) {
         Surface(modifier = Modifier.fillMaxWidth(.96f).fillMaxHeight(.92f), shape = MaterialTheme.shapes.large) {
             Column(Modifier.padding(16.dp)) {
                 Text(title, style = MaterialTheme.typography.titleLarge)
-                Column(Modifier.weight(1f).verticalScroll(rememberScrollState()).padding(vertical = 12.dp), verticalArrangement = Arrangement.spacedBy(12.dp), content = content)
+                Column(Modifier.weight(1f).verticalScroll(scroll).padding(vertical = 12.dp), verticalArrangement = Arrangement.spacedBy(12.dp), content = content)
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
-                    TextButton(onClick = onDismiss) { Text("关闭") }
+                    TextButton(onClick = onDismiss) { Text(dismissLabel) }
                     if (onSave != null) Button(onClick = onSave) { Text("保存") }
                 }
             }
@@ -102,13 +104,15 @@ private data class BodyPath(val muscle: String, val path: Path)
             BodyPath(shape.muscle, path)
         } } }
     }
+    val selectedColor = MaterialTheme.colorScheme.primary
+    val otherColor = MaterialTheme.colorScheme.outline
     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
         listOf("front" to "正面", "back" to "背面").forEach { (pose, name) ->
             Column(Modifier.weight(1f)) {
                 Text(name, style = MaterialTheme.typography.labelMedium)
                 Canvas(Modifier.fillMaxWidth().height(260.dp)) {
                     scale(size.width / 1000f, size.height / 2200f, Offset.Zero) {
-                        poses.getValue(pose).forEach { drawPath(it.path, if (it.muscle in keys) Color(0xFFE06E69) else Color(0xFF9DAAA6)) }
+                        poses.getValue(pose).forEach { drawPath(it.path, if (it.muscle in keys) selectedColor else otherColor) }
                     }
                 }
             }
@@ -117,7 +121,7 @@ private data class BodyPath(val muscle: String, val path: Path)
 }
 @Composable fun MediaImage(media: Media, repository: TrainingRepository, modifier: Modifier = Modifier) {
     SubcomposeAsyncImage(model = repository.mediaModel(media), contentDescription = media.name,
-        modifier = modifier.background(if (media.mimeType == "image/svg+xml") Color(0xFF273E48) else Color(0xFFF2F5F4)),
+        modifier = modifier.background(if (media.mimeType == "image/svg+xml") Color(0xFF273E48) else MaterialTheme.colorScheme.surfaceContainerHighest),
         loading = { Box(Modifier.padding(24.dp)) { CircularProgressIndicator() } },
         error = { Text("素材尚未下载或无法读取", Modifier.padding(16.dp), color = MaterialTheme.colorScheme.error) })
 }

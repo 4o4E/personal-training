@@ -11,6 +11,7 @@ import coil.decode.SvgDecoder
 class TrainingApplication : Application(), ImageLoaderFactory {
     val database: TrainingDatabase by lazy { Room.databaseBuilder(this, TrainingDatabase::class.java, "training.db").build() }
     val vault: ConnectionVault by lazy { ConnectionVault(this) }
+    val preferences: AppPreferences by lazy { AppPreferences(this) }
     val repository: TrainingRepository by lazy { TrainingRepository(this, database, vault) }
     override fun onCreate() { super.onCreate(); TimerEngine.createChannel(this) }
     override fun newImageLoader(): ImageLoader = ImageLoader.Builder(this).components {

@@ -30,6 +30,11 @@ android {
         isDebuggable = false
         if (releaseSigningPath != null) signingConfig = signingConfigs.getByName("release")
     }
+    buildTypes.getByName("debug") {
+        applicationIdSuffix = ".debug"
+        resValue("string", "app_name", "个人训练·验证")
+    }
+    buildTypes.getByName("release").resValue("string", "app_name", "个人训练")
     buildFeatures { compose = true; buildConfig = true }
     compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
     sourceSets["main"].assets.srcDir(rootProject.file("catalog"))

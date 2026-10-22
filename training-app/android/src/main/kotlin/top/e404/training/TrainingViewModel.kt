@@ -31,7 +31,14 @@ class TrainingViewModel(application: Application) : AndroidViewModel(application
         }
     }
     fun save(doc: Document, original: Document, done: () -> Unit = {}) = action { repository.save(doc, original); done() }
-    fun start(plan: Plan) = action { repository.beginSession(plan) }
+    fun start(plan: Plan) = action {
+        repository.beginSession(plan)
+        plan.programId?.let { programId ->
+            val preferences = getApplication<TrainingApplication>().preferences
+            if (plan.date == null) preferences.selectPlans(programId, mapOf(plan.slotId!! to plan.id))
+            else preferences.selectProgram(programId)
+        }
+    }
     fun finish(sessionId: String, cancelled: Boolean) = action {
         repository.updateSession(sessionId) { session, _ ->
             require(cancelled || session.results.isNotEmpty()) { "没有完成任何组，请选择取消训练" }

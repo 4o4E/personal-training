@@ -19,7 +19,7 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import top.e404.training.shared.*
 
-@Composable fun SettingsScreen(state: AppData, viewModel: TrainingViewModel, permissionRevision: Int, onDismiss: () -> Unit) {
+@Composable fun SettingsScreen(state: AppData, viewModel: TrainingViewModel, permissionRevision: Int, preferences: AppPreferences, onDismiss: () -> Unit) {
     val context = LocalContext.current
     val repository = viewModel.repository
     val connection = remember { repository.vault.load() }
@@ -41,6 +41,11 @@ import top.e404.training.shared.*
     }
     val import = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri -> importUri = uri?.toString() }
     FormDialog("设置", onDismiss) {
+        val choices by preferences.data.collectAsState()
+        InfoCard("应用外观") {
+            Choice("深浅模式", choices.appearance, Appearance.entries.map { it to it.title }, preferences::appearance)
+            Text("默认跟随系统；切换外观不会重置训练、编辑内容或休息计时。", style = MaterialTheme.typography.bodySmall)
+        }
         AppUpdateCard()
         InfoCard("原生提醒权限") {
             Text(if (notifications) "通知权限已具备" else "通知尚未授权或提醒渠道被关闭", color = if (notifications) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error)
