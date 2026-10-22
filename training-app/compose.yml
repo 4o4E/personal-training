@@ -1,6 +1,6 @@
 services:
   training:
-    image: ghcr.io/${GHCR_REPOSITORY:?请填写 Actions 摘要中的 GHCR_REPOSITORY}:latest
+    image: ghcr.io/4o4e/personal-training:latest
     pull_policy: always
     restart: unless-stopped
     ports:

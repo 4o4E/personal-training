@@ -68,24 +68,23 @@ Linux：
 
 构建时执行现有服务端行为回归；容器启动和唯一 token 鉴权通过后才推送。Gradle 依赖使用构建层缓存，框架依赖、教学素材和业务代码分层，业务更新不要求重新下载全部教学素材。发布使用工作流自己的 `GITHUB_TOKEN` 和 `packages: write`，不需要另存发布 PAT。
 
-### 首次公开设置
+### 镜像访问
 
-GitHub 新建容器包默认是 Private。第一次推送生成包后，在 GitHub 的 Packages 中打开该包，进入 **Package settings → Change visibility → Public** 并确认，源码仓库继续保持 Private。包的可见性与源码仓库独立，公开镜像可以匿名下载；参见 [GHCR 官方说明](https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-container-registry)。
+公开镜像为 `ghcr.io/4o4e/personal-training:latest`，已经通过未登录 Docker 拉取检查。源码仓库保持 Private，镜像包为 Public；两者独立配置，参见 [GHCR 官方说明](https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-container-registry)。
 
-完成公开设置后，重新运行工作流。最后一步会使用空的 Docker 登录配置实际拉取镜像；没有公开时此检查失败，不会把需要登录的包视为已经满足匿名部署要求。
+公开的是可运行镜像，个人训练数据保存在部署服务器的数据卷；训练接口仍使用自己的唯一 token。CI 每次发布后使用空的 Docker 登录配置验证匿名拉取。
 
 ### 部署与更新
 
-1. 将 `training-app/compose.yml` 复制到服务器的固定部署目录，无需复制源码。
-2. 从发布任务的运行摘要复制 `GHCR_REPOSITORY` 内容，保存为部署目录中的 `.env`。该值由实际仓库生成，不包含 token。
-3. 公开镜像无需 `docker login`，在部署目录执行：
+1. 将 `training-app/compose.yml` 复制到服务器的固定部署目录，无需复制源码或填写镜像仓库参数。
+2. 在部署目录执行以下命令，无需 `docker login`：
 
 ```sh
 docker compose pull
 docker compose up -d
 ```
 
-以后更新也执行这两条命令。Compose 始终拉取 `ghcr.io/${GHCR_REPOSITORY}:latest`，资料位于 `training-data` 命名卷，不需要服务器本地构建。服务以非 root 用户运行，默认仅发布到服务器 `127.0.0.1:8080`，由 HTTPS 反向代理提供手机可访问的地址；家庭网络直连时需按实际网络修改端口绑定。
+以后更新也执行这两条命令。Compose 始终拉取 `ghcr.io/4o4e/personal-training:latest`，资料位于 `training-data` 命名卷，不需要服务器本地构建。服务以非 root 用户运行，默认仅发布到服务器 `127.0.0.1:8080`，由 HTTPS 反向代理提供手机可访问的地址；家庭网络直连时需按实际网络修改端口绑定。
 
 不配置 `TRAINING_TOKEN` 时，服务首次启动会自动生成唯一 token 并保存到 `/data/token`。在服务器本地取得后填入手机「设置」，不将其放进镜像、发布参数或聊天；持久卷保留数据库、素材和 token，更新镜像不清空资料。
 
@@ -135,7 +134,7 @@ python skills\training-assistant\scripts\training.py export training-backup.zip
 - 完成一组后返回桌面并息屏，系统实际发布休息结束普通通知；单侧拉伸计时结束也发布普通通知，类别为 `reminder`，音频用途为 `USAGE_NOTIFICATION`。
 - 通过系统图片选择器保存器械图片，并经接口取得实际 JPEG 内容。手机 ZIP 导出、合并导入及独立后端恢复均已执行；含器械图片的数据包有 919 份业务文档、443 份媒体文件，恢复后逐份比较图像内容一致，解压后的业务资料不包含连接凭据。
 
-工作流已通过 actionlint 检查，Compose 已用原生 Windows 工具实际解析，并验证缺少镜像仓库名时明确报错。源码仓库为私有的 [4o4E/personal-training](https://github.com/4o4E/personal-training)。当前电脑没有 Docker 服务；容器构建、GHCR 发布及公开匿名拉取由该仓库工作流执行，本机 ADB 联调连接不作为长期服务。
+工作流及 Compose 已完成配置检查，实际 [GitHub Actions 发布运行](https://github.com/4o4E/personal-training/actions/runs/39713658219) 已通过 Linux 容器构建、服务端回归、启动、鉴权、部署配置和未登录镜像拉取检查。源码仓库为私有的 [4o4E/personal-training](https://github.com/4o4E/personal-training)，GHCR 镜像公开；服务器由用户手动部署，本机 ADB 联调连接不作为长期服务。
 
 ## 动作素材
 

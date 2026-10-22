@@ -78,13 +78,7 @@ jobs:
 
       - name: 检查手动部署配置
         shell: bash
-        env:
-          IMAGE: ${{ steps.meta.outputs.tags }}
-        run: |
-          set -euo pipefail
-          repository="${IMAGE#ghcr.io/}"
-          export GHCR_REPOSITORY="${repository%:latest}"
-          docker compose --file training-app/compose.yml config --quiet
+        run: docker compose --file training-app/compose.yml config --quiet
 
       - name: 登录 GHCR
         uses: docker/login-action@v4
@@ -104,13 +98,10 @@ jobs:
         env:
           IMAGE: ${{ steps.meta.outputs.tags }}
         run: |
-          repository="${IMAGE#ghcr.io/}"
-          repository="${repository%:latest}"
           {
             printf '## 个人训练后端\n\n镜像：`%s`\n\n' "$IMAGE"
-            printf '源码仓库保持 Private，GHCR 镜像包使用 Public。首次发布后在包的 Package settings → Change visibility 中选择 Public；之后重新运行本工作流完成匿名拉取检查。\n\n'
-            printf '将仓库中的 `training-app/compose.yml` 放到部署目录，并将以下内容保存为同目录的 `.env`：\n\n'
-            printf '```dotenv\nGHCR_REPOSITORY=%s\n```\n\n' "$repository"
+            printf '源码仓库保持 Private，GHCR 镜像包为 Public，可匿名拉取。\n\n'
+            printf '将仓库中的 `training-app/compose.yml` 复制到固定部署目录，无需复制源码或配置镜像仓库参数。\n\n'
             printf '执行 `docker compose pull` 和 `docker compose up -d`。持久数据保存在命名卷中。\n'
           } >> "$GITHUB_STEP_SUMMARY"
 
