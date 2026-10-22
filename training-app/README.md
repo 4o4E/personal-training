@@ -164,6 +164,8 @@ python skills\training-assistant\scripts\training.py export training-backup.zip
 
 独立软件验证资料包含 10 条训练记录、8 个实际操作完成的力量组。暂停后端仍能记录，恢复后同步成功；手机导出与合并导入、CLI 导出及独立后端恢复均执行成功。928 份业务内容与 442 份素材逐项一致，原始 kg/lb 和开始时内容保持，备份不包含连接 token 或本机交互偏好。
 
+`v0.0.2` 的实际 [正式发布 CI](https://github.com/4o4E/personal-training/actions/runs/39769037369) 通过签名 APK 与后端同版本构建、Release 发布、复用 Release 后端包构建镜像、容器启动及鉴权、匿名镜像拉取；[普通提交 CI](https://github.com/4o4E/personal-training/actions/runs/39769036916) 仅执行检查。已下载公开 APK，核对应用标识、`0.0.2`／内部版本 `3`、更新清单 SHA-256，以及与 `0.0.1` 相同的签名证书。公开后端 ZIP 通过 Windows 启动脚本运行，健康请求为 200、未鉴权请求为 401、有效 token 请求为 200。发布时公开最新版本入口指向 [v0.0.2](https://github.com/4o4E/personal-training/releases/tag/v0.0.2)，镜像版本标签与 `latest` 摘要一致。
+
 ## 动作素材
 
 内置 416 项中文力量动作、23 项拉伸及实际图解。训练与拉伸使用插画或分帧图，不要求训练时访问第三方网站。
