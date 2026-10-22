@@ -1,116 +1,123 @@
-name: 发布个人训练后端镜像
+name: 检查与发布个人训练
 
 on:
   push:
-    paths:
-      - .github/workflows/publish-training-image.yml
-      - training-app/Dockerfile
-      - training-app/.dockerignore
-      - training-app/*.gradle.kts
-      - training-app/gradle.properties
-      - training-app/gradlew*
-      - training-app/gradle/**
-      - training-app/shared/**
-      - training-app/server/**
-      - training-app/catalog/**
-  workflow_dispatch:
+    branches: [main]
+    tags: ['v*']
+    paths: ['training-app/**', '.github/workflows/**']
+  pull_request:
+    paths: ['training-app/**', '.github/workflows/**']
+
+permissions:
+  contents: read
 
 concurrency:
-  group: training-image-${{ github.ref }}
-  cancel-in-progress: true
+  group: training-${{ github.ref_type == 'tag' && 'release' || github.ref }}
+  cancel-in-progress: ${{ github.ref_type != 'tag' }}
 
 jobs:
-  publish:
-    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+  build:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    permissions:
+      contents: write
+    defaults:
+      run:
+        working-directory: training-app
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-read-only: ${{ github.event_name == 'pull_request' }}
+      - name: 允许执行 Gradle
+        run: chmod +x gradlew
+      - name: 检查应用和后端
+        if: github.ref_type != 'tag'
+        run: ./gradlew :server:test :android:assembleDebug --no-daemon
+      - name: 同版本构建签名 APK 与后端
+        if: github.ref_type == 'tag'
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PATH: ${{ runner.temp }}/training-signing.keystore
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+        run: |
+          set -euo pipefail
+          trap 'rm -f "$ANDROID_KEYSTORE_PATH"' EXIT
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$ANDROID_KEYSTORE_PATH"
+          chmod 600 "$ANDROID_KEYSTORE_PATH"
+          ./gradlew -PreleaseVersion="${GITHUB_REF_NAME#v}" :server:test :server:distZip :android:assembleRelease --no-daemon
+          node tools/package-release.mjs "${GITHUB_REF_NAME#v}"
+      - name: 发布正式 Release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" release/*.apk release/*.zip release/update.json --verify-tag --title "$GITHUB_REF_NAME" --notes-file release/notes.md
+
+  image:
+    if: github.ref_type == 'tag'
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: read
       packages: write
     steps:
-      - name: 读取源码
-        uses: actions/checkout@v7
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
-
-      - name: 准备镜像构建器
-        uses: docker/setup-buildx-action@v4
-
-      - name: 生成实际仓库镜像地址
-        id: meta
+      - name: 下载实际 Release 后端包
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release download "$GITHUB_REF_NAME" --pattern 'personal-training-server-*.zip' --dir .release
+          unzip -q .release/*.zip -d .release/unpacked
+          node training-app/tools/prepare-image.mjs ".release/unpacked/server-${GITHUB_REF_NAME#v}/lib" .release/image
+      - uses: docker/setup-buildx-action@v4
+      - id: meta
         uses: docker/metadata-action@v6
         with:
           images: ghcr.io/${{ github.repository }}
-          tags: type=raw,value=latest
-
-      - name: 构建镜像并执行后端回归
+          tags: |
+            type=raw,value=${{ github.ref_name }}
+            type=raw,value=latest
+      - name: 组装 Release 运行镜像
         uses: docker/build-push-action@v7
         with:
-          context: ./training-app
-          file: ./training-app/Dockerfile
+          context: .release/image
+          file: training-app/Dockerfile
           platforms: linux/amd64
           load: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha,scope=training-backend
-          cache-to: type=gha,mode=max,scope=training-backend
-
-      - name: 检查容器启动与唯一 token 鉴权
-        shell: bash
-        env:
-          IMAGE: ${{ steps.meta.outputs.tags }}
-        run: |
-          set -euo pipefail
-          docker run --detach --name training-image-smoke --publish 127.0.0.1:18080:8080 "$IMAGE"
-          trap 'docker rm --force training-image-smoke >/dev/null' EXIT
-          for attempt in {1..30}; do
-            if curl --silent --fail http://127.0.0.1:18080/health >/dev/null; then
-              break
-            fi
-            sleep 1
-          done
-          curl --fail --silent --show-error http://127.0.0.1:18080/health | jq --exit-status '.status == "ok"'
-          status="$(curl --silent --output /dev/null --write-out '%{http_code}' http://127.0.0.1:18080/v1/history)"
-          test "$status" = 401
-          token="$(docker exec training-image-smoke cat /data/token)"
-          curl --fail --silent --show-error --header "Authorization: Bearer $token" http://127.0.0.1:18080/v1/history \
-            | jq --exit-status '.sessions == [] and .strengthSets == 0 and .stretchSets == 0'
-
-      - name: 检查手动部署配置
-        shell: bash
+          cache-from: type=gha,scope=training-runtime
+          cache-to: type=gha,mode=max,scope=training-runtime
+      - name: 实际启动及鉴权检查
+        run: bash training-app/tools/smoke-image.sh ghcr.io/4o4e/personal-training:${{ github.ref_name }}
+      - name: 检查部署配置
         run: docker compose --file training-app/compose.yml config --quiet
-
-      - name: 登录 GHCR
-        uses: docker/login-action@v4
+      - uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: 发布已检查的镜像
-        shell: bash
+      - name: 推送已验收镜像
         env:
-          IMAGE: ${{ steps.meta.outputs.tags }}
-        run: docker push "$IMAGE"
-
-      - name: 写入手动部署参数
-        shell: bash
-        env:
-          IMAGE: ${{ steps.meta.outputs.tags }}
+          TAGS: ${{ steps.meta.outputs.tags }}
         run: |
-          {
-            printf '## 个人训练后端\n\n镜像：`%s`\n\n' "$IMAGE"
-            printf '源码仓库保持 Private，GHCR 镜像包为 Public，可匿名拉取。\n\n'
-            printf '将仓库中的 `training-app/compose.yml` 复制到固定部署目录，无需复制源码或配置镜像仓库参数。\n\n'
-            printf '执行 `docker compose pull` 和 `docker compose up -d`。持久数据保存在命名卷中。\n'
-          } >> "$GITHUB_STEP_SUMMARY"
-
-      - name: 验证公开镜像可以匿名拉取
-        shell: bash
-        env:
-          IMAGE: ${{ steps.meta.outputs.tags }}
+          while IFS= read -r tag; do docker push "$tag"; done <<< "$TAGS"
+      - name: 匿名拉取验证
         run: |
-          set -euo pipefail
           configuration="$(mktemp -d)"
-          trap 'rm -rf -- "$configuration"' EXIT
-          docker --config "$configuration" pull "$IMAGE"
+          trap 'rm -rf "$configuration"' EXIT
+          docker --config "$configuration" pull ghcr.io/4o4e/personal-training:${{ github.ref_name }}
+      - name: 记录发布地址
+        run: |
+          printf 'Release: https://github.com/%s/releases/tag/%s\n\n镜像：`ghcr.io/4o4e/personal-training:%s` 和 `latest`\n\n手动部署：`docker compose pull && docker compose up -d`\n' "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME" "$GITHUB_REF_NAME" >> "$GITHUB_STEP_SUMMARY"

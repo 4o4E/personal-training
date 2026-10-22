@@ -5,6 +5,10 @@ plugins {
     id("org.jetbrains.kotlin.plugin.compose")
     id("com.google.devtools.ksp")
 }
+val releaseSigningPath = providers.environmentVariable("ANDROID_KEYSTORE_PATH").orNull
+gradle.taskGraph.whenReady {
+    if (hasTask(":android:assembleRelease")) require(releaseSigningPath != null) { "正式构建需要 ANDROID_KEYSTORE_PATH 及签名凭据" }
+}
 android {
     namespace = "top.e404.training"
     compileSdk = 36
@@ -13,8 +17,18 @@ android {
         applicationId = "top.e404.training"
         minSdk = 26
         targetSdk = 36
-        versionCode = 1
-        versionName = "1.0.0"
+        versionCode = rootProject.extra["androidVersionCode"] as Int
+        versionName = project.version.toString()
+    }
+    if (releaseSigningPath != null) signingConfigs.create("release") {
+        storeFile = file(releaseSigningPath)
+        storePassword = providers.environmentVariable("ANDROID_KEYSTORE_PASSWORD").get()
+        keyAlias = providers.environmentVariable("ANDROID_KEY_ALIAS").get()
+        keyPassword = storePassword
+    }
+    buildTypes.getByName("release") {
+        isDebuggable = false
+        if (releaseSigningPath != null) signingConfig = signingConfigs.getByName("release")
     }
     buildFeatures { compose = true; buildConfig = true }
     compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
@@ -25,6 +39,7 @@ kotlin { compilerOptions { jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarg
 ksp { arg("room.schemaLocation", file("schemas").absolutePath) }
 dependencies {
     implementation(project(":shared"))
+    implementation("androidx.core:core-ktx:1.17.0")
     implementation(platform("androidx.compose:compose-bom:2025.12.01"))
     implementation("androidx.activity:activity-compose:1.12.1")
     implementation("androidx.compose.material3:material3")

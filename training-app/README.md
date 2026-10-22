@@ -12,6 +12,7 @@ Android 原生训练应用、自有 Ktor 后端、SQLite 存储和项目级训�
 6. 每组按实际情况修改次数或读数，点击「完成一组」即保存并开始休息。计时固定显示在训练列表上方；切换应用和息屏后，到时唤醒应用并发送普通通知，不依赖网络或界面持续运行。
 7. 结束时选择完成或取消。未完成的目标组不计入历史，取消中已完成的组仍保留；只有明确完成才推进分化顺序。休息几天不会跳过部位。
 8. 「记录」查看实际组、原始重量单位、侧别、开始时计划和训练反馈。目标值与实际结果分开，过去的训练不会因修改未来计划而改变。
+9. 「设置 → 应用更新」检查最新正式版本，查看更新说明并下载。下载可以在离开设置后继续；完成后点击安装，通过安卓系统确认覆盖更新，保留原有资料。首次安装来源未授权时，允许「个人训练」安装应用，返回后再次点击安装。
 
 默认新力量动作 4 组，可以按实际情况调整；拉伸按动作自身的时长、次数和左右侧要求配置。更换具体器械不会把旧读数自动换算到另一种单位，需要确认该台器械的实际显示。
 
@@ -33,6 +34,16 @@ Linux 后端构建不需要 Android SDK：
 ```
 
 应用、共享类型和后端分别位于 `android/`、`shared/`、`server/`。Gradle 包装器随项目提供，不需要全局安装 Gradle。
+
+正式签名 APK 与后端 ZIP 可从 [Release](https://github.com/4o4E/personal-training/releases/latest) 下载，无需编译。后端 ZIP 包含 `bin/`、依赖和动作素材，解压后使用 JDK 21 运行 `bin/server`（Linux）或 `bin/server.bat`（Windows）。
+
+正式版本从 `v0.0.1` 开始，标签为 `vMAJOR.MINOR.PATCH`。本地正式构建设置 `ANDROID_KEYSTORE_PATH`、`ANDROID_KEYSTORE_PASSWORD`、`ANDROID_KEY_ALIAS` 后执行：
+
+```powershell
+.\gradlew.bat -PreleaseVersion=0.0.1 :server:test :server:distZip :android:assembleRelease
+```
+
+内部版本号为 `MAJOR × 1000000 + MINOR × 1000 + PATCH + 1`，次版本与修订号不超过 999。签名必须使用同一份密钥才能覆盖安装；密钥在仓库之外备份，不提交到 Git，CI 使用三个对应的签名 Secrets（密钥文件为 `ANDROID_KEYSTORE_BASE64`）。
 
 ## 运行后端
 
@@ -64,13 +75,13 @@ Linux：
 
 ## CI 镜像发布与手动部署
 
-源码保存在私有 GitHub 仓库，GHCR 镜像包公开。工作流位于根目录 `.github/workflows/publish-training-image.yml`，默认分支有后端变更时自动运行，也可以在 Actions 手动触发。镜像地址根据实际仓库生成并转为小写，发布 Linux amd64 的 `latest`。
+源码、GitHub Release 与 GHCR 镜像均公开，工作流位于根目录 `.github/workflows/publish-training-image.yml`。默认分支提交及拉取请求只检查应用与后端；推送 `vMAJOR.MINOR.PATCH` 标签才正式发布，普通提交不更新 Release 或镜像。
 
-构建时执行现有服务端行为回归；容器启动和唯一 token 鉴权通过后才推送。Gradle 依赖使用构建层缓存，框架依赖、教学素材和业务代码分层，业务更新不要求重新下载全部教学素材。发布使用工作流自己的 `GITHUB_TOKEN` 和 `packages: write`，不需要另存发布 PAT。
+正式发布在同一次 Gradle 执行中完成后端行为回归、签名 APK 与后端 ZIP，共享模块只构建一次并复用 Gradle 缓存。APK、后端 ZIP 和 `update.json` 发布到同一个 Release；随后镜像任务下载该 Release 的后端 ZIP，仅封装 JRE 和原始 JAR，Docker 内不包含 JDK、源码或 Gradle，也不重复编译。镜像保持框架依赖、教学素材和业务代码分层，通过实际启动与鉴权检查后推送版本标签和 `latest`。
 
 ### 镜像访问
 
-公开镜像为 `ghcr.io/4o4e/personal-training:latest`，已经通过未登录 Docker 拉取检查。源码仓库保持 Private，镜像包为 Public；两者独立配置，参见 [GHCR 官方说明](https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-container-registry)。
+公开镜像为 `ghcr.io/4o4e/personal-training:latest`，指定版本使用如 `ghcr.io/4o4e/personal-training:v0.0.1`。APK、更新资料、后端 ZIP 及镜像均无需登录 GitHub 即可下载或拉取。
 
 公开的是可运行镜像，个人训练数据保存在部署服务器的数据卷；训练接口仍使用自己的唯一 token。CI 每次发布后使用空的 Docker 登录配置验证匿名拉取。
 
@@ -87,6 +98,8 @@ docker compose up -d
 以后更新也执行这两条命令。Compose 始终拉取 `ghcr.io/4o4e/personal-training:latest`，资料位于 `training-data` 命名卷，不需要服务器本地构建。服务以非 root 用户运行，默认仅发布到服务器 `127.0.0.1:8080`，由 HTTPS 反向代理提供手机可访问的地址；家庭网络直连时需按实际网络修改端口绑定。
 
 不配置 `TRAINING_TOKEN` 时，服务首次启动会自动生成唯一 token 并保存到 `/data/token`。在服务器本地取得后填入手机「设置」，不将其放进镜像、发布参数或聊天；持久卷保留数据库、素材和 token，更新镜像不清空资料。
+
+容器运行用户为 `10001:10001`。预置配置使用命名卷；如果自行改为 `./training-data:/data` 这样的宿主目录绑定，需要先确保该目录及已有数据库文件归该用户所有，否则后端不能创建或更新 SQLite 数据库。健康检查地址为 `/health`，根路径不是网页首页。
 
 ## 助手操作 skill
 
@@ -134,7 +147,7 @@ python skills\training-assistant\scripts\training.py export training-backup.zip
 - 完成一组后返回桌面并息屏，系统实际发布休息结束普通通知；单侧拉伸计时结束也发布普通通知，类别为 `reminder`，音频用途为 `USAGE_NOTIFICATION`。
 - 通过系统图片选择器保存器械图片，并经接口取得实际 JPEG 内容。手机 ZIP 导出、合并导入及独立后端恢复均已执行；含器械图片的数据包有 919 份业务文档、443 份媒体文件，恢复后逐份比较图像内容一致，解压后的业务资料不包含连接凭据。
 
-工作流及 Compose 已完成配置检查，实际 [GitHub Actions 发布运行](https://github.com/4o4E/personal-training/actions/runs/39713658219) 已通过 Linux 容器构建、服务端回归、启动、鉴权、部署配置和未登录镜像拉取检查。源码仓库为私有的 [4o4E/personal-training](https://github.com/4o4E/personal-training)，GHCR 镜像公开；服务器由用户手动部署，本机 ADB 联调连接不作为长期服务。
+已有实际 GitHub Actions 运行通过容器构建、服务端回归、启动、鉴权、Compose 和未登录镜像拉取检查。源码仓库为公开的 [4o4E/personal-training](https://github.com/4o4E/personal-training)，正式 APK、后端及镜像按版本发布；服务器由用户手动部署，本机 ADB 联调连接不作为长期服务。
 
 ## 动作素材
 

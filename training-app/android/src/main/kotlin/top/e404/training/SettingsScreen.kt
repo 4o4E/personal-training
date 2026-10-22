@@ -41,6 +41,7 @@ import top.e404.training.shared.*
     }
     val import = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri -> importUri = uri?.toString() }
     FormDialog("设置", onDismiss) {
+        AppUpdateCard()
         InfoCard("原生提醒权限") {
             Text(if (notifications) "通知权限已具备" else "通知尚未授权或提醒渠道被关闭", color = if (notifications) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error)
             Text(if (exact) "定时唤醒权限已具备" else "需要允许定时唤醒", color = if (exact) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error)
