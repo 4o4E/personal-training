@@ -1,0 +1,15 @@
+services:
+  training:
+    image: ghcr.io/${GHCR_REPOSITORY:?请填写 Actions 摘要中的 GHCR_REPOSITORY}:latest
+    pull_policy: always
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8080:8080"
+    environment:
+      - TRAINING_DATA=/data
+      - PORT=8080
+      - TRAINING_TOKEN
+    volumes:
+      - training-data:/data
+volumes:
+  training-data:

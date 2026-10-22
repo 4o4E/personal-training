@@ -1,0 +1,12 @@
+.gradle/
+.kotlin/
+**/build/
+android/
+data/
+.env
+local.properties
+skills/
+docs/
+tools/
+**/*.keystore
+**/*.jks

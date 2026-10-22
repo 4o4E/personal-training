@@ -1,0 +1,33 @@
+schema: spec-driven
+
+context: |
+  Language: Chinese
+  All artifacts must be written in Chinese.
+  Keep OpenSpec structural headings and SHALL/MUST keywords in English.
+  This workspace contains personal sports records and a new personal training application.
+  Existing record/ and misports/ are independent data sources, not the application implementation.
+  The application is for one person's private use on Android.
+  The confirmed client choice is native Kotlin with Jetpack Compose; iOS is out of scope.
+  A future browser client is for data browsing, not a second training implementation.
+  Native Android timed reminders are a highest-priority requirement.
+  Confirmed requirements and architecture decisions belong to the official OpenSpec workflow.
+  Project engineering skills come from 4o4E/skills, ref feat/openspec-decisions.
+  Domain terms are maintained in GLOSSARY.md.
+  The confirmed backend is Kotlin Ktor with SQLite. The Android client uses Room for complete offline training and later synchronization.
+  Rotation advances after completed training; dates are optional. Stretches are recommended automatically but inserted manually.
+  The user approved an independent application database; existing sports records and misports.db must remain unchanged.
+  Concrete notification APIs and final media selections are implementation details to verify, not additional user architecture choices.
+
+rules:
+  proposal:
+    - 只记录用户已确认的需求和明确的变更范围；助手建议不得写成用户决定。
+    - 记录需求不代表功能已经实现；不得修改既有个人训练记录或小米同步脚本。
+  specs:
+    - 每项要求至少提供一个具体的 WHEN/THEN 场景，并保留英文结构标题。
+    - 不将具体素材供应方、后端框架或数据库产品写成已确认要求。
+  design:
+    - 分别记录已确认决定、确认原文、助手建议和待确认事项。
+    - 单人私用是已确认范围；不把分发、商业授权或合规审查作为当前开发的前置任务。
+  tasks:
+    - 未执行的应用实现任务必须保持未完成，不得把规范记录标记为应用交付。
+    - 将待确认的架构选择与已确认需求的实现任务分开。
