@@ -149,6 +149,12 @@ python skills\training-assistant\scripts\training.py export training-backup.zip
 
 已有实际 GitHub Actions 运行通过容器构建、服务端回归、启动、鉴权、Compose 和未登录镜像拉取检查。源码仓库为公开的 [4o4E/personal-training](https://github.com/4o4E/personal-training)，正式 APK、后端及镜像按版本发布；服务器由用户手动部署，本机 ADB 联调连接不作为长期服务。
 
+`v0.0.1` 的实际 [正式发布 CI](https://github.com/4o4E/personal-training/actions/runs/39733130505) 已通过 APK 和后端同版本构建、Release 发布、Release 运行包组装镜像、容器启动及鉴权、匿名镜像拉取；[普通提交 CI](https://github.com/4o4E/personal-training/actions/runs/39733077733) 只执行检查，镜像任务跳过。公开产物位于 [v0.0.1 Release](https://github.com/4o4E/personal-training/releases/tag/v0.0.1)。
+
+真机从带更新入口的 `0.0.0`（内部版本 1）读取真实公开 Release，后台下载、重新打开设置、校验、系统授权、取消安装后再次安装，最终升级为 `0.0.1`（内部版本 2）。自建验证资料保留，再次检查显示已是最新版本；损坏的安装包被拒绝，重新下载后正常安装。正式版完成组后返回桌面，系统实际发布普通 `reminder` 通知。自建验证训练、计划、健身房及临时连接已删除，历史和待同步均恢复为空。
+
+从该 Release 匿名下载的后端 ZIP 已在 Windows 解压并通过其 `bin/server.bat` 实际启动；健康路由为 200，无 token 请求为 401，有效 token 请求为 200。验证目录、端口转发和本机服务不作为生产部署。
+
 ## 动作素材
 
 内置 416 项中文力量动作、23 项拉伸及实际图解。训练与拉伸使用插画或分帧图，不要求训练时访问第三方网站。
