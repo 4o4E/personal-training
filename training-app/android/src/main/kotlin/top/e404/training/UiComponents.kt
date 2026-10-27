@@ -1,5 +1,6 @@
 package top.e404.training
 
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -33,7 +34,7 @@ fun numericText(value: Double): String = if (value % 1.0 == 0.0) value.toLong().
 fun intInput(text: String, name: String): Int = text.toIntOrNull() ?: throw IllegalArgumentException("请输入有效的$name")
 fun doubleInput(text: String, name: String): Double = text.toDoubleOrNull() ?: throw IllegalArgumentException("请输入有效的$name")
 
-@Composable fun FormDialog(title: String, onDismiss: () -> Unit, onSave: (() -> Unit)? = null, dismissLabel: String = "关闭", dismissOnClickOutside: Boolean = true, scrollKey: Int = 0, content: @Composable ColumnScope.() -> Unit) {
+@Composable fun FormDialog(title: String, onDismiss: () -> Unit, onSave: (() -> Unit)? = null, dismissLabel: String = "关闭", dismissOnClickOutside: Boolean = true, scrollKey: Int = 0, confirmLabel: String = "保存", content: @Composable ColumnScope.() -> Unit) {
     val scroll = rememberScrollState()
     LaunchedEffect(scrollKey) { scroll.scrollTo(0) }
     Dialog(onDismissRequest = onDismiss, properties = DialogProperties(usePlatformDefaultWidth = false, dismissOnClickOutside = dismissOnClickOutside)) {
@@ -43,7 +44,7 @@ fun doubleInput(text: String, name: String): Double = text.toDoubleOrNull() ?: t
                 Column(Modifier.weight(1f).verticalScroll(scroll).padding(vertical = 12.dp), verticalArrangement = Arrangement.spacedBy(12.dp), content = content)
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
                     TextButton(onClick = onDismiss) { Text(dismissLabel) }
-                    if (onSave != null) Button(onClick = onSave) { Text("保存") }
+                    if (onSave != null) Button(onClick = onSave) { Text(confirmLabel) }
                 }
             }
         }

@@ -10,6 +10,7 @@ import top.e404.training.shared.wireJson
 @Serializable data class DeviceChoices(
     val appearance: Appearance = Appearance.SYSTEM,
     val guide: String? = null,
+    // 仅用于将升级前的本机业务选择迁移到云端；确认迁移成功后立即清除。
     val programId: String? = null,
     val slotPlans: Map<String, Map<String, String>> = emptyMap()
 )
@@ -25,9 +26,7 @@ class AppPreferences(context: Context) {
     }
     fun appearance(value: Appearance) = save(mutable.value.copy(appearance = value))
     fun finishGuide(status: String) = save(mutable.value.copy(guide = status))
-    fun selectProgram(id: String) = save(mutable.value.copy(programId = id))
-    fun selectPlans(programId: String, plans: Map<String, String>) {
-        val selected = mutable.value.slotPlans[programId].orEmpty() + plans
-        save(mutable.value.copy(programId = programId, slotPlans = mutable.value.slotPlans + (programId to selected)))
-    }
+    fun legacySelection(): Pair<String?, Map<String, Map<String, String>>> =
+        mutable.value.programId to mutable.value.slotPlans
+    fun clearLegacyChoices() = save(mutable.value.copy(programId = null, slotPlans = emptyMap()))
 }

@@ -51,7 +51,7 @@ fun readBackup(input: InputStream, mediaDirectory: Path): Backup {
             zip.closeEntry()
         }
     }
-    return requireNotNull(backup) { "数据包缺少 data.json" }.also { require(it.formatVersion == 1) { "不支持此数据包版本" } }
+    return requireNotNull(backup) { "数据包缺少 data.json" }.also { require(it.formatVersion in 1..2) { "不支持此数据包版本" } }
 }
 
 /** 导入时比较实际文件，识别同名不同图；不能仅凭路径判断两份素材相同。 */

@@ -6,7 +6,7 @@ import java.time.LocalDate
 
 val wireJson = Json { encodeDefaults = true; ignoreUnknownKeys = false }
 
-enum class Kind { muscle, media, exercise, gym, equipment, program, plan, session }
+enum class Kind { muscle, media, exercise, gym, equipment, program, plan, session, arrangement }
 
 @Serializable data class Muscle(val id: String, val name: String, val mapKeys: List<String> = emptyList())
 @Serializable data class Media(val id: String, val name: String, val fileName: String, val mimeType: String, val source: String = "", val sourceUrl: String = "")
@@ -39,16 +39,26 @@ enum class Kind { muscle, media, exercise, gym, equipment, program, plan, sessio
     val id: String, val name: String, val programId: String? = null, val slotId: String? = null,
     val gymId: String? = null, val date: String? = null, val items: List<PlanItem> = emptyList(), val notes: String = ""
 )
+@Serializable data class SetSegment(val reps: Int, val load: Load? = null)
 @Serializable data class SetResult(
     val itemId: String, val setIndex: Int, val reps: Int? = null, val seconds: Int? = null,
-    val load: Load? = null, val side: String = "both", val completedAt: Long
+    val load: Load? = null, val side: String = "both", val completedAt: Long? = null,
+    val segments: List<SetSegment> = emptyList()
 )
-/** 训练开始时保存计划和动作说明；未来编辑计划不能重写这次实际训练。 */
+@Serializable data class HistoricalSource(val sourceId: String, val localDate: String, val originalText: String)
+@Serializable data class ArrangementOverride(val id: String, val slotId: String)
+@Serializable data class Arrangement(
+    val id: String = "current", val programId: String? = null,
+    val selectedPlans: Map<String, Map<String, String>> = emptyMap(),
+    val nextOverrides: Map<String, ArrangementOverride> = emptyMap()
+)
+/** 训练开始时保存计划和动作说明；历史训练可以明确缺少计划和精确时间。 */
 @Serializable data class Session(
-    val id: String, val name: String, val snapshot: Plan, val exercises: List<Exercise>,
-    val startedAt: Long, val endedAt: Long? = null, val status: String,
+    val id: String, val name: String, val snapshot: Plan?, val exercises: List<Exercise>,
+    val startedAt: Long?, val endedAt: Long? = null, val status: String,
     val results: List<SetResult> = emptyList(), val notes: String = "",
-    val items: List<PlanItem> = snapshot.items, val skippedItems: List<String> = emptyList()
+    val items: List<PlanItem> = snapshot?.items ?: emptyList(), val skippedItems: List<String> = emptyList(),
+    val historicalSource: HistoricalSource? = null, val arrangementOverrideId: String? = null
 )
 @Serializable data class Document(
     val kind: Kind, val id: String, val data: JsonObject,
@@ -61,11 +71,12 @@ enum class Kind { muscle, media, exercise, gym, equipment, program, plan, sessio
     val cursor: Long, val documents: List<Document>, val accepted: List<Document> = emptyList(),
     val conflicts: List<Conflict> = emptyList()
 )
-@Serializable data class Backup(val formatVersion: Int = 1, val documents: List<Document>, val exportedAt: Long)
+@Serializable data class Backup(val formatVersion: Int = 2, val documents: List<Document>, val exportedAt: Long)
 @Serializable data class ApiError(val message: String)
 @Serializable data class TimerState(
     val deadline: Long, val label: String, val sessionId: String,
-    val itemId: String, val setIndex: Int, val type: String = "rest"
+    val itemId: String, val setIndex: Int, val type: String = "rest",
+    val notified: Boolean = false
 )
 @Serializable data class HistorySummary(val sessions: List<Session>, val strengthSets: Int, val stretchSets: Int, val strengthSetsByMuscle: Map<String, Int>)
 
@@ -80,7 +91,7 @@ private fun checkLoad(load: Load?) {
     if (load == null) return
     require(load.value.isFinite() && load.value >= 0) { "重量必须是非负有限数值" }
     require(load.unit in setOf("kg", "lb")) { "重量单位必须为 kg 或 lb" }
-    require(load.meaning in setOf("total", "per_hand", "per_side")) { "重量含义不正确" }
+    require(load.meaning in setOf("total", "per_hand", "per_side", "unknown")) { "重量含义不正确" }
     require(load.mode in setOf("external", "assistance")) { "重量须区分负重或助力" }
 }
 fun checkTarget(target: SetTarget) {
@@ -98,10 +109,11 @@ fun validateDocument(doc: Document, list: (Kind) -> List<Document>, lookup: (Kin
     require(validId(doc.id)) { "资料标识不正确" }
     if (doc.deleted) {
         fun plans() = list(Kind.plan).map { it.value<Plan>() }
+        val arrangements = list(Kind.arrangement).filterNot { it.deleted }.map { it.value<Arrangement>() }
         val inUse = when (doc.kind) {
             Kind.gym -> list(Kind.equipment).any { it.value<Equipment>().gymId == doc.id } || plans().any { it.gymId == doc.id }
             Kind.equipment -> plans().any { p -> p.items.any { it.equipmentId == doc.id } }
-            Kind.program -> plans().any { it.programId == doc.id }
+            Kind.program -> plans().any { it.programId == doc.id } || arrangements.any { it.programId == doc.id || doc.id in it.selectedPlans || doc.id in it.nextOverrides }
             Kind.exercise -> plans().any { p -> p.items.any { it.exerciseId == doc.id } }
             Kind.media -> list(Kind.exercise).any { doc.id in it.value<Exercise>().mediaIds } ||
                 list(Kind.equipment).any { it.value<Equipment>().mediaId == doc.id } ||
@@ -109,9 +121,10 @@ fun validateDocument(doc: Document, list: (Kind) -> List<Document>, lookup: (Kin
             Kind.muscle -> list(Kind.exercise).any { e -> e.value<Exercise>().let { doc.id in it.muscles || doc.id in it.secondaryMuscles } } ||
                 list(Kind.program).any { p -> p.value<Program>().slots.any { doc.id in it.muscles } } ||
                 list(Kind.session).any { s -> s.value<Session>().exercises.any { doc.id in it.muscles || doc.id in it.secondaryMuscles } }
-            Kind.plan, Kind.session -> false
+            Kind.plan -> arrangements.any { arrangement -> arrangement.selectedPlans.values.any { doc.id in it.values } }
+            Kind.session, Kind.arrangement -> false
         }
-        require(!inUse) { "该资料仍被计划、器械或训练记录使用，请先解除关联" }
+        require(!inUse) { "该资料仍被计划、器械、安排或训练记录使用，请先解除关联" }
         return
     }
     fun ref(kind: Kind, id: String) = require(lookup(kind, id)?.deleted == false) { "关联资料不存在：$kind/$id" }
@@ -134,8 +147,28 @@ fun validateDocument(doc: Document, list: (Kind) -> List<Document>, lookup: (Kin
             require(it.name.isNotBlank() && it.tags.isNotEmpty()) { "器械需要名称和类别" }
             ref(Kind.gym, it.gymId)
             require(it.unit in setOf("kg", "lb")) { "器械单位必须为 kg 或 lb" }
-            require(it.meaning in setOf("total", "per_hand", "per_side")) { "器械重量含义不正确" }
+            require(it.meaning in setOf("total", "per_hand", "per_side", "unknown")) { "器械重量含义不正确" }
             it.mediaId?.let { id -> ref(Kind.media, id) }
+        }.id
+        Kind.arrangement -> doc.value<Arrangement>().also { arrangement ->
+            require(arrangement.id == "current") { "安排标识必须为 current" }
+            arrangement.programId?.let { id -> ref(Kind.program, id) }
+            arrangement.selectedPlans.forEach { (programId, plansBySlot) ->
+                val program = lookup(Kind.program, programId)?.takeUnless { it.deleted }?.value<Program>()
+                    ?: throw IllegalArgumentException("安排引用的分化方案不存在：$programId")
+                plansBySlot.forEach { (slotId, planId) ->
+                    require(program.slots.any { it.id == slotId }) { "安排引用的分化项不存在：$slotId" }
+                    val plan = lookup(Kind.plan, planId)?.takeUnless { it.deleted }?.value<Plan>()
+                        ?: throw IllegalArgumentException("安排引用的计划不存在：$planId")
+                    require(plan.programId == programId && plan.slotId == slotId) { "安排中的计划与分化项不匹配" }
+                }
+            }
+            arrangement.nextOverrides.forEach { (programId, override) ->
+                require(override.id.isNotBlank()) { "下次安排缺少选择标识" }
+                val program = lookup(Kind.program, programId)?.takeUnless { it.deleted }?.value<Program>()
+                    ?: throw IllegalArgumentException("下次安排引用的分化方案不存在：$programId")
+                require(program.slots.any { it.id == override.slotId }) { "下次安排引用的分化项不存在：${override.slotId}" }
+            }
         }.id
         Kind.program -> doc.value<Program>().also {
             require(it.name.isNotBlank() && it.slots.isNotEmpty()) { "分化方案至少需要一项训练" }
@@ -166,30 +199,45 @@ fun validateDocument(doc: Document, list: (Kind) -> List<Document>, lookup: (Kin
             }
         }.id
         Kind.session -> doc.value<Session>().also { session ->
-            require(session.name.isNotBlank() && session.startedAt > 0) { "训练缺少名称或开始时间" }
+            require(session.name.isNotBlank()) { "训练缺少名称" }
             require(session.status in setOf("active", "completed", "cancelled")) { "训练状态不正确" }
-            require((session.status == "active") == (session.endedAt == null)) { "训练状态与结束时间不一致" }
-            require(session.endedAt == null || session.endedAt >= session.startedAt) { "训练结束时间早于开始时间" }
+            val history = session.historicalSource
+            if (history == null) {
+                require(session.snapshot != null && session.startedAt != null && session.startedAt > 0) { "实时训练缺少计划或开始时间" }
+                require((session.status == "active") == (session.endedAt == null)) { "训练状态与结束时间不一致" }
+                require(session.endedAt == null || session.endedAt >= session.startedAt) { "训练结束时间早于训练开始" }
+            } else {
+                require(session.status != "active" && session.snapshot == null && session.startedAt == null) { "历史训练不能作为实时训练或包含推断的计划时间" }
+                LocalDate.parse(history.localDate)
+                require(history.sourceId.isNotBlank() && history.originalText.isNotBlank()) { "历史来源和原始文字不能为空" }
+            }
             require(session.status != "completed" || session.results.isNotEmpty()) { "没有完成组的训练不能标记完成" }
             require(session.results.map { it.itemId to it.setIndex }.distinct().size == session.results.size) { "同一训练组不能重复记录" }
-            require(session.snapshot.items.all { p -> session.exercises.any { it.id == p.exerciseId } }) { "训练缺少开始时动作说明" }
+            session.snapshot?.items?.forEach { p -> require(session.exercises.any { it.id == p.exerciseId }) { "训练缺少开始时动作说明" } }
             require(session.exercises.map { it.id }.distinct().size == session.exercises.size) { "动作说明不能重复" }
             require(session.items.map { it.id }.distinct().size == session.items.size) { "实际训练动作标识不能重复" }
             require(session.items.all { p -> session.exercises.any { it.id == p.exerciseId } }) { "实际训练缺少对应动作说明" }
             require(session.skippedItems.all { id -> session.items.any { it.id == id } }) { "跳过的动作不存在" }
             session.items.forEach { it.sets.forEach(::checkTarget) }
-            session.results.forEach { r ->
-                val p = session.items.singleOrNull { it.id == r.itemId }
-                require(p != null && r.setIndex in p.sets.indices) { "实际组没有对应计划组" }
-                require(r.completedAt >= session.startedAt) { "完成组时间早于训练开始" }
-                checkTarget(SetTarget(r.reps, seconds = r.seconds, load = r.load, side = r.side, restSeconds = 0))
+            session.results.forEach { result ->
+                val item = session.items.singleOrNull { it.id == result.itemId }
+                require(item != null && result.setIndex >= 0 && (history != null || result.setIndex in item.sets.indices)) { "实际组没有对应计划组" }
+                if (history == null) require(result.completedAt != null) { "实时完成组缺少真实完成时间" }
+                if (result.completedAt != null && session.startedAt != null) require(result.completedAt >= session.startedAt) { "完成组时间早于训练开始" }
+                require(result.side in setOf("both", "left", "right")) { "左右侧记录不正确" }
+                result.segments.forEach { segment ->
+                    require(segment.reps > 0 && result.seconds == null) { "分段次数或时长不正确" }
+                    checkLoad(segment.load)
+                }
+                if (result.segments.isNotEmpty()) {
+                    require(result.reps == result.segments.sumOf { it.reps }) { "分段次数与整组次数不一致" }
+                    require(result.load == null) { "分段重量不能同时填写整组重量" }
+                } else checkTarget(SetTarget(result.reps, seconds = result.seconds, load = result.load, side = result.side, restSeconds = 0))
             }
             lookup(Kind.session, session.id)?.takeUnless { it.deleted }?.value<Session>()?.let { old ->
-                require(old.snapshot == session.snapshot && old.startedAt == session.startedAt) { "已经开始的训练不能改写原计划内容" }
+                require(old.snapshot == session.snapshot && old.startedAt == session.startedAt && old.historicalSource == session.historicalSource) { "已有训练来源及开始内容不能改写" }
                 require(old.exercises.all { it in session.exercises }) { "已经记录的动作说明不能改写" }
-                old.results.forEach { result ->
-                    require(old.items.single { it.id == result.itemId } == session.items.singleOrNull { it.id == result.itemId }) { "已经完成组的动作与目标不能被替换" }
-                }
+                old.results.forEach { result -> require(old.items.single { it.id == result.itemId } == session.items.singleOrNull { it.id == result.itemId }) { "已经完成组的动作与目标不能被替换" } }
                 require(old.status == "active" || old.status == session.status) { "已经结束的训练不能重新开始或取消" }
             }
         }.id
@@ -223,25 +271,36 @@ fun recommendExercises(exercises: List<Exercise>, muscles: Set<String>, gymId: S
         .sortedWith(compareByDescending<Exercise> { ex -> ex.muscles.count(muscles::contains) }.thenBy { it.name })
 
 /** 只有真正完成的训练推进轮换，取消及日历经过均不改变下一项。 */
-fun nextSlot(program: Program, sessions: List<Session>): SplitSlot {
-    val last = sessions.filter { it.status == "completed" && it.snapshot.programId == program.id }
-        .maxWithOrNull(compareBy<Session> { it.endedAt ?: 0 }.thenBy { it.id })
-    val index = last?.let { s -> program.slots.indexOfFirst { it.id == s.snapshot.slotId } } ?: -1
+fun nextSlot(program: Program, sessions: List<Session>, override: ArrangementOverride? = null): SplitSlot {
+    val completed = sessions.filter { it.status == "completed" && it.snapshot?.programId == program.id }
+    val last = completed.maxWithOrNull(compareBy<Session> { it.endedAt ?: it.startedAt ?: 0 }.thenBy { it.id })
+    val consumed = override?.takeIf { candidate -> completed.any { it.arrangementOverrideId == candidate.id } }
+    val effectiveOverride = override?.takeUnless { it.id == consumed?.id }
+    if (effectiveOverride != null) return program.slots.single { it.id == effectiveOverride.slotId }
+    val index = last?.let { s -> program.slots.indexOfFirst { it.id == s.snapshot?.slotId } } ?: -1
     return program.slots[(index + 1) % program.slots.size]
 }
 
+/** 历史训练使用已记录的本地日期，实时训练从真实开始时间转换为 UTC+8。 */
+fun sessionDate(session: Session): LocalDate = session.historicalSource?.let { LocalDate.parse(it.localDate) }
+    ?: requireNotNull(session.startedAt) { "训练缺少真实日期" }.let {
+        java.time.Instant.ofEpochMilli(it).atZone(java.time.ZoneId.of("Asia/Shanghai")).toLocalDate()
+    }
+
+val sessionComparator: Comparator<Session> = compareByDescending<Session> { sessionDate(it) }
+    .thenByDescending { it.startedAt ?: Long.MIN_VALUE }.thenBy { it.id }
+
 fun summarizeHistory(sessions: List<Session>): HistorySummary {
-    val ordered = sessions.sortedByDescending { it.startedAt }
+    val ordered = sessions.sortedWith(sessionComparator)
     val counts = linkedMapOf<String, Int>()
     var strengthSets = 0
     var stretchSets = 0
-    // 实际完成的组始终保留；取消训练不推进分化，但不能抹去已经进行的练习。
-    ordered.forEach { s -> s.results.forEach { r ->
-        val item = s.items.single { it.id == r.itemId }
-        val exercise = s.exercises.single { it.id == item.exerciseId }
+    ordered.forEach { session -> session.results.forEach { result ->
+        val item = session.items.single { it.id == result.itemId }
+        val exercise = session.exercises.single { it.id == item.exerciseId }
         if (exercise.type == "stretch") stretchSets++ else {
             strengthSets++
-            exercise.muscles.forEach { m -> counts[m] = (counts[m] ?: 0) + 1 }
+            exercise.muscles.forEach { muscle -> counts[muscle] = (counts[muscle] ?: 0) + 1 }
         }
     } }
     return HistorySummary(ordered, strengthSets, stretchSets, counts)
@@ -249,8 +308,15 @@ fun summarizeHistory(sessions: List<Session>): HistorySummary {
 
 fun loadText(load: Load?): String = if (load == null) "未记录外部负重" else {
     val amount = if (load.value % 1.0 == 0.0) load.value.toLong().toString() else load.value.toString()
-    val meaning = when (load.meaning) { "per_hand" -> "单只"; "per_side" -> "单侧"; else -> "总重量" }
+    val meaning = when (load.meaning) { "per_hand" -> "单只"; "per_side" -> "单侧"; "unknown" -> "重量含义未记录"; else -> "总重量" }
     "$amount ${load.unit} · $meaning${if (load.mode == "assistance") " · 助力" else ""}"
+}
+fun resultText(result: SetResult): String {
+    val value = result.segments.takeIf { it.isNotEmpty() }?.joinToString("，") {
+        "${loadText(it.load)} × ${it.reps} 次"
+    } ?: listOfNotNull(result.reps?.let { "$it 次" }, result.seconds?.let { "$it 秒" }, result.load?.let(::loadText))
+        .joinToString(" · ")
+    return listOf(value, sideText(result.side)).filter { it.isNotBlank() }.joinToString(" · ")
 }
 fun sideText(side: String): String = when (side) { "left" -> "左侧"; "right" -> "右侧"; else -> "双侧" }
 fun targetText(t: SetTarget): String = listOfNotNull(

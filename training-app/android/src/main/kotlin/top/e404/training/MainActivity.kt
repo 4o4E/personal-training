@@ -1,10 +1,10 @@
 package top.e404.training
 
+import androidx.compose.foundation.layout.Arrangement
 import android.Manifest
 import android.os.Build
 import android.content.pm.PackageManager
 import androidx.activity.compose.rememberLauncherForActivityResult
-import androidx.activity.compose.BackHandler
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.ui.platform.LocalContext
 import android.os.Bundle
@@ -18,7 +18,6 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
-import androidx.compose.runtime.saveable.rememberSaveableStateHolder
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
@@ -28,6 +27,12 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.navigation.NavType
+import androidx.navigation.navArgument
+import androidx.navigation.compose.NavHost
+import androidx.navigation.compose.composable
+import androidx.navigation.compose.currentBackStackEntryAsState
+import androidx.navigation.compose.rememberNavController
 import kotlinx.coroutines.launch
 import kotlinx.serialization.builtins.nullable
 import kotlinx.serialization.json.jsonPrimitive
@@ -36,16 +41,32 @@ import top.e404.training.shared.*
 class MainActivity : ComponentActivity() {
     private lateinit var model: TrainingViewModel
     private var permissionRevision by mutableIntStateOf(0)
+    private var pendingWorkoutIntent by mutableStateOf(false)
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         model = ViewModelProvider(this)[TrainingViewModel::class.java]
+        val launchIntent = intent
+        pendingWorkoutIntent = launchIntent?.getStringExtra("training.destination") == "workout"
+        launchIntent?.removeExtra("training.destination")
         setContent {
             val preferences = (application as TrainingApplication).preferences
             val choices by preferences.data.collectAsStateWithLifecycle()
-            TrainingTheme(choices.appearance) { TrainingApp(model, permissionRevision, preferences) }
+            TrainingTheme(choices.appearance) {
+                TrainingApp(model, permissionRevision, preferences, pendingWorkoutIntent) { pendingWorkoutIntent = false }
+            }
         }
     }
+
+    override fun onNewIntent(intent: android.content.Intent) {
+        super.onNewIntent(intent)
+        val openWorkout = intent.getStringExtra("training.destination") == "workout"
+        intent.removeExtra("training.destination")
+        setIntent(intent)
+        if (openWorkout) pendingWorkoutIntent = true
+    }
+
     override fun onResume() {
         super.onResume()
         permissionRevision++
@@ -53,37 +74,46 @@ class MainActivity : ComponentActivity() {
     }
 }
 
+private object Routes {
+    const val workout = "workout"
+    const val adjust = "adjust"
+    const val history = "history"
+    const val settings = "settings"
+    const val day = "history/{date}"
+    const val sessionAdjust = "session-adjust"
+    const val setup = "adjust/setup"
+    const val advanced = "adjust/advanced"
+}
+
 @OptIn(ExperimentalMaterial3Api::class)
-@Composable fun TrainingApp(viewModel: TrainingViewModel, permissionRevision: Int, preferences: AppPreferences) {
+@Composable fun TrainingApp(viewModel: TrainingViewModel, permissionRevision: Int, preferences: AppPreferences, openWorkout: Boolean = false, consumedWorkout: () -> Unit = {}) {
     val state by viewModel.repository.data.collectAsStateWithLifecycle()
     val choices by preferences.data.collectAsStateWithLifecycle()
     val message by viewModel.message.collectAsStateWithLifecycle()
-    var tab by rememberSaveable { mutableStateOf("开始训练") }
-    var editing by rememberSaveable(stateSaver = jsonSaver(Document.serializer().nullable)) { mutableStateOf<Document?>(null) }
-    var deleting by rememberSaveable(stateSaver = jsonSaver(Document.serializer().nullable)) { mutableStateOf<Document?>(null) }
-    var preview by rememberSaveable(stateSaver = jsonSaver(Plan.serializer().nullable)) { mutableStateOf<Plan?>(null) }
-    var daySetup by rememberSaveable(stateSaver = jsonSaver(DaySetupRequest.serializer().nullable)) { mutableStateOf<DaySetupRequest?>(null) }
-    var showSetup by rememberSaveable { mutableStateOf(false) }
-    var showSettings by rememberSaveable { mutableStateOf(false) }
-    var showGuide by rememberSaveable { mutableStateOf(false) }
-    var showGyms by rememberSaveable { mutableStateOf(false) }
-    var showAdvanced by rememberSaveable { mutableStateOf(false) }
-    BackHandler(enabled = showGyms || (showAdvanced && tab == "调整计划")) {
-        if (showGyms) showGyms = false else showAdvanced = false
-    }
+    val nav = androidx.navigation.compose.rememberNavController()
+    val entry by nav.currentBackStackEntryAsState()
+    val route = entry?.destination?.route ?: Routes.workout
     val context = LocalContext.current
     val drawer = rememberDrawerState(DrawerValue.Closed)
     val scope = rememberCoroutineScope()
-    val pages = rememberSaveableStateHolder()
+    var editing by rememberSaveable(stateSaver = jsonSaver(Document.serializer().nullable)) { mutableStateOf<Document?>(null) }
+    var deleting by rememberSaveable(stateSaver = jsonSaver(Document.serializer().nullable)) { mutableStateOf(null) }
+    var preview by rememberSaveable(stateSaver = jsonSaver(Plan.serializer().nullable)) { mutableStateOf<Plan?>(null) }
+    var previewEditable by rememberSaveable { mutableStateOf(false) }
+    var daySetup by rememberSaveable(stateSaver = jsonSaver(DaySetupRequest.serializer().nullable)) { mutableStateOf<DaySetupRequest?>(null) }
+    var showGuide by rememberSaveable { mutableStateOf(false) }
+    var showGyms by rememberSaveable { mutableStateOf(false) }
     var pendingStart by rememberSaveable(stateSaver = jsonSaver(Plan.serializer().nullable)) { mutableStateOf<Plan?>(null) }
     val requestNotifications = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) {
         pendingStart?.let(viewModel::start); pendingStart = null
     }
     val startTraining: (Plan) -> Unit = { plan ->
         if (Build.VERSION.SDK_INT >= 33 && context.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
-            pendingStart = plan; requestNotifications.launch(Manifest.permission.POST_NOTIFICATIONS)
+            pendingStart = plan
+            requestNotifications.launch(Manifest.permission.POST_NOTIFICATIONS)
         } else viewModel.start(plan)
-        tab = "开始训练"; showGyms = false
+        nav.navigate(Routes.workout) { launchSingleTop = true }
+        showGyms = false
     }
     val activeDocument = remember(state.documents[Kind.session]) {
         state.records(Kind.session).firstOrNull { it.data["status"]?.jsonPrimitive?.content == "active" }
@@ -96,59 +126,78 @@ class MainActivity : ComponentActivity() {
             else showGuide = true
         }
     }
-    // 唯一可用的方案与模板没有歧义；先记住当前选择，后续同步新增候选不会改变已经使用的内容。
-    LaunchedEffect(state.documents[Kind.program], state.documents[Kind.plan], choices.programId) {
-        val programs = state.records(Kind.program).map { it.value<Program>() }
-        val program = currentProgram(programs, choices)
-        if (program != null) {
-            val unique = linkedMapOf<String, String>()
-            val multiple = hashSetOf<String>()
-            state.records(Kind.plan).forEach { doc ->
-                val plan = doc.value<Plan>()
-                if (plan.programId == program.id && plan.date == null) {
-                    val slotId = plan.slotId!!
-                    if (unique.put(slotId, plan.id) != null) multiple += slotId
-                }
-            }
-            multiple.forEach(unique::remove)
-            val selected = choices.slotPlans[program.id].orEmpty()
-            if (choices.programId != program.id || unique.any { (slot, plan) -> selected[slot] != plan })
-                preferences.selectPlans(program.id, unique)
+    LaunchedEffect(openWorkout, activeDocument?.id) {
+        if (openWorkout) {
+            nav.navigate(Routes.workout) { launchSingleTop = true }
+            consumedWorkout()
         }
     }
-    if (!state.ready) Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { CircularProgressIndicator() }
-    else ModalNavigationDrawer(drawerState = drawer, drawerContent = {
+    val mainRoute = route in setOf(Routes.workout, Routes.adjust, Routes.history)
+    ModalNavigationDrawer(drawerState = drawer, drawerContent = {
         ModalDrawerSheet {
             Text("个人训练", Modifier.padding(24.dp), style = MaterialTheme.typography.headlineSmall)
-            NavigationDrawerItem(label = { Text("设置") }, selected = false, onClick = { showSettings = true; scope.launch { drawer.close() } }, modifier = Modifier.padding(horizontal = 12.dp))
+            NavigationDrawerItem(label = { Text("设置") }, selected = false, onClick = { nav.navigate(Routes.settings); scope.launch { drawer.close() } }, modifier = Modifier.padding(horizontal = 12.dp))
             NavigationDrawerItem(label = { Text("健身房与器械（可选）") }, selected = showGyms, onClick = { showGyms = true; scope.launch { drawer.close() } }, modifier = Modifier.padding(horizontal = 12.dp))
             NavigationDrawerItem(label = { Text("使用教程") }, selected = false, onClick = { showGuide = true; scope.launch { drawer.close() } }, modifier = Modifier.padding(horizontal = 12.dp))
         }
     }) {
         Scaffold(
-            topBar = { TopAppBar(title = { Text(if (showGyms) "健身房与器械" else tab) }, navigationIcon = {
-                if (showGyms) TextButton(onClick = { showGyms = false }) { Text("返回") }
-                else IconButton(onClick = { scope.launch { drawer.open() } }, modifier = Modifier.semantics { contentDescription = "打开菜单" }) { NavigationGlyph("菜单") }
-            }) },
-            bottomBar = { NavigationBar { listOf("开始训练", "调整计划", "运动记录").forEach { title ->
-                NavigationBarItem(selected = title == tab && !showGyms, onClick = { tab = title; showGyms = false }, modifier = Modifier.semantics { contentDescription = title }, icon = { NavigationGlyph(title) }, label = { Text(title) })
-            } } }
+            topBar = {
+                TopAppBar(title = { Text(when { showGyms -> "健身房与器械"; route == Routes.settings -> "设置"; route == Routes.day -> "每日训练"; route == Routes.sessionAdjust -> "本次剩余内容"; route == Routes.setup -> "整轮计划配置"; route == Routes.advanced -> "全部计划"; else -> when(route) { Routes.workout -> "开始训练"; Routes.adjust -> "调整计划"; else -> "运动记录" } }) }, navigationIcon = {
+                    if (!mainRoute || showGyms) TextButton(onClick = { if (showGyms) showGyms = false else nav.popBackStack() }) { Text("返回") }
+                    else IconButton(onClick = { scope.launch { drawer.open() } }, modifier = Modifier.semantics { contentDescription = "打开菜单" }) { NavigationGlyph("菜单") }
+                })
+            },
+            bottomBar = {
+                if (mainRoute && !showGyms) NavigationBar {
+                    listOf(Routes.workout to "开始训练", Routes.adjust to "调整计划", Routes.history to "运动记录").forEach { (destination, title) ->
+                        NavigationBarItem(selected = route == destination, onClick = {
+                            nav.navigate(destination) {
+                                popUpTo(nav.graph.startDestinationId) { saveState = true }
+                                launchSingleTop = true
+                                restoreState = true
+                            }
+                        }, modifier = Modifier.semantics { contentDescription = title }, icon = { NavigationGlyph(title) }, label = { Text(title) })
+                    }
+                }
+            }
         ) { padding ->
             Column(Modifier.padding(padding).fillMaxSize()) {
-                Row(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp), horizontalArrangement = Arrangement.SpaceBetween) {
-                    Text(state.syncMessage, style = MaterialTheme.typography.bodySmall)
-                    if (state.pending > 0) Text("待同步 ${state.pending} 项", style = MaterialTheme.typography.bodySmall)
+                if (mainRoute && !showGyms) {
+                    Column(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp)) {
+                        Text("${state.syncMessage} · 最近同步 ${state.lastSuccessfulSyncAt?.let(::localDateTime) ?: "尚无"}", style = MaterialTheme.typography.bodySmall, maxLines = 2)
+                        Text("待上传 ${state.pending} · 冲突 ${state.conflicts.size} · 素材 ${when (state.mediaSyncStatus) { MediaSyncStatus.idle -> "未开始"; MediaSyncStatus.checking -> "检查中"; MediaSyncStatus.ready -> "已就绪"; MediaSyncStatus.error -> "异常" }}", style = MaterialTheme.typography.bodySmall, maxLines = 2)
+                    }
                 }
                 Box(Modifier.weight(1f)) {
                     if (showGyms) GymsScreen(state, viewModel, { editing = it }, { deleting = it })
-                    else pages.SaveableStateProvider(tab) {
-                        when (tab) {
-                            "开始训练" -> if (active != null) WorkoutScreen(active, state, viewModel, permissionRevision) else StartOverview(state, choices, preferences, startTraining, { preview = it }, { showSetup = true }) { tab = "调整计划" }
-                            "调整计划" -> if (showAdvanced) Column {
-                                TextButton(onClick = { showAdvanced = false }) { Text("返回当前训练方案") }
-                                Box(Modifier.weight(1f)) { AdvancedPlansScreen(state, startTraining, { editing = it }, { deleting = it }) }
-                            } else AdjustPrograms(state, choices, preferences, { editing = it }, { preview = it }, { showSetup = true }, { daySetup = it }) { showAdvanced = true }
-                            "运动记录" -> HistoryScreen(state, viewModel, { deleting = it })
+                    else androidx.navigation.compose.NavHost(navController = nav, startDestination = Routes.workout, modifier = Modifier.fillMaxSize()) {
+                        composable(Routes.workout) {
+                            if (active != null) WorkoutScreen(active, state, viewModel, permissionRevision) { nav.navigate(Routes.sessionAdjust) }
+                            else StartOverview(state, startTraining, { preview = it; previewEditable = false }) { nav.navigate(Routes.adjust) }
+                        }
+                        composable(Routes.adjust) {
+                            AdjustPrograms(state, viewModel, { editing = it }, { preview = it; previewEditable = true }, { nav.navigate(Routes.sessionAdjust) }, { daySetup = null; nav.navigate(Routes.setup) }, { request -> daySetup = request; nav.navigate(Routes.setup) }, { nav.navigate(Routes.advanced) })
+                        }
+                        composable(Routes.history) {
+                            HistoryCalendarScreen(state) { date -> nav.navigate("history/$date") }
+                        }
+                        composable(Routes.settings) {
+                            SettingsScreen(state, viewModel, permissionRevision, preferences) { nav.popBackStack() }
+                        }
+                        composable(Routes.day, arguments = listOf(navArgument("date") { type = NavType.StringType })) { backStack ->
+                            DayHistoryScreen(backStack.arguments?.getString("date").orEmpty(), state, viewModel) { deleting = it }
+                        }
+                        composable(Routes.sessionAdjust) {
+                            LaunchedEffect(state.ready, active?.id) { if (state.ready && active == null) nav.popBackStack() }
+                            if (active != null) SessionAdjustScreen(active, state, viewModel)
+                            else Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { CircularProgressIndicator() }
+                        }
+                        composable(Routes.setup) {
+                            PresetSetupScreen(state, viewModel, daySetup) { daySetup = null; nav.popBackStack() }
+                        }
+                        composable(Routes.advanced) {
+                            AdvancedPlansScreen(state, startTraining, { editing = it }, { deleting = it })
                         }
                     }
                 }
@@ -164,24 +213,30 @@ class MainActivity : ComponentActivity() {
             else -> error("此资料不使用该编辑入口")
         }
     } }
-    preview?.let { plan -> PlanPreview(plan, state, viewModel, { preview = null }) { editing = state.record(Kind.plan, plan.id); preview = null } }
+    preview?.let { plan ->
+        PlanPreview(
+            plan, state, viewModel,
+            onDismiss = { preview = null; previewEditable = false },
+            onEdit = if (previewEditable) ({
+                editing = state.record(Kind.plan, plan.id)
+                preview = null
+                previewEditable = false
+            }) else null
+        )
+    }
     deleting?.let { source ->
         AlertDialog(onDismissRequest = { deleting = null }, title = { Text("删除${source.displayName()}？") },
             text = { Text(if (source.kind == Kind.session) "删除训练记录会改变历史统计和按完成情况计算的下一项训练。" else "删除会同步到后端。正在被其他资料使用的内容需要先解除关联。") },
-            confirmButton = { TextButton(onClick = { viewModel.action { viewModel.repository.remove(source); deleting = null } }) { Text("确认删除") } },
+            confirmButton = { TextButton(onClick = { viewModel.action { viewModel.repository.removeTrainingDocument(source); deleting = null } }) { Text("确认删除") } },
             dismissButton = { TextButton(onClick = { deleting = null }) { Text("取消") } })
     }
-    if (showSettings) SettingsScreen(state, viewModel, permissionRevision, preferences) { showSettings = false }
-    if (showGuide) FirstUseGuide(state, viewModel, {
-        if (choices.guide == null) preferences.finishGuide("skipped")
-        showGuide = false
-    }) { choosePlan ->
+    if (showGuide) FirstUseGuide(state, viewModel, { if (choices.guide == null) preferences.finishGuide("skipped"); showGuide = false }) { choosePlan ->
         preferences.finishGuide("completed"); showGuide = false
-        if (choosePlan) { tab = "调整计划"; showSetup = true }
+        if (choosePlan) nav.navigate(Routes.adjust)
     }
-    if (showSetup || daySetup != null) PresetSetupScreen(state, viewModel, preferences, daySetup) { showSetup = false; daySetup = null }
     message?.let { text -> AlertDialog(onDismissRequest = viewModel::dismissMessage, title = { Text("操作未完成") }, text = { Text(text) }, confirmButton = { TextButton(onClick = viewModel::dismissMessage) { Text("知道了") } }) }
 }
+
 
 @Composable private fun NavigationGlyph(name: String) {
     val color = LocalContentColor.current
@@ -208,7 +263,8 @@ private fun AppData.planDate(plan: Plan) = plan.date ?: "未指定日期"
 @Composable fun AdvancedPlansScreen(state: AppData, start: (Plan) -> Unit, edit: (Document) -> Unit, remove: (Document) -> Unit) {
     val programs = state.records(Kind.program)
     val plans = remember(state.documents[Kind.plan]) { state.records(Kind.plan).map { it to it.value<Plan>() }.sortedWith(compareBy<Pair<Document, Plan>> { it.second.date == null }.thenBy { it.second.date }) }
-    val completed = remember(state.documents[Kind.session]) { state.completedSessions().map { it.snapshot.id }.toSet() }
+    val completed = remember(state.documents[Kind.session]) { state.completedSessions().mapNotNull { it.snapshot?.id }.toSet() }
+    val hasActiveSession = state.records(Kind.session).any { it.value<Session>().status == "active" }
     LazyColumn(Modifier.fillMaxSize().padding(horizontal = 12.dp), verticalArrangement = Arrangement.spacedBy(10.dp), contentPadding = PaddingValues(bottom = 20.dp)) {
         item { Row { Button(onClick = { val p = Program(newId(), "", listOf(SplitSlot(newId(), "训练一", emptyList()))); edit(document(Kind.program, p.id, p)) }) { Text("新增分化") }; TextButton(onClick = { val p = Plan(newId(), ""); edit(document(Kind.plan, p.id, p)) }) { Text("新增计划") } } }
         items(programs, key = { "program-${it.id}" }) { doc ->
@@ -224,7 +280,9 @@ private fun AppData.planDate(plan: Plan) = plan.date ?: "未指定日期"
             InfoCard(plan.name) {
                 Text("${state.planDate(plan)} · ${if (plan.id in completed) "已有完成记录" else "待训练"}")
                 Text(state.planParts(plan))
-                Row { TextButton(onClick = { edit(doc) }) { Text("查看与编辑") }; TextButton(onClick = { start(plan) }, enabled = plan.items.isNotEmpty()) { Text("开始训练") } }
+                if (plan.date != null || plan.programId == null) Button(onClick = { start(plan) }, enabled = !hasActiveSession && plan.items.isNotEmpty()) {
+                    Text(if (plan.date != null) "开始指定日期训练" else "开始独立训练")
+                }
                 Row {
                     TextButton(onClick = { val copy = plan.copy(id = newId(), name = "${plan.name}（复制）", date = null, items = plan.items.map { it.copy(id = newId()) }); edit(document(Kind.plan, copy.id, copy)) }) { Text("复制为新计划") }
                     TextButton(onClick = { remove(doc) }) { Text("删除计划") }
@@ -272,42 +330,3 @@ private fun AppData.planDate(plan: Plan) = plan.date ?: "未指定日期"
 }
 
 
-@Composable fun HistoryScreen(state: AppData, viewModel: TrainingViewModel, remove: (Document) -> Unit) {
-    val sessions = remember(state.documents[Kind.session]) { state.records(Kind.session).map { it to it.value<Session>() }.sortedByDescending { it.second.startedAt } }
-    val summary = remember(sessions) { summarizeHistory(sessions.map { it.second }) }
-    var detail by remember { mutableStateOf<Session?>(null) }
-    LazyColumn(Modifier.fillMaxSize().padding(horizontal = 12.dp), verticalArrangement = Arrangement.spacedBy(10.dp), contentPadding = PaddingValues(bottom = 20.dp)) {
-        item { Text("力量 ${summary.strengthSets} 组 · 拉伸 ${summary.stretchSets} 组", style = MaterialTheme.typography.titleMedium) }
-        if (sessions.isEmpty()) item { EmptyMessage("尚无训练记录。开始训练并完成组后会保存在这里。") }
-        items(sessions, key = { it.first.id }) { (doc, session) ->
-            InfoCard(session.name) {
-                Text(localDateTime(session.startedAt))
-                Text(when (session.status) { "active" -> "进行中"; "completed" -> "已完成"; else -> "已取消，已练的组仍保留" })
-                Text("实际完成 ${session.results.size} 组")
-                Row { TextButton(onClick = { detail = session }) { Text("查看实际记录") }; if (session.status != "active") TextButton(onClick = { remove(doc) }) { Text("删除记录") } }
-            }
-        }
-    }
-    detail?.let { SessionHistory(it, state, viewModel) { detail = null } }
-}
-
-@Composable fun SessionHistory(session: Session, state: AppData, viewModel: TrainingViewModel, onDismiss: () -> Unit) {
-    FormDialog(session.name, onDismiss) {
-        Text("开始：${localDateTime(session.startedAt)}")
-        session.endedAt?.let { Text("结束：${localDateTime(it)}") }
-        if (session.snapshot.date != null) Text("原计划日期：${session.snapshot.date}")
-        session.items.forEach { item ->
-            val exercise = session.exercises.single { it.id == item.exerciseId }
-            InfoCard(exercise.name) {
-                session.results.filter { it.itemId == item.id }.sortedBy { it.setIndex }.forEach { result ->
-                    Text("第 ${result.setIndex + 1} 组：" + listOfNotNull(result.reps?.let { "$it 次" }, result.seconds?.let { "$it 秒" }, sideText(result.side), loadText(result.load)).joinToString(" · "))
-                }
-                if (session.results.none { it.itemId == item.id }) Text("没有完成记录")
-                Text("计划 ${item.sets.size} 组；未完成的计划组不计入实际组数。", style = MaterialTheme.typography.bodySmall)
-            }
-        }
-        if (session.notes.isNotBlank()) Text("训练反馈：${session.notes}")
-        Text("开始时的计划", style = MaterialTheme.typography.titleMedium)
-        session.snapshot.items.forEach { item -> Text("${session.exercises.single { it.id == item.exerciseId }.name} · ${item.sets.size} 组") }
-    }
-}

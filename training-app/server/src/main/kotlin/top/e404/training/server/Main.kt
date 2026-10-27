@@ -101,10 +101,11 @@ fun Application.trainingApplication(store: Store, archives: Archives, token: Str
                     call.respond(withContext(Dispatchers.IO) { store.sync(request) })
                 }
                 get("/history") {
-                    val from = call.request.queryParameters["from"]?.let { LocalDate.parse(it).atStartOfDay().toInstant(ZoneOffset.ofHours(8)).toEpochMilli() }
-                    val until = call.request.queryParameters["to"]?.let { LocalDate.parse(it).plusDays(1).atStartOfDay().toInstant(ZoneOffset.ofHours(8)).toEpochMilli() }
+                    val from = call.request.queryParameters["from"]?.let(LocalDate::parse)
+                    val until = call.request.queryParameters["to"]?.let(LocalDate::parse)
                     val sessions = withContext(Dispatchers.IO) { store.list(Kind.session).map { it.value<Session>() } }
-                    call.respond(summarizeHistory(sessions.filter { (from == null || it.startedAt >= from) && (until == null || it.startedAt < until) }))
+                        .filter { session -> (from == null || sessionDate(session) >= from) && (until == null || sessionDate(session) <= until) }
+                    call.respond(summarizeHistory(sessions))
                 }
                 get("/recommendations") {
                     val type = call.request.queryParameters["type"] ?: "strength"
@@ -123,7 +124,12 @@ fun Application.trainingApplication(store: Store, archives: Archives, token: Str
                 get("/programs/{id}/next") {
                     val docs = withContext(Dispatchers.IO) { store.list() }
                     val program = docs.singleOrNull { it.kind == Kind.program && it.id == call.parameters["id"] }
-                    if (program == null) call.respond(HttpStatusCode.NotFound, ApiError("分化方案不存在")) else call.respond(nextSlot(program.value(), docs.filter { it.kind == Kind.session }.map { it.value() }))
+                    if (program == null) call.respond(HttpStatusCode.NotFound, ApiError("分化方案不存在")) else {
+                        val value = program.value<Program>()
+                        val sessions = docs.filter { it.kind == Kind.session }.map { it.value<Session>() }
+                        val arrangement = docs.singleOrNull { it.kind == Kind.arrangement && it.id == "current" }?.value<Arrangement>()
+                        call.respond(nextSlot(value, sessions, arrangement?.nextOverrides?.get(value.id)))
+                    }
                 }
                 get("/files/{name}") {
                     val name = call.parameters["name"]!!

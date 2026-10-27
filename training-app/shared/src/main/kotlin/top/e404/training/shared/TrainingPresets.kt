@@ -81,9 +81,12 @@ fun previewPreset(count: Int, style: PresetStyle, actions: Int, exercises: Map<S
 data class RotationPlan(val slot: SplitSlot, val plan: Plan?)
 
 /** 日期安排只执行一次；无日期的分化计划循环使用。多份模板必须明确选择，不能猜测用户偏好。 */
-fun rotationPlans(program: Program, plans: List<Plan>, sessions: List<Session>, selectedPlans: Map<String, String>): List<RotationPlan> {
-    val completed = sessions.asSequence().filter { it.status == "completed" }.map { it.snapshot.id }.toHashSet()
-    val next = nextSlot(program, sessions)
+fun rotationPlans(
+    program: Program, plans: List<Plan>, sessions: List<Session>, selectedPlans: Map<String, String>,
+    override: ArrangementOverride? = null
+): List<RotationPlan> {
+    val completed = sessions.asSequence().filter { it.status == "completed" }.mapNotNull { it.snapshot?.id }.toHashSet()
+    val next = nextSlot(program, sessions, override)
     val start = program.slots.indexOfFirst { it.id == next.id }
     return List(program.slots.size) { offset ->
         val slot = program.slots[(start + offset) % program.slots.size]

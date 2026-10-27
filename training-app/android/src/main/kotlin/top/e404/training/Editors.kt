@@ -107,7 +107,8 @@ import top.e404.training.shared.*
             )
             checkTarget(target); onSave(target, applyAll)
         }
-    }) {
+    }, confirmLabel = if (actual) "完成并记录" else "保存") {
+        if (actual) Text("新组确认后保存实际结果并按该组休息时长计时；修改已完成组不会重启计时。", style = MaterialTheme.typography.bodySmall)
         Text(exercise.name, style = MaterialTheme.typography.titleMedium)
         if (exercise.measurement == "reps") {
             TextInput(if (actual) "实际次数" else "目标次数或范围下限", reps, { reps = it }, numeric = true)

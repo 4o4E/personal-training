@@ -22,6 +22,8 @@ python scripts/training.py list program
 python scripts/training.py list plan
 python scripts/training.py list muscle
 python scripts/training.py list exercise
+python scripts/training.py list arrangement
+python scripts/training.py get arrangement current
 python scripts/training.py get plan <计划ID>
 python scripts/training.py next <分化方案ID>
 python scripts/training.py recommend --type strength --muscles <部位ID列表> --gym <健身房ID>
@@ -34,6 +36,8 @@ python scripts/training.py import <备份ZIP路径>
 ```
 
 上述尖括号是命令参数说明，执行时必须替换为实际查询得到的值。新资料使用独立 UUID 和 `baseRevision = 0`。编辑已有资料保留 `get` 取得的完整 Document 及其 `revision`，只修改 `data`；完整 Document 文件可以省略 `--base-revision`，工具会使用文件中原有的修订号。
+当前方案、循环计划选择与手动下次选择是业务文档 `arrangement/current`，不是设备偏好。其 `data` 字段为 `{"id":"current","programId":"方案ID或null","selectedPlans":{"方案ID":{"slotId":"planId"}},"nextOverrides":{"方案ID":{"id":"稳定选择ID","slotId":"slotId"}}}`。用 `get arrangement current` 读取当前 revision，修改时只更新 `data` 并按该 revision 提交；新安排的 `baseRevision` 为 0。下次手动选择完成后由实际完成的 Session 消费；取消不消费，不应因取消手动清除选择。
+
 
 ## 安排训练
 
@@ -48,8 +52,9 @@ python scripts/training.py import <备份ZIP路径>
 
 ## 分析实际记录
 
-- 查询 `history`，时间统一 UTC+8，筛选依据是真实训练开始日期，不是计划日期。
-- 只有 `results` 中存在的组才是实际完成。`snapshot.items` 和 `items[].sets` 都是目标，不能当作训练完成量。
+- 查询 `history`，时间统一 UTC+8。历史训练按 `historicalSource.localDate` 筛选；实时训练按真实 `startedAt` 转换日期，未知具体时间不构造顺序。
+- 只有 `results` 中存在的组才是实际完成。`snapshot` 可为空；`items[].sets` 都是目标，不能当作训练完成量。
+- 完成组的 `completedAt` 可为空；`segments` 按发生顺序保存组内多段重量与次数，一组仍只计一次。`Load.meaning=unknown` 表示保留读数但重量含义未记录。
 - 完成、取消与进行中分开说明。取消训练中的实际完成组仍是事实，但取消不推进分化。
 - `strengthSets` 与 `stretchSets` 分开；`strengthSetsByMuscle` 是主要部位涉及的力量组，复合动作可涉及多个部位，不把部位之和当作总组数。
 - 同动作、同实际器械和同原始重量含义之间才比较负重。不同器械读数不能直接横向比较；不把助力增加解释为外部负重增加。
@@ -61,4 +66,7 @@ python scripts/training.py import <备份ZIP路径>
 - 器械与动作图片先 `upload`，再保存 `media` 文档并更新使用者引用。素材使用新的不可变文件名，避免覆盖仍被旧资料使用的文件。
 - 完整导出 ZIP 包含版本化 `data.json` 和 `media/`；不包含 token、手机授权和后端连接配置。
 - 导入默认为合并；遇到已有不同内容停止并说明。只有用户明确允许替换后才添加 `--replace`。
+
+- 历史来源合并仅限用户明确授权的 `record/1012.md`、`1013.md`、`1014.md`、`1015.md`、`1019.md`、`1020.md`、`1021.md` 和 `1026.md`；将它们作为历史会话合并导入，使用 `replace=false`。保留每份来源原文与反馈，不把手机测试记录算作真实训练，也不删除或替换其他已有资料。
+- 生产导入前确认后端支持 version-2 历史备份与可空时间；当前授权的生产操作须等 v0.0.3 发布后执行。若导出仍为 formatVersion 1 或接口不兼容，停止写入并报告，不尝试绕过版本限制。
 - 删除使用明确修订号；被计划、器械或历史素材引用的内容需要先解除关联。删除实际训练会改变统计及分化顺序，必须先取得用户确认。

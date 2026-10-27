@@ -1,8 +1,11 @@
 package top.e404.training
 
+import androidx.compose.material3.*
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.layout.*
-import androidx.compose.material3.*
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Modifier
@@ -25,7 +28,7 @@ import top.e404.training.shared.*
     }
 }
 
-@Composable fun PresetSetupScreen(state: AppData, viewModel: TrainingViewModel, preferences: AppPreferences, day: DaySetupRequest?, onDismiss: () -> Unit) {
+@Composable fun PresetSetupScreen(state: AppData, viewModel: TrainingViewModel, day: DaySetupRequest?, onDismiss: () -> Unit) {
     var step by rememberSaveable { mutableIntStateOf(if (day == null) 0 else 1) }
     var count by rememberSaveable { mutableIntStateOf(day?.program?.slots?.size ?: 3) }
     var actions by rememberSaveable { mutableIntStateOf(4) }
@@ -54,9 +57,9 @@ import top.e404.training.shared.*
         }
     }
     val chosen = candidates.single { it.style == style }
-    FormDialog(if (day == null) "选择整轮训练方案" else "调整${day.slot.name}", onDismiss,
-        dismissLabel = "取消配置", dismissOnClickOutside = false, scrollKey = step) {
-        Text(when (step) { 0 -> "1 · 选择分化方式"; 1 -> "2 · 选择训练量"; 2 -> "3 · 比较候选方案"; else -> "4 · 完整预览" }, color = MaterialTheme.colorScheme.primary)
+    Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+        TextButton(onClick = onDismiss) { Text("返回") }
+        Text(if (day == null) "整轮计划配置" else "调整${day.slot.name}未来计划", style = MaterialTheme.typography.headlineSmall)
         when (step) {
             0 -> {
                 Text("分化是一轮中的训练顺序，不是每周必须训练的天数。完成后推进，休息或取消不会跳过下一项。")
@@ -123,12 +126,13 @@ import top.e404.training.shared.*
                         try {
                             if (day == null) {
                                 viewModel.repository.saveRound(draftProgram!!, draftPlans)
-                                preferences.selectPlans(draftProgram!!.id, draftPlans.associate { it.slotId!! to it.id })
+                                viewModel.repository.selectProgram(draftProgram!!.id)
+                                draftPlans.forEach { plan -> viewModel.repository.selectPlan(draftProgram!!.id, plan.slotId!!, plan.id) }
                             } else {
                                 val plan = draftPlans.single()
                                 val document = document(Kind.plan, plan.id, plan)
                                 viewModel.repository.save(document, day.original ?: document)
-                                preferences.selectPlans(day.program.id, mapOf(day.slot.id to plan.id))
+                                viewModel.repository.selectPlan(day.program.id, day.slot.id, plan.id)
                             }
                             onDismiss()
                         } finally { saving = false }

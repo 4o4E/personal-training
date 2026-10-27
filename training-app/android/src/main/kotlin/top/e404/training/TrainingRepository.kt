@@ -43,11 +43,25 @@ import java.util.concurrent.TimeUnit
 
 private fun Document.key() = "${kind.name}/$id"
 private data class Cached(val document: Document, val dirty: Boolean, val remote: Document? = null)
+enum class SyncStatus { offline, syncing, synced, pending, conflict, error }
+enum class MediaSyncStatus { idle, checking, ready, error }
+data class DocumentSyncState(val dirty: Boolean, val conflict: Boolean)
 data class AppData(
     val ready: Boolean = false,
     val documents: Map<Kind, Map<String, Document>> = Kind.entries.associateWith { emptyMap() },
-    val pending: Int = 0, val conflicts: List<Conflict> = emptyList(), val syncMessage: String = "尚未连接后端"
+    val pending: Int = 0, val conflicts: List<Conflict> = emptyList(), val syncMessage: String = "尚未连接后端",
+    val pendingArrangementMigration: Arrangement? = null, val arrangementCloudRead: Boolean = false,
+    val lastSuccessfulSyncAt: Long? = null, val syncStatus: SyncStatus = SyncStatus.offline,
+    val documentSync: Map<String, DocumentSyncState> = emptyMap(),
+    val mediaSyncStatus: MediaSyncStatus = MediaSyncStatus.idle
 ) {
+    val arrangement: Arrangement? get() {
+        val saved = if (!arrangementCloudRead) pendingArrangementMigration ?: record(Kind.arrangement, "current")?.value<Arrangement>()
+            else record(Kind.arrangement, "current")?.value<Arrangement>() ?: pendingArrangementMigration
+        val consumed = records(Kind.session).asSequence().map { it.value<Session>() }
+            .filter { it.status == "completed" }.mapNotNull { it.arrangementOverrideId }.toSet()
+        return saved?.copy(nextOverrides = saved.nextOverrides.filterValues { it.id !in consumed })
+    }
     fun records(kind: Kind): List<Document> = documents.getValue(kind).values.filterNot { it.deleted }
     fun record(kind: Kind, id: String): Document? = documents.getValue(kind)[id]?.takeUnless { it.deleted }
 }
@@ -60,6 +74,9 @@ class TrainingRepository(
     private val dao = database.records()
     private val gate = Mutex()
     private val syncGate = Mutex()
+    private var arrangementCloudRead = false
+    private var arrangementMigrationDirty = false
+    private var startupSyncStarted = false
     private val cache = linkedMapOf<String, Cached>()
     private val pending = mutableSetOf<String>()
     private val conflicting = mutableSetOf<String>()
@@ -74,22 +91,53 @@ class TrainingRepository(
         install(HttpTimeout) { connectTimeoutMillis = 10000; requestTimeoutMillis = 30000 }
     }
 
-    suspend fun initialize() = withContext(Dispatchers.IO) {
+    suspend fun initialize(triggerStartupSync: Boolean = true) = withContext(Dispatchers.IO) {
+        var startSync = false
         gate.withLock {
-            if (_data.value.ready) return@withLock
-            val rows = dao.all()
-            val existing = rows.map { "${it.kind}/${it.id}" }.toSet()
-            val seed = context.assets.open("catalog.json").bufferedReader().use { wireJson.decodeFromString<List<Document>>(it.readText()) }
-                .filterNot { it.key() in existing }
-            database.withTransaction { dao.putAll(seed.map { it.local(false) }) }
-            val values = rows.map { Cached(it.document(), it.dirty, it.conflict?.let { c -> wireJson.decodeFromString<Document>(c) }) } + seed.map { Cached(it, false) }
-            install(values)
-            _timer.value = dao.value("timer")?.let { wireJson.decodeFromString<TimerState>(it) }
-            clearInactiveTimer()
-            _data.update { it.copy(ready = true, syncMessage = if (vault.load().configured) "连接已配置，等待同步" else "尚未连接后端，可离线使用") }
+            if (!_data.value.ready) {
+                val rows = dao.all()
+                val existing = rows.map { "${it.kind}/${it.id}" }.toSet()
+                val seed = context.assets.open("catalog.json").bufferedReader().use { wireJson.decodeFromString<List<Document>>(it.readText()) }
+                    .filterNot { it.key() in existing }
+                database.withTransaction { dao.putAll(seed.map { it.local(false) }) }
+                val values = rows.map { Cached(it.document(), it.dirty, it.conflict?.let { c -> wireJson.decodeFromString<Document>(c) }) } + seed.map { Cached(it, false) }
+                install(values)
+                _timer.value = dao.value("timer")?.let { wireJson.decodeFromString<TimerState>(it) }
+                clearInactiveTimer()
+                arrangementMigrationDirty = dao.value("arrangement-migration-dirty") == "true"
+                arrangementCloudRead = dao.value("arrangement-cloud-read") == "true"
+                val preferences = (context.applicationContext as TrainingApplication).preferences
+                val savedMigration = dao.value("arrangement-migration")?.let { wireJson.decodeFromString<Arrangement>(it) }
+                val (legacyProgram, legacyPlans) = preferences.legacySelection()
+                val pendingMigration = savedMigration ?: if (_data.value.record(Kind.arrangement, "current") == null &&
+                    !arrangementCloudRead && (legacyProgram != null || legacyPlans.isNotEmpty())) {
+                    Arrangement(programId = legacyProgram, selectedPlans = legacyPlans)
+                } else null
+                if (savedMigration == null && pendingMigration != null) {
+                    dao.putValue(LocalValue("arrangement-migration", wireJson.encodeToString(pendingMigration)))
+                }
+                val configured = vault.load().configured
+                _data.update { it.copy(ready = true, pendingArrangementMigration = pendingMigration,
+                    arrangementCloudRead = arrangementCloudRead,
+                    lastSuccessfulSyncAt = dao.value("lastSuccessfulSyncAt")?.toLongOrNull(),
+                    syncMessage = if (configured) "连接已配置，正在同步" else "尚未连接后端，可离线使用",
+                    syncStatus = if (configured) SyncStatus.pending else SyncStatus.offline) }
+            }
+            if (triggerStartupSync && _data.value.ready && vault.load().configured && !startupSyncStarted) {
+                startupSyncStarted = true
+                startSync = true
+            }
+        }
+        if (startSync) {
+            try {
+                sync()
+            } catch (error: IOException) {
+                syncFailure("网络不可用，记录已保存在手机，等待同步")
+            } catch (error: ApiProblem) {
+                syncFailure(error.message!!)
+            }
         }
     }
-
     private fun install(values: List<Cached>) {
         val grouped = _data.value.documents.toMutableMap()
         values.groupBy { it.document.kind }.forEach { (kind, updates) ->
@@ -102,7 +150,16 @@ class TrainingRepository(
             }
             grouped[kind] = byId
         }
-        _data.update { it.copy(documents = grouped, pending = pending.size, conflicts = conflicting.map { key -> cache.getValue(key).let { c -> Conflict(c.document, c.remote!!) } }) }
+        val documentsState = cache.mapValues { (_, value) -> DocumentSyncState(value.dirty, value.remote != null) }
+        val status = when {
+            conflicting.isNotEmpty() -> SyncStatus.conflict
+            pending.isNotEmpty() -> SyncStatus.pending
+            !vault.load().configured -> SyncStatus.offline
+            else -> _data.value.syncStatus
+        }
+        _data.update { it.copy(documents = grouped, pending = pending.size,
+            conflicts = conflicting.map { key -> cache.getValue(key).let { c -> Conflict(c.document, c.remote!!) } },
+            documentSync = documentsState, syncStatus = status) }
     }
 
     /** 同步、导入或冲突选择可以结束训练；计时只属于进行中的训练，必须同时撤销系统提醒。 */
@@ -132,16 +189,145 @@ class TrainingRepository(
         }
         enqueueSync()
     }
-    /** 一次确认对应完整一轮，事务中验证全部引用，避免只保存分化却缺少部分训练日。 */
+    /** 一次确认完整保存分化、计划和安排引用，避免云端产生失效选择。 */
     suspend fun saveRound(program: Program, plans: List<Plan>) = withContext(Dispatchers.IO) {
         initialize()
         gate.withLock {
             val documents = listOf(document(Kind.program, program.id, program)) + plans.map { document(Kind.plan, it.id, it) }
-            val combined = cache.values.associate { it.document.key() to it.document } + documents.associateBy { it.key() }
-            documents.forEach { value ->
-                validateDocument(value, { kind -> combined.values.filter { it.kind == kind && !it.deleted } }, { kind, id -> combined["${kind.name}/$id"] })
+            val prior = cache.values.associate { it.document.key() to it.document }
+            val combined = prior + documents.associateBy { it.key() }
+            val previousArrangementDoc = combined["arrangement/current"]?.takeUnless { it.deleted }
+            val previousArrangement = _data.value.arrangement ?: previousArrangementDoc?.value<Arrangement>() ?: Arrangement()
+            val availablePrograms = combined.values.filter { it.kind == Kind.program && !it.deleted }.associate { it.id to it.value<Program>() }
+            val availablePlans = combined.values.filter { it.kind == Kind.plan && !it.deleted }.associate { it.id to it.value<Plan>() }
+            val selected = previousArrangement.selectedPlans.mapNotNull { (programId, bySlot) ->
+                val targetProgram = availablePrograms[programId] ?: return@mapNotNull null
+                val valid = bySlot.filter { (slotId, planId) ->
+                    targetProgram.slots.any { it.id == slotId } && availablePlans[planId]?.let { it.programId == programId && it.slotId == slotId } == true
+                }
+                if (valid.isEmpty()) null else programId to valid
+            }.toMap()
+            val overrides = previousArrangement.nextOverrides.filter { (programId, override) ->
+                availablePrograms[programId]?.slots?.any { it.id == override.slotId } == true
             }
-            val entries = documents.map { Cached(it, true) }
+            val arrangement = previousArrangement.copy(
+                programId = previousArrangement.programId?.takeIf { it in availablePrograms },
+                selectedPlans = selected,
+                nextOverrides = overrides
+            )
+            val arrangementDocument = document(Kind.arrangement, "current", arrangement)
+            val complete = combined + (arrangementDocument.key() to arrangementDocument)
+            val all = if (arrangementCloudRead) documents + arrangementDocument else documents
+            all.forEach { value ->
+                validateDocument(value, { kind -> complete.values.filter { it.kind == kind && !it.deleted } }, { kind, id -> complete["${kind.name}/$id"] })
+            }
+            val migrationChanged = !arrangementCloudRead && arrangement != previousArrangement
+            val entries = all.map { doc ->
+                val old = cache[doc.key()]
+                Cached(doc.copy(revision = old?.document?.revision ?: 0), true, old?.remote)
+            }
+            database.withTransaction {
+                dao.putAll(entries.map { it.row() })
+                if (migrationChanged) {
+                    dao.putValue(LocalValue("arrangement-migration", wireJson.encodeToString(arrangement)))
+                    dao.putValue(LocalValue("arrangement-migration-dirty", "true"))
+                }
+            }
+            if (migrationChanged) {
+                arrangementMigrationDirty = true
+                _data.update { it.copy(pendingArrangementMigration = arrangement) }
+            }
+            install(entries)
+        }
+        enqueueSync()
+    }
+    private suspend fun saveArrangement(update: (Arrangement) -> Arrangement) {
+        val old = _data.value.record(Kind.arrangement, "current")
+        val current = _data.value.arrangement ?: Arrangement()
+        val changed = update(current).copy(id = "current")
+        if (!arrangementCloudRead) {
+            gate.withLock {
+                dao.putValue(LocalValue("arrangement-migration", wireJson.encodeToString(changed)))
+                dao.putValue(LocalValue("arrangement-migration-dirty", "true"))
+                arrangementMigrationDirty = true
+                _data.update { it.copy(pendingArrangementMigration = changed) }
+            }
+            enqueueSync()
+            return
+        }
+        val document = document(Kind.arrangement, "current", changed)
+        save(document, old ?: document)
+    }
+    private suspend fun clearPendingArrangementMigration(clearLegacy: Boolean) {
+        gate.withLock {
+            dao.removeValue("arrangement-migration")
+            dao.removeValue("arrangement-migration-dirty")
+            arrangementMigrationDirty = false
+            _data.update { it.copy(pendingArrangementMigration = null) }
+        }
+        if (clearLegacy) (context.applicationContext as TrainingApplication).preferences.clearLegacyChoices()
+    }
+
+    suspend fun selectProgram(programId: String?) {
+        initialize()
+        saveArrangement { it.copy(programId = programId) }
+    }
+
+    suspend fun selectPlan(programId: String, slotId: String, planId: String?) {
+        initialize()
+        saveArrangement { arrangement ->
+            val plans = arrangement.selectedPlans[programId].orEmpty().toMutableMap()
+            if (planId == null) plans.remove(slotId) else plans[slotId] = planId
+            arrangement.copy(selectedPlans = arrangement.selectedPlans + (programId to plans))
+        }
+    }
+
+    suspend fun selectNextOverride(programId: String, slotId: String?) {
+        initialize()
+        saveArrangement { arrangement ->
+            val overrides = arrangement.nextOverrides.toMutableMap()
+            if (slotId == null) overrides.remove(programId)
+            else overrides[programId] = ArrangementOverride(UUID.randomUUID().toString(), slotId)
+            arrangement.copy(nextOverrides = overrides)
+        }
+    }
+
+    suspend fun removeTrainingDocument(original: Document) {
+        if (original.kind !in setOf(Kind.program, Kind.plan)) {
+            remove(original)
+            return
+        }
+        initialize()
+        if (!arrangementCloudRead) {
+            remove(original)
+            saveArrangement { arrangement ->
+                if (original.kind == Kind.program) arrangement.copy(
+                    programId = arrangement.programId.takeUnless { it == original.id },
+                    selectedPlans = arrangement.selectedPlans - original.id,
+                    nextOverrides = arrangement.nextOverrides - original.id
+                ) else arrangement.copy(selectedPlans = arrangement.selectedPlans.mapValues { (_, plans) -> plans.filterValues { it != original.id } })
+            }
+            return
+        }
+        gate.withLock {
+            val arrangementDoc = lookup(Kind.arrangement, "current")
+            val arrangement = arrangementDoc?.value<Arrangement>() ?: Arrangement()
+            val next = if (original.kind == Kind.program) arrangement.copy(
+                programId = arrangement.programId.takeUnless { it == original.id },
+                selectedPlans = arrangement.selectedPlans - original.id,
+                nextOverrides = arrangement.nextOverrides - original.id
+            ) else arrangement.copy(selectedPlans = arrangement.selectedPlans.mapValues { (_, plans) -> plans.filterValues { it != original.id } })
+            val arrangementDocument = document(Kind.arrangement, "current", next)
+            val deleted = original.copy(deleted = true)
+            val combined = cache.values.associate { it.document.key() to it.document } +
+                mapOf(deleted.key() to deleted, arrangementDocument.key() to arrangementDocument)
+            listOf(deleted, arrangementDocument).forEach { doc ->
+                validateDocument(doc, { kind -> combined.values.filter { it.kind == kind && !it.deleted } }) { kind, id -> combined["${kind.name}/$id"] }
+            }
+            val entries = listOf(deleted, arrangementDocument).map { doc ->
+                val old = cache[doc.key()]
+                Cached(doc.copy(revision = old?.document?.revision ?: 0), true, old?.remote)
+            }
             database.withTransaction { dao.putAll(entries.map { it.row() }) }
             install(entries)
         }
@@ -178,16 +364,31 @@ class TrainingRepository(
             validateDocument(document(Kind.plan, plan.id, plan), ::list, ::lookup)
             validatePlanEquipment(plan, list(Kind.equipment).map { it.value<Equipment>() }, ::lookup)
             val exercises = plan.items.map { lookup(Kind.exercise, it.exerciseId)!!.value<Exercise>() }.distinctBy { it.id }
-            persistSession(Session(UUID.randomUUID().toString(), plan.name, plan, exercises, System.currentTimeMillis(), status = "active"), null)
+            val overrideId = plan.programId?.let { programId ->
+                _data.value.arrangement?.takeIf { it.programId == programId }?.nextOverrides?.get(programId)
+                    ?.takeIf { it.slotId == plan.slotId }?.id
+            }
+            persistSession(Session(UUID.randomUUID().toString(), plan.name, plan, exercises, System.currentTimeMillis(),
+                status = "active", arrangementOverrideId = overrideId), null)
         }
         enqueueSync()
     }
     suspend fun updateSession(id: String, update: (Session, TimerState?) -> Pair<Session, TimerState?>) = withContext(Dispatchers.IO) {
+        var completedOverride: Pair<String, String>? = null
         gate.withLock {
             val current = requireNotNull(lookup(Kind.session, id)) { "训练不存在" }.value<Session>()
             require(current.status == "active") { "这次训练已经结束" }
             val (session, timer) = update(current, _timer.value)
             persistSession(session, timer)
+            val programId = session.snapshot?.programId
+            val overrideId = session.arrangementOverrideId
+            if (session.status == "completed" && programId != null && overrideId != null)
+                completedOverride = programId to overrideId
+        }
+        completedOverride?.let { (programId, id) ->
+            saveArrangement { arrangement ->
+                if (arrangement.nextOverrides[programId]?.id == id) arrangement.copy(nextOverrides = arrangement.nextOverrides - programId) else arrangement
+            }
         }
         enqueueSync()
     }
@@ -199,23 +400,41 @@ class TrainingRepository(
         }
     }
     suspend fun restoreTimer() {
-        initialize()
+        initialize(triggerStartupSync = false)
         gate.withLock {
             val current = _timer.value
-            if (current != null && current.deadline > System.currentTimeMillis()) TimerEngine.schedule(context, current)
-            else TimerEngine.cancel(context)
+            when {
+                current == null -> TimerEngine.clearActive(context)
+                current.type != "rest" && current.notified -> TimerEngine.finishExercise(context)
+                else -> TimerEngine.schedule(context, current, clearFinished = false)
+            }
         }
     }
     suspend fun notifyTimer(timer: TimerState) {
-        initialize()
-        gate.withLock { if (_timer.value == timer) TimerEngine.notifyFinished(context, timer) }
+        initialize(triggerStartupSync = false)
+        gate.withLock {
+            val current = _timer.value ?: return@withLock
+            val sameTimer = current.deadline == timer.deadline && current.sessionId == timer.sessionId &&
+                current.itemId == timer.itemId && current.setIndex == timer.setIndex && current.type == timer.type
+            if (!sameTimer || current.deadline > System.currentTimeMillis()) return@withLock
+            TimerEngine.cancelAlarm(context)
+            if (!current.notified) {
+                val notified = current.copy(notified = true)
+                dao.putValue(LocalValue("timer", wireJson.encodeToString(notified)))
+                _timer.value = notified
+                TimerEngine.notifyFinished(context, notified)
+                if (notified.type != "rest") TimerEngine.finishExercise(context)
+            } else if (current.type != "rest") {
+                TimerEngine.finishExercise(context)
+            }
+        }
     }
 
     suspend fun saveConnection(connection: BackendConnection) = withContext(Dispatchers.IO) {
         syncGate.withLock {
             vault.save(connection)
             gate.withLock { dao.putValue(LocalValue("cursor", "0")) }
-            _data.update { it.copy(syncMessage = "连接已保存，等待同步") }
+            _data.update { it.copy(syncMessage = "连接已保存，等待同步", syncStatus = SyncStatus.pending) }
             enqueueSync()
         }
     }
@@ -223,7 +442,7 @@ class TrainingRepository(
         syncGate.withLock {
             vault.clear()
             WorkManager.getInstance(context).apply { cancelUniqueWork("training-sync"); cancelUniqueWork("training-periodic-sync") }
-            _data.update { it.copy(syncMessage = "尚未连接后端，可离线使用") }
+            _data.update { it.copy(syncMessage = "尚未连接后端，可离线使用", syncStatus = SyncStatus.offline) }
         }
     }
     fun enqueueSync() {
@@ -235,16 +454,22 @@ class TrainingRepository(
         work.enqueueUniquePeriodicWork("training-periodic-sync", ExistingPeriodicWorkPolicy.KEEP,
             PeriodicWorkRequestBuilder<SyncWorker>(15, TimeUnit.MINUTES).setConstraints(constraints).build())
     }
-    fun syncFailure(message: String) { _data.update { it.copy(syncMessage = message) } }
+    fun syncFailure(message: String) { _data.update { it.copy(syncMessage = message, syncStatus = SyncStatus.error, mediaSyncStatus = if (it.mediaSyncStatus == MediaSyncStatus.checking) MediaSyncStatus.error else it.mediaSyncStatus) } }
 
-    suspend fun sync() = withContext(Dispatchers.IO) {
+    suspend fun sync(): Unit = withContext(Dispatchers.IO) {
+        initialize(triggerStartupSync = false)
         syncGate.withLock {
-            initialize()
             val connection = vault.load()
             require(connection.configured) { "请先填写后端地址和 token" }
-            _data.update { it.copy(syncMessage = "正在同步") }
+            _data.update { it.copy(syncMessage = "正在同步", syncStatus = SyncStatus.syncing, mediaSyncStatus = MediaSyncStatus.idle) }
+            val cursor = if (!arrangementCloudRead) "0" else dao.value("cursor") ?: "0"
             val request = gate.withLock {
-                SyncRequest((dao.value("cursor") ?: "0").toLong(), pending.map { key -> cache.getValue(key).document.let { Mutation(it, it.revision) } })
+                SyncRequest(cursor.toLong(), pending.mapNotNull { key ->
+                    val cached = cache.getValue(key)
+                    val value = cached.document
+                    if (cached.remote != null || (!arrangementCloudRead && value.kind == Kind.arrangement)) null
+                    else Mutation(value, value.revision)
+                })
             }
             request.mutations.filter { it.document.kind == Kind.media && !it.document.deleted }.forEach { mutation ->
                 val media = mutation.document.value<Media>()
@@ -291,11 +516,39 @@ class TrainingRepository(
                     val key = conflict.local.key(); val local = current(key)!!
                     patch[key] = local.copy(remote = conflict.remote)
                 }
-                database.withTransaction { dao.putAll(patch.values.map { it.row() }); dao.putValue(LocalValue("cursor", result.cursor.toString())) }
+                val syncedAt = System.currentTimeMillis()
+                database.withTransaction {
+                    dao.putAll(patch.values.map { it.row() })
+                    dao.putValue(LocalValue("cursor", result.cursor.toString()))
+                    dao.putValue(LocalValue("lastSuccessfulSyncAt", syncedAt.toString()))
+                    if (request.cursor == 0L) dao.putValue(LocalValue("arrangement-cloud-read", "true"))
+                }
                 install(patch.values.toList())
+                if (request.cursor == 0L) {
+                    arrangementCloudRead = true
+                    _data.update { it.copy(arrangementCloudRead = true) }
+                }
+                _data.update { it.copy(lastSuccessfulSyncAt = syncedAt) }
                 clearInactiveTimer()
             }
-            _data.update { it.copy(syncMessage = "数据已同步，正在检查素材") }
+            val remoteArrangement = (result.documents + result.accepted)
+                .firstOrNull { it.kind == Kind.arrangement && it.id == "current" }
+            if (remoteArrangement != null) {
+                val migration = _data.value.pendingArrangementMigration
+                if (arrangementMigrationDirty && migration != null) {
+                    val local = document(Kind.arrangement, "current", migration).copy(revision = remoteArrangement.revision)
+                    val conflict = Cached(local, true, remoteArrangement)
+                    gate.withLock {
+                        dao.put(conflict.row())
+                        install(listOf(conflict))
+                    }
+                }
+                clearPendingArrangementMigration(clearLegacy = true)
+            } else if (request.cursor == 0L && _data.value.record(Kind.arrangement, "current") == null) {
+                val migration = _data.value.pendingArrangementMigration
+                if (migration != null) saveArrangement { migration }
+            }
+            _data.update { it.copy(syncMessage = "数据已同步，正在检查素材", mediaSyncStatus = MediaSyncStatus.checking) }
             // 修订号已确认后仍可能下载中断；每次同步都检查缺失素材，不依赖本次增量再次包含它。
             val missing = gate.withLock {
                 val candidates = linkedMapOf<String, Document>()
@@ -321,7 +574,15 @@ class TrainingRepository(
                         Files.move(temporary.toPath(), file.toPath(), StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING)
                     } finally { temporary.delete() }
             }
-            _data.update { it.copy(syncMessage = if (it.conflicts.isNotEmpty()) "有 ${it.conflicts.size} 项冲突待选择" else if (it.pending > 0) "有 ${it.pending} 项新改动等待同步" else "已同步") }
+            val status = when {
+                _data.value.conflicts.isNotEmpty() -> SyncStatus.conflict
+                _data.value.pending > 0 -> SyncStatus.pending
+                else -> SyncStatus.synced
+            }
+            _data.update { it.copy(
+                syncMessage = if (status == SyncStatus.conflict) "有 ${it.conflicts.size} 项冲突待选择" else if (status == SyncStatus.pending) "有 ${it.pending} 项新改动等待同步" else "已同步",
+                syncStatus = status, mediaSyncStatus = MediaSyncStatus.ready
+            ) }
         }
     }
     private suspend fun requireSuccess(response: HttpResponse) {

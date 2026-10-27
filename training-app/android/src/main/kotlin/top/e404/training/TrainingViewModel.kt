@@ -31,14 +31,12 @@ class TrainingViewModel(application: Application) : AndroidViewModel(application
         }
     }
     fun save(doc: Document, original: Document, done: () -> Unit = {}) = action { repository.save(doc, original); done() }
-    fun start(plan: Plan) = action {
-        repository.beginSession(plan)
-        plan.programId?.let { programId ->
-            val preferences = getApplication<TrainingApplication>().preferences
-            if (plan.date == null) preferences.selectPlans(programId, mapOf(plan.slotId!! to plan.id))
-            else preferences.selectProgram(programId)
-        }
-    }
+    fun start(plan: Plan) = action { repository.beginSession(plan) }
+    fun selectProgram(programId: String?) = action { repository.selectProgram(programId) }
+    fun selectPlan(programId: String, slotId: String, planId: String?) = action { repository.selectPlan(programId, slotId, planId) }
+    fun selectNextOverride(programId: String, slotId: String?) = action { repository.selectNextOverride(programId, slotId) }
+    fun saveRound(program: Program, plans: List<Plan>) = action { repository.saveRound(program, plans) }
+    fun removeTrainingDocument(document: Document) = action { repository.removeTrainingDocument(document) }
     fun finish(sessionId: String, cancelled: Boolean) = action {
         repository.updateSession(sessionId) { session, _ ->
             require(cancelled || session.results.isNotEmpty()) { "没有完成任何组，请选择取消训练" }
@@ -49,12 +47,20 @@ class TrainingViewModel(application: Application) : AndroidViewModel(application
         repository.updateSession(sessionId) { session, currentTimer ->
             val item = session.items.single { it.id == itemId }
             val old = session.results.singleOrNull { it.itemId == itemId && it.setIndex == index }
+            if (old != null) return@updateSession session to currentTimer
             val now = System.currentTimeMillis()
-            val result = SetResult(itemId, index, target.reps, target.seconds, target.load, target.side, old?.completedAt ?: now)
-            val revised = session.copy(results = session.results.filterNot { it.itemId == itemId && it.setIndex == index } + result)
-            val timer = if (old != null) currentTimer else if (target.restSeconds > 0) TimerState(now + target.restSeconds * 1000L,
+            val result = SetResult(itemId, index, target.reps, target.seconds, target.load, target.side, now)
+            val revised = session.copy(results = session.results + result)
+            val timer = if (target.restSeconds > 0) TimerState(now + target.restSeconds * 1000L,
                 "${session.exercises.single { it.id == item.exerciseId }.name} · 第 ${index + 1} 组", session.id, itemId, index) else null
             revised to timer
+        }
+    }
+    fun reviseSet(sessionId: String, itemId: String, index: Int, target: SetTarget) = action {
+        repository.updateSession(sessionId) { session, timer ->
+            val old = requireNotNull(session.results.singleOrNull { it.itemId == itemId && it.setIndex == index }) { "完成组不存在" }
+            val revised = old.copy(reps = target.reps, seconds = target.seconds, load = target.load, side = target.side, segments = emptyList())
+            session.copy(results = session.results.map { if (it.itemId == itemId && it.setIndex == index) revised else it }) to timer
         }
     }
     fun undoSet(sessionId: String, itemId: String, index: Int) = action {
@@ -102,17 +108,17 @@ class TrainingViewModel(application: Application) : AndroidViewModel(application
 fun newPlanItem(exercise: Exercise, gymId: String?, state: AppData, count: Int? = null): PlanItem {
     val equipment = state.records(Kind.equipment).map { it.value<Equipment>() }
         .firstOrNull { it.gymId == gymId && exercise.equipmentTags.firstOrNull() in it.tags }
-    var previous: SetResult? = null
-    state.records(Kind.session).forEach { doc ->
-        val session = doc.value<Session>()
-        session.results.forEach { result ->
-            if ((previous == null || result.completedAt > previous!!.completedAt) && session.items.any { it.id == result.itemId && it.exerciseId == exercise.id && it.equipmentId == equipment?.id }) previous = result
-        }
-    }
+    val previous = state.records(Kind.session).map { it.value<Session>() }.sortedWith(sessionComparator)
+        .asSequence().mapNotNull { session ->
+            session.results.lastOrNull { result ->
+                session.items.any { it.id == result.itemId && it.exerciseId == exercise.id && it.equipmentId == equipment?.id }
+            }
+        }.firstOrNull()
+    val previousLoad = previous?.segments?.lastOrNull()?.load ?: previous?.load
     val target = SetTarget(
         reps = if (exercise.measurement == "reps") previous?.reps ?: 10 else null,
         seconds = if (exercise.measurement == "seconds") previous?.seconds ?: exercise.defaultSeconds else null,
-        load = previous?.load, restSeconds = if (exercise.type == "stretch") 15 else 90
+        load = previousLoad?.takeUnless { it.meaning == "unknown" }, restSeconds = if (exercise.type == "stretch") 15 else 90
     )
     val size = count ?: if (exercise.type == "stretch") if (exercise.unilateral) 2 else 1 else 4
     val sets = List(size) { index -> if (exercise.type == "stretch" && exercise.unilateral) target.copy(side = if (index % 2 == 0) "left" else "right") else target }

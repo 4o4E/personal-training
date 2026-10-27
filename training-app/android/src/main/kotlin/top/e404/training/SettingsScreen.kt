@@ -1,13 +1,16 @@
 package top.e404.training
 
+import androidx.compose.foundation.layout.Arrangement
 import android.Manifest
 import android.content.Intent
 import android.net.Uri
 import android.os.Build
 import android.provider.Settings
-import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.material3.*
@@ -40,16 +43,18 @@ import top.e404.training.shared.*
         }
     }
     val import = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri -> importUri = uri?.toString() }
-    FormDialog("设置", onDismiss) {
+    Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+        Text("返回后继续当前操作；训练读数和休息计时会保留。", style = MaterialTheme.typography.bodySmall)
         val choices by preferences.data.collectAsState()
         InfoCard("应用外观") {
             Choice("深浅模式", choices.appearance, Appearance.entries.map { it to it.title }, preferences::appearance)
             Text("默认跟随系统；切换外观不会重置训练、编辑内容或休息计时。", style = MaterialTheme.typography.bodySmall)
         }
         AppUpdateCard()
-        InfoCard("原生提醒权限") {
-            Text(if (notifications) "通知权限已具备" else "通知尚未授权或提醒渠道被关闭", color = if (notifications) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error)
-            Text(if (exact) "定时唤醒权限已具备" else "需要允许定时唤醒", color = if (exact) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error)
+        InfoCard("计时与系统提醒") {
+            Text(if (notifications) "通知显示已具备" else "通知未授权或提醒渠道已关闭", color = if (notifications) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error)
+            Text(if (exact) "精确定时唤醒权限已具备" else "精确定时唤醒权限未具备", color = if (exact) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error)
+            Text("训练计时由前台服务运行，不依赖保持页面打开；通知授权影响系统到时提醒能否显示，精确定时权限用于系统唤醒能力。勿扰及声音遵循系统设置。", style = MaterialTheme.typography.bodySmall)
             Button(onClick = {
                 if (Build.VERSION.SDK_INT >= 33 && context.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != android.content.pm.PackageManager.PERMISSION_GRANTED)
                     askNotifications.launch(Manifest.permission.POST_NOTIFICATIONS)
@@ -57,6 +62,15 @@ import top.e404.training.shared.*
             }) { Text("通知授权与声音设置") }
             if (!exact && Build.VERSION.SDK_INT >= 31) Button(onClick = { context.startActivity(Intent(Settings.ACTION_REQUEST_SCHEDULE_EXACT_ALARM, Uri.parse("package:${context.packageName}"))) }) { Text("允许定时唤醒") }
             OutlinedButton(onClick = { context.startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:${context.packageName}"))) }) { Text("应用电池与后台设置") }
+            val liveUpdates = remember(permissionRevision, permissionChanged) { TimerEngine.canRequestLiveUpdates(context) }
+            val promoted = remember(permissionRevision, permissionChanged) { TimerEngine.isActiveNotificationPromoted(context) }
+            Text(when {
+                promoted -> "当前休息通知已由系统提升展示。"
+                Build.VERSION.SDK_INT < 36 -> "当前Android版本不支持Live Updates；仍使用普通倒计时通知。"
+                !notifications -> "通知权限未具备，无法请求Live Updates；请先允许通知。"
+                !liveUpdates -> "系统未允许提升此通知；可在系统通知设置中检查相关权限。"
+                else -> "系统支持且允许请求Live Updates，实际是否提升以系统通知状态为准。"
+            }, style = MaterialTheme.typography.bodySmall)
             Text("休息结束时唤醒应用并发送普通通知，不需要保持界面打开。提示音和振动遵循系统通知设置。", style = MaterialTheme.typography.bodySmall)
         }
         InfoCard("自有后端") {
@@ -68,7 +82,8 @@ import top.e404.training.shared.*
                 TextButton(onClick = { viewModel.action { repository.sync() } }) { Text("立即同步") }
             }
             Text(state.syncMessage)
-            Text("待同步 ${state.pending} 项 · 待选择冲突 ${state.conflicts.size} 项")
+            Text("${when (state.syncStatus) { SyncStatus.offline -> "离线"; SyncStatus.syncing -> "同步中"; SyncStatus.synced -> "已同步"; SyncStatus.pending -> "待上传"; SyncStatus.conflict -> "存在冲突"; SyncStatus.error -> "同步失败" }} · 最近成功同步 ${state.lastSuccessfulSyncAt?.let(::localDateTime) ?: "尚无"}")
+            Text("待上传 ${state.pending} 项 · 冲突 ${state.conflicts.size} 项 · 素材 ${when (state.mediaSyncStatus) { MediaSyncStatus.idle -> "未开始"; MediaSyncStatus.checking -> "检查中"; MediaSyncStatus.ready -> "已就绪"; MediaSyncStatus.error -> "有错误" }}")
             TextButton(onClick = { viewModel.action { repository.disconnect(); url = ""; token = "" } }) { Text("断开连接，保留手机资料") }
         }
         val tagNames = equipmentNames()
@@ -120,13 +135,32 @@ private fun documentDescription(doc: Document, state: AppData, tagNames: Map<Str
             append(plan.notes)
         } }
         Kind.session -> doc.value<Session>().let { session -> buildString {
-            append("${session.name} · ${localDateTime(session.startedAt)}\n")
+            append("${session.name} · ${session.startedAt?.let(::localDateTime) ?: session.historicalSource?.localDate ?: "时间未记录"}\n")
             append(when (session.status) { "active" -> "进行中\n"; "completed" -> "已完成\n"; else -> "已取消\n" })
             session.items.forEach { item ->
                 append("${session.exercises.single { it.id == item.exerciseId }.name}\n")
-                session.results.forEach { result -> if (result.itemId == item.id) append("第 ${result.setIndex + 1} 组：" + listOfNotNull(result.reps?.let { "$it 次" }, result.seconds?.let { "$it 秒" }, sideText(result.side), loadText(result.load)).joinToString(" · ") + "\n") }
+                session.results.forEach { result -> if (result.itemId == item.id) append("第 ${result.setIndex + 1} 组：${sideText(result.side)} · ${resultText(result)}\n") }
             }
             append(session.notes)
+        } }
+        Kind.arrangement -> doc.value<top.e404.training.shared.Arrangement>().let { arrangement -> buildString {
+            val currentProgramId = arrangement.programId
+            val currentProgram = currentProgramId?.let { state.record(Kind.program, it)?.value<Program>() }
+            append("当前分化：${currentProgram?.name ?: if (currentProgramId == null) "未选择" else "分化资料未取得"}\n")
+            if (arrangement.selectedPlans.isEmpty()) append("尚未选用循环计划。\n")
+            arrangement.selectedPlans.forEach { (programId, slots) ->
+                val program = state.record(Kind.program, programId)?.value<Program>()
+                slots.forEach { (slotId, planId) ->
+                    val slotName = program?.slots?.firstOrNull { it.id == slotId }?.name ?: "训练项资料未取得"
+                    val planName = state.record(Kind.plan, planId)?.value<Plan>()?.name ?: "计划资料未取得"
+                    append("${program?.name ?: "分化资料未取得"} · $slotName → $planName\n")
+                }
+            }
+            arrangement.nextOverrides.forEach { (programId, override) ->
+                val program = state.record(Kind.program, programId)?.value<Program>()
+                val slotName = program?.slots?.firstOrNull { it.id == override.slotId }?.name ?: "训练项资料未取得"
+                append("下次训练：${program?.name ?: "分化资料未取得"} · $slotName\n")
+            }
         } }
         Kind.program -> doc.value<Program>().let { "${it.name}\n" + it.slots.joinToString("\n") { slot -> "${slot.name}：${parts(slot.muscles)}" } }
         Kind.equipment -> doc.value<Equipment>().let { "${it.name} · ${it.unit} · " + when (it.meaning) { "per_hand" -> "单只重量"; "per_side" -> "单侧配重"; else -> "总重量" } + "\n" + it.tags.joinToString("、") { tag -> tagNames[tag] ?: tag } + "\n${it.instructions}\n${it.notes}" }

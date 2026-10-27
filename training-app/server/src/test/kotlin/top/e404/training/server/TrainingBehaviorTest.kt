@@ -4,6 +4,8 @@ import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.io.TempDir
 import top.e404.training.shared.*
 import java.nio.file.Path
+import java.time.LocalDate
+import java.time.ZoneId
 import kotlin.test.*
 
 /** 使用实际目录、实际 SQLite 和内置动作资料；不替换网络、数据库或业务实现。 */
@@ -59,7 +61,96 @@ class TrainingBehaviorTest {
         assertEquals("cancelled", summary.sessions.single().status)
         assertEquals(Load(20.0, "kg", "per_hand"), summary.sessions.single().results[0].load)
         assertEquals(Load(60.0, "lb", mode = "assistance"), summary.sessions.single().results[1].load)
-        assertEquals(11, s.snapshot.items.sumOf { it.sets.size })
+        assertEquals(11, s.snapshot!!.items.sumOf { it.sets.size })
+    }
+    @Test fun `历史日期和组内降重在真实SQLite中保留且只计一组`() {
+        val history = Session(
+            id = "historical", name = "历史训练", snapshot = null, exercises = listOf(dumbbell),
+            startedAt = null, endedAt = null, status = "completed",
+            results = listOf(SetResult("actual", 0, reps = 10, completedAt = null, segments = listOf(
+                SetSegment(4, Load(10.0, "kg", "unknown")),
+                SetSegment(6, Load(7.5, "kg", "per_hand"))
+            ))),
+            items = listOf(PlanItem("actual", dumbbell.id, sets = emptyList())),
+            historicalSource = HistoricalSource("source-2026-10-13", "2026-10-13", "原始历史记录")
+        )
+        Store(directory, seed).use { store ->
+            val saved = store.put(document(Kind.session, history.id, history))
+            val restored = saved.value<Session>()
+            assertNull(restored.snapshot)
+            assertNull(restored.startedAt)
+            assertNull(restored.endedAt)
+            assertNull(restored.results.single().completedAt)
+            assertEquals(LocalDate.parse("2026-10-13"), sessionDate(restored))
+            val olderTime = LocalDate.parse("2026-10-12").atStartOfDay(ZoneId.of("Asia/Shanghai")).toInstant().toEpochMilli()
+            val realOlder = session("older-realtime", "push", "completed", olderTime)
+            assertEquals("historical", summarizeHistory(listOf(realOlder, restored)).sessions.first().id)
+            assertEquals(1, restored.results.size)
+            assertEquals(2, restored.results.single().segments.size)
+            assertEquals(listOf(4, 6), restored.results.single().segments.map { it.reps })
+            assertEquals(listOf("kg", "kg"), restored.results.single().segments.map { it.load?.unit })
+            assertEquals(listOf("unknown", "per_hand"), restored.results.single().segments.map { it.load?.meaning })
+        }
+    }
+    @Test fun `历史多段记录在一二版备份中往返`() {
+        val history = Session(
+            id = "backup-history", name = "历史训练", snapshot = null, exercises = listOf(dumbbell),
+            startedAt = null, endedAt = null, status = "completed",
+            results = listOf(SetResult("actual", 0, reps = 10, segments = listOf(
+                SetSegment(4, Load(10.0, "kg", "unknown")), SetSegment(6, Load(7.5, "kg", "per_hand"))
+            ))),
+            items = listOf(PlanItem("actual", dumbbell.id, sets = emptyList())),
+            historicalSource = HistoricalSource("backup-source", "2026-10-13", "原始文本")
+        )
+        val docs = listOf(document(Kind.session, history.id, history))
+        for (version in 1..2) {
+            val bytes = java.io.ByteArrayOutputStream()
+            writeBackup(Backup(formatVersion = version, documents = docs, exportedAt = start), bytes) { null }
+            val restored = readBackup(bytes.toByteArray().inputStream(), directory.resolve("backup-media-$version"))
+            assertEquals(version, restored.formatVersion)
+            assertEquals(history, restored.documents.single().value<Session>())
+            if (version == 2) {
+                Store(directory.resolve("import-v2"), seed).use { store ->
+                    store.import(restored, replace = false)
+                    assertEquals(history, store.get(Kind.session, history.id)!!.value<Session>())
+                }
+            }
+        }
+    }
+
+
+    @Test fun `已完成手动下次选择后不因后续训练重新生效`() {
+        Store(directory, seed).use { store ->
+            store.put(document(Kind.program, program.id, program))
+            val legsPlan = plan("legs-plan", "legs")
+            store.put(document(Kind.plan, legsPlan.id, legsPlan))
+            val override = ArrangementOverride("manual-next-1", "legs")
+            val savedOldArrangement = store.put(document(Kind.arrangement, "current", Arrangement(programId = program.id, nextOverrides = mapOf(program.id to override))))
+            val manual = session("manual-legs", "legs", "completed", start).copy(
+                snapshot = legsPlan, arrangementOverrideId = override.id
+            )
+            store.put(document(Kind.session, manual.id, manual))
+            val nextOverride = ArrangementOverride("manual-next-2", "legs")
+            store.put(
+                document(Kind.arrangement, "current", Arrangement(programId = program.id,
+                    nextOverrides = mapOf(program.id to nextOverride))),
+                savedOldArrangement.revision
+            )
+            val savedArrangement = store.get(Kind.arrangement, "current")!!.value<Arrangement>()
+            val sessionsAfterManual = store.list(Kind.session).map { it.value<Session>() }
+            assertEquals("legs", nextSlot(program, sessionsAfterManual, savedArrangement.nextOverrides[program.id]).id)
+            val cancelled = session("cancelled-manual-next", "legs", "cancelled", start + 10000).copy(
+                results = emptyList(), arrangementOverrideId = nextOverride.id
+            )
+            store.put(document(Kind.session, cancelled.id, cancelled))
+            val sessionsAfterCancelled = store.list(Kind.session).map { it.value<Session>() }
+            assertEquals("legs", nextSlot(program, sessionsAfterCancelled, savedArrangement.nextOverrides[program.id]).id)
+            assertEquals("push", nextSlot(program, sessionsAfterManual, override).id)
+            val nextPush = session("after-manual-push", "push", "completed", start + 20000).copy(snapshot = plan("push-after", "push"))
+            store.put(document(Kind.session, nextPush.id, nextPush))
+            val sessionsAfterPush = store.list(Kind.session).map { it.value<Session>() }
+            assertEquals("pull", nextSlot(program, sessionsAfterPush, override).id)
+        }
     }
 
     @Test fun `并发版本冲突不覆盖内容且其他资料仍可提交`() {
@@ -92,7 +183,7 @@ class TrainingBehaviorTest {
             val accepted = store.put(document(Kind.session, revised.id, revised), saved.revision)
             assertEquals(started.snapshot, accepted.value<Session>().snapshot)
             assertEquals(started.results, accepted.value<Session>().results)
-            val rewritten = revised.copy(snapshot = revised.snapshot.copy(name = "改写原计划"))
+            val rewritten = revised.copy(snapshot = revised.snapshot!!.copy(name = "改写原计划"))
             assertFailsWith<IllegalArgumentException> { store.put(document(Kind.session, revised.id, rewritten), accepted.revision) }
             val changedCompletedTarget = revised.copy(items = revised.items.map { if (it.id == "item") it.copy(sets = List(4) { SetTarget(reps = 20) }) else it })
             assertFailsWith<IllegalArgumentException> { store.put(document(Kind.session, revised.id, changedCompletedTarget), accepted.revision) }
@@ -148,7 +239,7 @@ class TrainingBehaviorTest {
         Store(directory, seed).use { store ->
             val started = session("immutable-import", "push", "active", start)
             store.put(document(Kind.session, started.id, started))
-            val changed = started.copy(snapshot = started.snapshot.copy(items = started.snapshot.items.map { item ->
+            val changed = started.copy(snapshot = started.snapshot!!.copy(items = started.snapshot!!.items.map { item ->
                 item.copy(sets = item.sets.map { it.copy(reps = 12) })
             }))
             val backup = Backup(documents = listOf(document(Kind.session, changed.id, changed)), exportedAt = start + 2000)
