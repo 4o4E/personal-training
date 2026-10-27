@@ -42,14 +42,13 @@ private fun sessionStatusText(status: String): String = when (status) {
     var displayedMonth by rememberSaveable { mutableStateOf(YearMonth.now().toString()) }
     var selectedDate by rememberSaveable { mutableStateOf<String?>(null) }
     val month = YearMonth.parse(displayedMonth)
-    val sessionsByDate = state.records(Kind.session).map { document -> document to document.value<Session>() }
-        .filter { (_, session) -> session.results.isNotEmpty() }
-        .groupBy { (_, session) -> sessionDate(session) }
+    val sessionsByDate = state.records(Kind.session).map { it.value<Session>() }
+        .filter { it.results.isNotEmpty() }
+        .groupBy(::sessionDate)
     val startOffset = month.atDay(1).dayOfWeek.value - DayOfWeek.MONDAY.value
     val endPadding = (7 - ((startOffset + month.lengthOfMonth()) % 7)) % 7
     val cells = List<LocalDate?>(startOffset) { null } + (1..month.lengthOfMonth()).map(month::atDay) + List<LocalDate?>(endPadding) { null }
     Column(Modifier.fillMaxSize().padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-        Text("运动记录", style = MaterialTheme.typography.headlineSmall)
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
             TextButton(onClick = { displayedMonth = month.minusMonths(1).toString() }) { Text("上月") }
             Text(month.format(DateTimeFormatter.ofPattern("yyyy年 M月", Locale.CHINA)), style = MaterialTheme.typography.titleLarge)
@@ -64,28 +63,23 @@ private fun sessionStatusText(status: String): String = when (status) {
             cells.chunked(7).forEach { week ->
                 Row(Modifier.fillMaxWidth()) {
                     week.forEach { date ->
-                        Box(Modifier.weight(1f).heightIn(min = 58.dp).padding(2.dp)) {
+                        Box(Modifier.weight(1f).height(80.dp).padding(1.dp)) {
                             if (date != null) {
                                 val daily = sessionsByDate[date].orEmpty()
                                 val isSelected = selectedDate == date.toString()
-                                Column(Modifier.fillMaxWidth().background(
+                                Column(Modifier.fillMaxSize().background(
                                     if (isSelected) MaterialTheme.colorScheme.secondaryContainer else MaterialTheme.colorScheme.surfaceVariant,
                                     MaterialTheme.shapes.small
                                 ).clickable {
                                     selectedDate = date.toString()
                                     onDay(date.toString())
-                                }.padding(4.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                                }.padding(vertical = 4.dp), horizontalAlignment = Alignment.CenterHorizontally) {
                                     Text(date.dayOfMonth.toString(), style = MaterialTheme.typography.bodyMedium)
                                     if (daily.isNotEmpty()) {
-                                        val dirtyCount = daily.count { (document, _) -> state.documentSync["${document.kind.name}/${document.id}"]?.dirty == true }
-                                        val conflictCount = daily.count { (document, _) -> state.documentSync["${document.kind.name}/${document.id}"]?.conflict == true }
-                                        Text("● ${daily.size} 条", color = MaterialTheme.colorScheme.primary, style = MaterialTheme.typography.labelSmall)
-                                        daily.take(2).forEach { (_, session) ->
-                                            Text(session.name, style = MaterialTheme.typography.labelSmall, textAlign = TextAlign.Center)
-                                        }
-                                        if (daily.size > 2) Text("另有 ${daily.size - 2} 条，点击查看全部", style = MaterialTheme.typography.labelSmall, textAlign = TextAlign.Center)
-                                        if (dirtyCount > 0) Text("待上传 $dirtyCount", color = MaterialTheme.colorScheme.tertiary, style = MaterialTheme.typography.labelSmall)
-                                        if (conflictCount > 0) Text("冲突 $conflictCount", color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.labelSmall)
+                                        val labels = daily.map(::sessionTrainingLabel).distinct()
+                                        val completedSets = daily.sumOf { it.results.size }
+                                        Text(labels.joinToString("、"), maxLines = 2, style = MaterialTheme.typography.labelSmall, textAlign = TextAlign.Center)
+                                        Text("${completedSets}组", style = MaterialTheme.typography.labelSmall, textAlign = TextAlign.Center)
                                     }
                                 }
                             }
@@ -94,8 +88,6 @@ private fun sessionStatusText(status: String): String = when (status) {
                 }
             }
         }
-        selectedDate?.let { Text("已选 $it", style = MaterialTheme.typography.bodyMedium) }
-        Text("仅至少完成一组的训练日期显示标记。", style = MaterialTheme.typography.bodySmall)
     }
 }
 
@@ -114,8 +106,7 @@ private fun sessionStatusText(status: String): String = when (status) {
                 val conflict = state.documentSync["${document.kind.name}/${document.id}"]?.conflict == true
                 val startedAt = session.startedAt
                 val snapshot = session.snapshot
-                val historicalSource = session.historicalSource
-                InfoCard(session.name) {
+                InfoCard(sessionTrainingLabel(session)) {
                     Text(when {
                         conflict -> "同步冲突 · 本机记录保留"
                         dirty -> "本机待上传"
@@ -123,7 +114,7 @@ private fun sessionStatusText(status: String): String = when (status) {
                         else -> "本机保存副本 · ${syncStatusText(state.syncStatus)}"
                     }, color = if (dirty || conflict) MaterialTheme.colorScheme.tertiary else MaterialTheme.colorScheme.secondary)
                     if (startedAt != null) Text("开始：${localDateTime(startedAt)}")
-                    else Text("训练日期：${historicalSource?.localDate ?: date} · 未记录具体时间")
+                    else Text("训练日期：${session.historicalSource?.localDate ?: date} · 未记录具体时间")
                     session.endedAt?.let { Text("结束：${localDateTime(it)}") }
                     Text("状态：${sessionStatusText(session.status)}")
                     if (snapshot != null) Text("开始时计划：${snapshot.name}") else Text("开始时计划：未记录")
@@ -139,7 +130,6 @@ private fun sessionStatusText(status: String): String = when (status) {
                             }
                         }
                     }
-                    historicalSource?.let { Text("历史来源：${it.originalText}", style = MaterialTheme.typography.bodySmall) }
                     if (session.notes.isNotBlank()) Text("反馈：${session.notes}")
                     Text("实际完成 ${session.results.size} 组")
                     if (session.status != "active") {

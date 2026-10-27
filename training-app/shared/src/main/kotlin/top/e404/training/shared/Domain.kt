@@ -45,7 +45,7 @@ enum class Kind { muscle, media, exercise, gym, equipment, program, plan, sessio
     val load: Load? = null, val side: String = "both", val completedAt: Long? = null,
     val segments: List<SetSegment> = emptyList()
 )
-@Serializable data class HistoricalSource(val sourceId: String, val localDate: String, val originalText: String)
+@Serializable data class HistoricalSource(val sourceId: String, val localDate: String)
 @Serializable data class ArrangementOverride(val id: String, val slotId: String)
 @Serializable data class Arrangement(
     val id: String = "current", val programId: String? = null,
@@ -58,8 +58,18 @@ enum class Kind { muscle, media, exercise, gym, equipment, program, plan, sessio
     val startedAt: Long?, val endedAt: Long? = null, val status: String,
     val results: List<SetResult> = emptyList(), val notes: String = "",
     val items: List<PlanItem> = snapshot?.items ?: emptyList(), val skippedItems: List<String> = emptyList(),
-    val historicalSource: HistoricalSource? = null, val arrangementOverrideId: String? = null
+    val historicalSource: HistoricalSource? = null, val arrangementOverrideId: String? = null,
+    val splitSlotName: String? = null
 )
+
+fun sessionTrainingLabel(session: Session): String = when (session.splitSlotName) {
+    null -> "自由锻炼"
+    "推类训练", "推" -> "推"
+    "拉类训练", "拉" -> "拉"
+    "腿部训练", "腿类训练", "腿" -> "腿"
+    else -> requireNotNull(session.splitSlotName)
+}
+
 @Serializable data class Document(
     val kind: Kind, val id: String, val data: JsonObject,
     val revision: Long = 0, val deleted: Boolean = false
@@ -71,7 +81,7 @@ enum class Kind { muscle, media, exercise, gym, equipment, program, plan, sessio
     val cursor: Long, val documents: List<Document>, val accepted: List<Document> = emptyList(),
     val conflicts: List<Conflict> = emptyList()
 )
-@Serializable data class Backup(val formatVersion: Int = 2, val documents: List<Document>, val exportedAt: Long)
+@Serializable data class Backup(val formatVersion: Int = 3, val documents: List<Document>, val exportedAt: Long)
 @Serializable data class ApiError(val message: String)
 @Serializable data class TimerState(
     val deadline: Long, val label: String, val sessionId: String,
@@ -80,7 +90,9 @@ enum class Kind { muscle, media, exercise, gym, equipment, program, plan, sessio
 )
 @Serializable data class HistorySummary(val sessions: List<Session>, val strengthSets: Int, val stretchSets: Int, val strengthSetsByMuscle: Map<String, Int>)
 
-inline fun <reified T> Document.value(): T = wireJson.decodeFromJsonElement(data)
+inline fun <reified T> Document.value(): T = wireJson.decodeFromJsonElement(
+    if (kind == Kind.session) withoutDeprecatedHistoricalText(this).data else data
+)
 inline fun <reified T> document(kind: Kind, id: String, value: T): Document =
     Document(kind, id, wireJson.encodeToJsonElement(value).jsonObject)
 
@@ -103,6 +115,9 @@ fun checkTarget(target: SetTarget) {
     require(target.restSeconds >= 0) { "休息时长不能为负数" }
     require(target.side in setOf("both", "left", "right")) { "左右侧要求不正确" }
 }
+
+private fun Document.hasDeprecatedHistoricalText(): Boolean =
+    data["historicalSource"]?.takeUnless { it is JsonNull }?.jsonObject?.containsKey("originalText") == true
 
 /** 同一入口核验客户端和接口数据；只校验业务边界，不推测或换算器械读数。 */
 fun validateDocument(doc: Document, list: (Kind) -> List<Document>, lookup: (Kind, String) -> Document?) {
@@ -199,6 +214,7 @@ fun validateDocument(doc: Document, list: (Kind) -> List<Document>, lookup: (Kin
             }
         }.id
         Kind.session -> doc.value<Session>().also { session ->
+            require(!doc.hasDeprecatedHistoricalText()) { "新写入不能包含已废弃的 historicalSource.originalText" }
             require(session.name.isNotBlank()) { "训练缺少名称" }
             require(session.status in setOf("active", "completed", "cancelled")) { "训练状态不正确" }
             val history = session.historicalSource
@@ -209,7 +225,7 @@ fun validateDocument(doc: Document, list: (Kind) -> List<Document>, lookup: (Kin
             } else {
                 require(session.status != "active" && session.snapshot == null && session.startedAt == null) { "历史训练不能作为实时训练或包含推断的计划时间" }
                 LocalDate.parse(history.localDate)
-                require(history.sourceId.isNotBlank() && history.originalText.isNotBlank()) { "历史来源和原始文字不能为空" }
+                require(history.sourceId.isNotBlank()) { "历史来源不能为空" }
             }
             require(session.status != "completed" || session.results.isNotEmpty()) { "没有完成组的训练不能标记完成" }
             require(session.results.map { it.itemId to it.setIndex }.distinct().size == session.results.size) { "同一训练组不能重复记录" }
@@ -308,8 +324,13 @@ fun summarizeHistory(sessions: List<Session>): HistorySummary {
 
 fun loadText(load: Load?): String = if (load == null) "未记录外部负重" else {
     val amount = if (load.value % 1.0 == 0.0) load.value.toLong().toString() else load.value.toString()
-    val meaning = when (load.meaning) { "per_hand" -> "单只"; "per_side" -> "单侧"; "unknown" -> "重量含义未记录"; else -> "总重量" }
-    "$amount ${load.unit} · $meaning${if (load.mode == "assistance") " · 助力" else ""}"
+    val meaning = when (load.meaning) {
+        "per_hand" -> " · 单只"
+        "per_side" -> " · 单侧"
+        "unknown" -> ""
+        else -> " · 总重量"
+    }
+    "$amount ${load.unit}$meaning${if (load.mode == "assistance") " · 助力" else ""}"
 }
 fun resultText(result: SetResult): String {
     val value = result.segments.takeIf { it.isNotEmpty() }?.joinToString("，") {

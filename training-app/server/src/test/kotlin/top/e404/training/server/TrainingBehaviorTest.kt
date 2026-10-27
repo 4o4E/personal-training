@@ -2,6 +2,10 @@ package top.e404.training.server
 
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.io.TempDir
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.encodeToJsonElement
+import kotlinx.serialization.json.jsonObject
 import top.e404.training.shared.*
 import java.nio.file.Path
 import java.time.LocalDate
@@ -72,7 +76,7 @@ class TrainingBehaviorTest {
                 SetSegment(6, Load(7.5, "kg", "per_hand"))
             ))),
             items = listOf(PlanItem("actual", dumbbell.id, sets = emptyList())),
-            historicalSource = HistoricalSource("source-2026-10-13", "2026-10-13", "原始历史记录")
+            historicalSource = HistoricalSource("source-2026-10-13", "2026-10-13")
         )
         Store(directory, seed).use { store ->
             val saved = store.put(document(Kind.session, history.id, history))
@@ -92,29 +96,66 @@ class TrainingBehaviorTest {
             assertEquals(listOf("unknown", "per_hand"), restored.results.single().segments.map { it.load?.meaning })
         }
     }
-    @Test fun `历史多段记录在一二版备份中往返`() {
+    @Test fun `历史多段备份迁移并导出时清理废弃来源字段`() {
         val history = Session(
             id = "backup-history", name = "历史训练", snapshot = null, exercises = listOf(dumbbell),
-            startedAt = null, endedAt = null, status = "completed",
+            startedAt = null, endedAt = null, status = "completed", notes = "原有反馈",
             results = listOf(SetResult("actual", 0, reps = 10, segments = listOf(
                 SetSegment(4, Load(10.0, "kg", "unknown")), SetSegment(6, Load(7.5, "kg", "per_hand"))
             ))),
             items = listOf(PlanItem("actual", dumbbell.id, sets = emptyList())),
-            historicalSource = HistoricalSource("backup-source", "2026-10-13", "原始文本")
+            historicalSource = HistoricalSource("backup-source", "2026-10-13")
         )
-        val docs = listOf(document(Kind.session, history.id, history))
-        for (version in 1..2) {
-            val bytes = java.io.ByteArrayOutputStream()
-            writeBackup(Backup(formatVersion = version, documents = docs, exportedAt = start), bytes) { null }
-            val restored = readBackup(bytes.toByteArray().inputStream(), directory.resolve("backup-media-$version"))
-            assertEquals(version, restored.formatVersion)
-            assertEquals(history, restored.documents.single().value<Session>())
-            if (version == 2) {
-                Store(directory.resolve("import-v2"), seed).use { store ->
-                    store.import(restored, replace = false)
-                    assertEquals(history, store.get(Kind.session, history.id)!!.value<Session>())
-                }
-            }
+        val sourceWithLegacyText = JsonObject(
+            wireJson.encodeToJsonElement(history.historicalSource!!).jsonObject +
+                ("originalText" to JsonPrimitive("legacy source"))
+        )
+        val oldDocument = document(Kind.session, history.id, history).let {
+            it.copy(data = JsonObject(it.data + ("historicalSource" to sourceWithLegacyText)))
+        }
+        val legacy = Backup(formatVersion = 2, documents = listOf(oldDocument), exportedAt = start)
+        val legacyBytes = java.io.ByteArrayOutputStream()
+        java.util.zip.ZipOutputStream(legacyBytes).use { zip ->
+            zip.putNextEntry(java.util.zip.ZipEntry("data.json"))
+            zip.write(wireJson.encodeToString(legacy).toByteArray())
+            zip.closeEntry()
+        }
+        val migrated = readBackup(legacyBytes.toByteArray().inputStream(), directory.resolve("backup-media-v2"))
+        val migratedDoc = migrated.documents.single()
+        assertEquals(history, migratedDoc.value<Session>())
+        assertFalse(migratedDoc.data["historicalSource"].toString().contains("originalText"))
+
+        Store(directory.resolve("legacy-store"), seed + oldDocument).use { store ->
+            val storedOld = store.get(Kind.session, history.id)!!
+            assertEquals(history, storedOld.value<Session>())
+            val updated = store.put(
+                document(Kind.session, history.id, storedOld.value<Session>().copy(notes = "修改后的反馈")),
+                storedOld.revision
+            )
+            assertEquals("修改后的反馈", updated.value<Session>().notes)
+            assertFalse(updated.data["historicalSource"].toString().contains("originalText"))
+            assertFails { store.put(oldDocument, updated.revision) }
+
+            val exportedBytes = java.io.ByteArrayOutputStream()
+            Archives(directory.resolve("legacy-store"), store).export(exportedBytes)
+            val exported = readBackup(exportedBytes.toByteArray().inputStream(), directory.resolve("backup-media-export"))
+            assertEquals(3, exported.formatVersion)
+            val exportedSession = exported.documents.single { it.kind == Kind.session && it.id == history.id }
+            assertEquals("修改后的反馈", exportedSession.value<Session>().notes)
+            assertFalse(exportedSession.data["historicalSource"].toString().contains("originalText"))
+        }
+        val invalidV3 = legacy.copy(formatVersion = 3)
+        val invalidV3Bytes = java.io.ByteArrayOutputStream()
+        java.util.zip.ZipOutputStream(invalidV3Bytes).use { zip ->
+            zip.putNextEntry(java.util.zip.ZipEntry("data.json"))
+            zip.write(wireJson.encodeToString(invalidV3).toByteArray())
+            zip.closeEntry()
+        }
+        assertFails { readBackup(invalidV3Bytes.toByteArray().inputStream(), directory.resolve("backup-media-invalid-v3")) }
+        Store(directory.resolve("reject-legacy-write"), seed).use { store ->
+            assertFails { store.put(oldDocument) }
+            assertFails { store.put(document(Kind.session, "invalid-active-history", history.copy(id = "invalid-active-history", status = "active"))) }
+            assertFails { store.put(document(Kind.session, "invalid-planned-history", history.copy(id = "invalid-planned-history", snapshot = plan()))) }
         }
     }
 

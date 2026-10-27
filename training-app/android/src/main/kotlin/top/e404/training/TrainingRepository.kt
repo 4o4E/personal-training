@@ -364,12 +364,17 @@ class TrainingRepository(
             validateDocument(document(Kind.plan, plan.id, plan), ::list, ::lookup)
             validatePlanEquipment(plan, list(Kind.equipment).map { it.value<Equipment>() }, ::lookup)
             val exercises = plan.items.map { lookup(Kind.exercise, it.exerciseId)!!.value<Exercise>() }.distinctBy { it.id }
+            val splitSlotName = plan.programId?.let { programId ->
+                val program = requireNotNull(lookup(Kind.program, programId)) { "计划的分化方案不存在" }.value<Program>()
+                val slotId = requireNotNull(plan.slotId) { "计划的分化项不存在" }
+                program.slots.single { it.id == slotId }.name
+            }
             val overrideId = plan.programId?.let { programId ->
                 _data.value.arrangement?.takeIf { it.programId == programId }?.nextOverrides?.get(programId)
                     ?.takeIf { it.slotId == plan.slotId }?.id
             }
             persistSession(Session(UUID.randomUUID().toString(), plan.name, plan, exercises, System.currentTimeMillis(),
-                status = "active", arrangementOverrideId = overrideId), null)
+                status = "active", splitSlotName = splitSlotName, arrangementOverrideId = overrideId), null)
         }
         enqueueSync()
     }

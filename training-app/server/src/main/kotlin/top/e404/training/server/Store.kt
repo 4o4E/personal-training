@@ -79,7 +79,7 @@ class Store(dataDirectory: Path, seed: List<Document>) : AutoCloseable {
 
     /** 导入先核验整包；遇到同标识的不同数据必须明确允许替换，不能导入一半才发现冲突。 */
     @Synchronized fun import(backup: Backup, replace: Boolean): List<Document> {
-        require(backup.formatVersion in 1..2) { "不支持此数据包版本" }
+        require(backup.formatVersion in 1..3) { "不支持此数据包版本" }
         require(backup.documents.map { it.kind to it.id }.distinct().size == backup.documents.size) { "数据包包含重复资料" }
         val incoming = backup.documents.associateBy { it.kind to it.id }
         val combined = (list(includeDeleted = true) + backup.documents).associateBy { it.kind to it.id }.values.filterNot { it.deleted }.groupBy { it.kind }

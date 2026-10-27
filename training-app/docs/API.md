@@ -94,14 +94,13 @@
 
 ### 实际训练
 
-`Session` 保存 `id`、`name`、动作教学 `exercises`、`status`、`results`、`notes`、实际执行安排 `items` 和被替代的 `skippedItems`。实时训练要求 `snapshot: Plan` 与真实 `startedAt`；只有日期的历史训练允许 `snapshot`、`startedAt`、`endedAt` 和组 `completedAt` 为 `null`，并提供不可变 `historicalSource: {sourceId, localDate, originalText}`。历史训练不能标记为进行中，也不能推断精确时间。
+`Session` 保存 `id`、`name`、动作教学 `exercises`、`status`、`results`、`notes`、实际执行安排 `items`、被替代的 `skippedItems` 和开始时明确选择的可空 `splitSlotName`。实时训练要求 `snapshot: Plan` 与真实 `startedAt`；只有日期的历史训练允许 `snapshot`、`startedAt`、`endedAt` 和组 `completedAt` 为 `null`，并提供不可变 `historicalSource: {sourceId, localDate}`。历史训练不能标记为进行中，也不能推断精确时间。
 
 - epoch 毫秒表示已知精确时间；日期筛选与实时训练日期统一 UTC+8，历史来源日期直接使用 `historicalSource.localDate`。
 - `status`：`active` / `completed` / `cancelled`。没有实际完成组的训练不能标记完成。
 - `SetResult`：`itemId`、非负 `setIndex`、实际 `reps` / `seconds`、实际 `load`、`side`、可空 `completedAt` 和有序 `segments`。
 - `SetSegment` 保留分段实际 `reps` 与 `load`；分段次数之和必须等于整组次数，分段重量不可再压成一个组重量；一条 `SetResult` 仍只计一个实际组。
-- `Load.meaning` 支持 `total`、`per_hand`、`per_side`、`unknown`；未知含义保留原始数值与单位，显示为“重量含义未记录”。
-- 只有 `results` 才是已完成组。未执行的 `sets` 不计入历史。实际次数和重量可以与目标不同。
+- `Load.meaning` 支持 `total`、`per_hand`、`per_side`、`unknown`；未知含义保留原始数值与单位，界面仅显示数字和原始单位，不猜测重量含义；助力模式仍显示助力语义。
 - 完成部分组后仍可明确结束为完成，以实际量保存并推进分化；取消也保存已经练过的组，但不推进分化。
 - `snapshot`、开始时间和已有动作教学不可改写。实时训练已有完成组的条目和目标不能替换。替换剩余动作时保留原条目与真实结果，将未执行部分标记跳过，再插入新执行条目。
 - 编辑未来计划不会修改已经开始的训练。
@@ -133,9 +132,8 @@
 
 ZIP 内含：
 
-- `data.json`：新导出为 `{"formatVersion":2,"documents":[...],"exportedAt":epoch毫秒}`；读取端兼容版本 1 和 2。
-- `media/`：所有未删除素材引用的实际图像文件。
+- `data.json`：新导出为 `{"formatVersion":3,"documents":[...],"exportedAt":epoch毫秒}`；读取端兼容版本 1、2 和 3。
 
-版本 2 保留 nullable 历史时间与计划、历史来源、组内多段重量和未知重量含义。版本 1 的既有精确时间、计划与结果按原义恢复；导出不含凭据。不同内容必须明确允许替换；素材先完整准备，再提交数据库，失败不会覆盖已有可见图片。
+版本 3 保留 nullable 历史时间与计划、历史来源的 `sourceId` 和 `localDate`、`splitSlotName`、组内多段重量和未知重量含义。版本 1、2 读取时会移除已废弃的 `historicalSource.originalText`，其余原生字段及用户备注保持。0.0.3 旧库存、手机缓存与同步文档也会在 Session 解码边界定向投影移除此字段，避免要求清缓存或改写数据库；不会自动转换 `notes`。版本 3 导入和新文档写入包含该字段会被拒绝。导出会投影为版本 3，并仅移除旧库存中的该废弃字段，不改写数据库或用户备注。版本 1、2 的既有精确时间、计划与结果按原义恢复；导出不含凭据。不同内容必须明确允许替换；素材先完整准备，再提交数据库，失败不会覆盖已有可见图片。
 
 CLI 支持 `list/get/put/delete/sync/history/recommend/next/export/import/upload/download`。`TRAINING_URL` 指定后端；`TRAINING_TOKEN` 或 `TRAINING_TOKEN_FILE` 提供凭据。凭据不要放进命令参数、JSON、运动记录或临时文件。退出码 3 表示冲突，其他非零表示操作失败。
