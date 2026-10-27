@@ -21,6 +21,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import top.e404.training.shared.*
+import android.media.RingtoneManager
 
 @Composable fun SettingsScreen(state: AppData, viewModel: TrainingViewModel, permissionRevision: Int, preferences: AppPreferences, onDismiss: () -> Unit) {
     val context = LocalContext.current
@@ -43,6 +44,12 @@ import top.e404.training.shared.*
         }
     }
     val import = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri -> importUri = uri?.toString() }
+    val chooseTimerSound = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+        if (result.resultCode == android.app.Activity.RESULT_OK) {
+            val uri = result.data?.getParcelableExtra<Uri>(RingtoneManager.EXTRA_RINGTONE_PICKED_URI)
+            preferences.timerRingtone(uri?.toString() ?: "")
+        }
+    }
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
         Text("返回后继续当前操作；训练读数和休息计时会保留。", style = MaterialTheme.typography.bodySmall)
         val choices by preferences.data.collectAsState()
@@ -54,7 +61,23 @@ import top.e404.training.shared.*
         InfoCard("计时与系统提醒") {
             Text(if (notifications) "通知显示已具备" else "通知未授权或提醒渠道已关闭", color = if (notifications) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error)
             Text(if (exact) "精确定时唤醒权限已具备" else "精确定时唤醒权限未具备", color = if (exact) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error)
-            Text("训练计时由前台服务运行，不依赖保持页面打开；通知授权影响系统到时提醒能否显示，精确定时权限用于系统唤醒能力。勿扰及声音遵循系统设置。", style = MaterialTheme.typography.bodySmall)
+            Text("持续提醒使用系统闹钟音量和闹钟勿扰规则；正常倒计时通知静默。系统勿扰可能抑制声音或振动。", style = MaterialTheme.typography.bodySmall)
+            val ringtoneLabel = when {
+                choices.timerRingtoneUri == "" -> "无声音（仅振动）"
+                choices.timerRingtoneUri == null -> "系统默认闹钟铃声"
+                else -> RingtoneManager.getRingtone(context, Uri.parse(choices.timerRingtoneUri))?.getTitle(context) ?: "已选择的系统铃声"
+            }
+            Text("到时铃声：$ringtoneLabel")
+            OutlinedButton(onClick = {
+                chooseTimerSound.launch(Intent(RingtoneManager.ACTION_RINGTONE_PICKER).apply {
+                    putExtra(RingtoneManager.EXTRA_RINGTONE_TYPE, RingtoneManager.TYPE_ALARM)
+                    putExtra(RingtoneManager.EXTRA_RINGTONE_TITLE, "选择计时提醒铃声")
+                    putExtra(RingtoneManager.EXTRA_RINGTONE_SHOW_SILENT, true)
+                    putExtra(RingtoneManager.EXTRA_RINGTONE_SHOW_DEFAULT, true)
+                    putExtra(RingtoneManager.EXTRA_RINGTONE_EXISTING_URI, choices.timerRingtoneUri?.takeIf { it.isNotEmpty() }?.let(Uri::parse)
+                        ?: if (choices.timerRingtoneUri == null) Settings.System.DEFAULT_ALARM_ALERT_URI else null)
+                })
+            }) { Text("选择系统闹钟铃声") }
             Button(onClick = {
                 if (Build.VERSION.SDK_INT >= 33 && context.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != android.content.pm.PackageManager.PERMISSION_GRANTED)
                     askNotifications.launch(Manifest.permission.POST_NOTIFICATIONS)
@@ -71,7 +94,14 @@ import top.e404.training.shared.*
                 !liveUpdates -> "系统未允许提升此通知；可在系统通知设置中检查相关权限。"
                 else -> "系统支持且允许请求Live Updates，实际是否提升以系统通知状态为准。"
             }, style = MaterialTheme.typography.bodySmall)
-            Text("休息结束时唤醒应用并发送普通通知，不需要保持界面打开。提示音和振动遵循系统通知设置。", style = MaterialTheme.typography.bodySmall)
+            if (Build.VERSION.SDK_INT >= 36) {
+                Text("OxygenOS 还需在系统设置中开启“流体云显示实时活动”；允许应用通知不代表此开关已开启。", style = MaterialTheme.typography.bodySmall)
+                OutlinedButton(onClick = {
+                    context.startActivity(Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS)
+                        .putExtra(Settings.EXTRA_APP_PACKAGE, context.packageName))
+                }) { Text("实时活动显示设置") }
+            }
+            Text("休息结束时发送静默倒计时/结果通知；持续振动及所选铃声由系统闹钟音量控制。", style = MaterialTheme.typography.bodySmall)
         }
         InfoCard("自有后端") {
             TextInput("后端地址", url, { url = it }, keyboardType = KeyboardType.Uri)
@@ -166,6 +196,12 @@ private fun documentDescription(doc: Document, state: AppData, tagNames: Map<Str
         Kind.equipment -> doc.value<Equipment>().let { "${it.name} · ${it.unit} · " + when (it.meaning) { "per_hand" -> "单只重量"; "per_side" -> "单侧配重"; else -> "总重量" } + "\n" + it.tags.joinToString("、") { tag -> tagNames[tag] ?: tag } + "\n${it.instructions}\n${it.notes}" }
         Kind.gym -> doc.value<Gym>().let { "${it.name}\n${it.notes}" }
         Kind.exercise -> doc.value<Exercise>().let { "${it.name}\n主要部位：${parts(it.muscles)}\n辅助部位：${parts(it.secondaryMuscles)}\n" + it.instructions.joinToString("\n") + "\n${it.notes}" }
+        Kind.activity -> doc.value<ActivityRecord>().let { activity -> buildString {
+            append("${activity.name} · ${activity.localDate}\n")
+            activity.durationSeconds?.let { append("时长：${it} 秒\n") }
+            activity.distanceMeters?.let { append("距离：${it} 米\n") }
+            if (activity.notes.isNotBlank()) append(activity.notes)
+        } }
         Kind.media -> doc.value<Media>().let { "${it.name} · ${it.source}" }
         Kind.muscle -> doc.value<Muscle>().name
     }

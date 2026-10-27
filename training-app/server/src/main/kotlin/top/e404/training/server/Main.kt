@@ -103,9 +103,15 @@ fun Application.trainingApplication(store: Store, archives: Archives, token: Str
                 get("/history") {
                     val from = call.request.queryParameters["from"]?.let(LocalDate::parse)
                     val until = call.request.queryParameters["to"]?.let(LocalDate::parse)
-                    val sessions = withContext(Dispatchers.IO) { store.list(Kind.session).map { it.value<Session>() } }
+                    val documents = withContext(Dispatchers.IO) { store.list() }
+                    val sessions = documents.filter { it.kind == Kind.session }.map { it.value<Session>() }
                         .filter { session -> (from == null || sessionDate(session) >= from) && (until == null || sessionDate(session) <= until) }
-                    call.respond(summarizeHistory(sessions))
+                    val activities = documents.filter { it.kind == Kind.activity }.map { it.value<ActivityRecord>() }
+                        .filter { activity ->
+                            val date = LocalDate.parse(activity.localDate)
+                            (from == null || date >= from) && (until == null || date <= until)
+                        }
+                    call.respond(summarizeHistory(sessions, activities))
                 }
                 get("/recommendations") {
                     val type = call.request.queryParameters["type"] ?: "strength"

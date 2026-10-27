@@ -34,6 +34,7 @@ class TimerService : Service() {
     private var activeBuilder: NotificationCompat.Builder? = null
     private var wakeLock: PowerManager.WakeLock? = null
     private var wakeLockDeadline: Long? = null
+    private val alertPlayback = AlertPlayback()
 
     private val screenReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
@@ -90,7 +91,13 @@ class TimerService : Service() {
                                     state = repository.timer.value ?: return@collectLatest
                                     updateWakeLock(state)
                                 }
-                                if (state.type != "rest" && state.notified) {
+                                if (state.notified && !state.alertDismissed) {
+                                    val choices = (application as TrainingApplication).preferences.data.value
+                                    alertPlayback.start(this@TimerService, state, choices.timerRingtoneUri)
+                                } else {
+                                    alertPlayback.stop()
+                                }
+                                if (state.type != "rest" && state.notified && state.alertDismissed) {
                                     TimerEngine.finishExercise(this@TimerService)
                                     stopSelf()
                                     return@collectLatest
@@ -108,6 +115,9 @@ class TimerService : Service() {
                                     delay(nextDisplayChange)
                                 } else if (!state.notified) {
                                     delay(remaining.coerceAtLeast(1L))
+                                } else if (state.type != "rest") {
+                                    repository.timer.first { it == null || it.alertDismissed }
+                                    return@collectLatest
                                 } else {
                                     screenOn.first { it }
                                 }
@@ -119,6 +129,7 @@ class TimerService : Service() {
                     }
             }
         }
+
         return START_NOT_STICKY
     }
 
@@ -148,6 +159,7 @@ class TimerService : Service() {
         timerJob?.cancel()
         timerJob = null
         releaseWakeLock()
+        alertPlayback.stop()
         if (screenReceiverRegistered) unregisterReceiver(screenReceiver)
         stopForeground(STOP_FOREGROUND_REMOVE)
         scope.cancel()

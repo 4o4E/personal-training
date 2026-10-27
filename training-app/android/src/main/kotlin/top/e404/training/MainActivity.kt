@@ -143,7 +143,7 @@ private object Routes {
     }) {
         Scaffold(
             topBar = {
-                TopAppBar(title = { Text(when { showGyms -> "健身房与器械"; route == Routes.settings -> "设置"; route == Routes.day -> "每日训练"; route == Routes.sessionAdjust -> "本次剩余内容"; route == Routes.setup -> "整轮计划配置"; route == Routes.advanced -> "全部计划"; else -> when(route) { Routes.workout -> "开始训练"; Routes.adjust -> "调整计划"; else -> "运动记录" } }) }, navigationIcon = {
+                TopAppBar(title = { Text(when { showGyms -> "健身房与器械"; route == Routes.settings -> "设置"; route == Routes.day -> "每日运动"; route == Routes.sessionAdjust -> "本次剩余内容"; route == Routes.setup -> "整轮计划配置"; route == Routes.advanced -> "全部计划"; else -> when(route) { Routes.workout -> "开始训练"; Routes.adjust -> "调整计划"; else -> "运动记录" } }) }, navigationIcon = {
                     if (!mainRoute || showGyms) TextButton(onClick = { if (showGyms) showGyms = false else nav.popBackStack() }) { Text("返回") }
                     else IconButton(onClick = { scope.launch { drawer.open() } }, modifier = Modifier.semantics { contentDescription = "打开菜单" }) { NavigationGlyph("菜单") }
                 })
@@ -180,13 +180,30 @@ private object Routes {
                             AdjustPrograms(state, viewModel, { editing = it }, { preview = it; previewEditable = true }, { nav.navigate(Routes.sessionAdjust) }, { daySetup = null; nav.navigate(Routes.setup) }, { request -> daySetup = request; nav.navigate(Routes.setup) }, { nav.navigate(Routes.advanced) })
                         }
                         composable(Routes.history) {
-                            HistoryCalendarScreen(state) { date -> nav.navigate("history/$date") }
+                            HistoryCalendarScreen(
+                                state = state,
+                                onDay = { date -> nav.navigate("history/$date") },
+                                onNewActivity = { date ->
+                                    val id = newId()
+                                    editing = document(Kind.activity, id, ActivityRecord(id, "", date))
+                                }
+                            )
                         }
                         composable(Routes.settings) {
                             SettingsScreen(state, viewModel, permissionRevision, preferences) { nav.popBackStack() }
                         }
                         composable(Routes.day, arguments = listOf(navArgument("date") { type = NavType.StringType })) { backStack ->
-                            DayHistoryScreen(backStack.arguments?.getString("date").orEmpty(), state, viewModel) { deleting = it }
+                            DayHistoryScreen(
+                                backStack.arguments?.getString("date").orEmpty(),
+                                state,
+                                viewModel,
+                                remove = { deleting = it },
+                                editActivity = { editing = it },
+                                addActivity = { date ->
+                                    val id = newId()
+                                    editing = document(Kind.activity, id, ActivityRecord(id, "", date))
+                                }
+                            )
                         }
                         composable(Routes.sessionAdjust) {
                             LaunchedEffect(state.ready, active?.id) { if (state.ready && active == null) nav.popBackStack() }
@@ -210,6 +227,7 @@ private object Routes {
             Kind.equipment -> EquipmentEditor(source, state, viewModel) { editing = null }
             Kind.program -> ProgramEditor(source, state, viewModel) { editing = null }
             Kind.plan -> PlanEditor(source, state, viewModel) { editing = null }
+            Kind.activity -> ActivityEditor(source, viewModel) { editing = null }
             else -> error("此资料不使用该编辑入口")
         }
     } }

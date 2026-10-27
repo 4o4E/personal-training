@@ -16,6 +16,7 @@
             <intent-filter><action android:name="android.intent.action.MAIN" /><category android:name="android.intent.category.LAUNCHER" /></intent-filter>
         </activity>
         <receiver android:name=".TimerReceiver" android:exported="false" />
+        <receiver android:name=".TimerAlertReceiver" android:exported="false" />
         <service android:name=".TimerService" android:exported="false" android:foregroundServiceType="specialUse">
             <property android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE" android:value="Maintains an active workout rest or exercise timer and notifies at its deadline" />
         </service>

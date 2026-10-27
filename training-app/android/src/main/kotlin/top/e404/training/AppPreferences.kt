@@ -12,7 +12,8 @@ import top.e404.training.shared.wireJson
     val guide: String? = null,
     // 仅用于将升级前的本机业务选择迁移到云端；确认迁移成功后立即清除。
     val programId: String? = null,
-    val slotPlans: Map<String, Map<String, String>> = emptyMap()
+    val slotPlans: Map<String, Map<String, String>> = emptyMap(),
+    val timerRingtoneUri: String? = null
 )
 
 /** 本机交互偏好不进入训练资料、开放接口或备份；连接凭据仍由 ConnectionVault 独立管理。 */
@@ -29,4 +30,5 @@ class AppPreferences(context: Context) {
     fun legacySelection(): Pair<String?, Map<String, Map<String, String>>> =
         mutable.value.programId to mutable.value.slotPlans
     fun clearLegacyChoices() = save(mutable.value.copy(programId = null, slotPlans = emptyMap()))
+    fun timerRingtone(value: String?) = save(mutable.value.copy(timerRingtoneUri = value))
 }

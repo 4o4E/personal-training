@@ -28,7 +28,7 @@
 
 这是计划示例，不是完成记录。新资料建议使用独立 UUID。标识和素材文件名只接受英文、数字、点号、下划线及连字符，长度最多 160，第一位是英文或数字。
 
-- `kind`：`muscle`、`media`、`exercise`、`gym`、`equipment`、`program`、`plan`、`session`、`arrangement`。
+- `kind`：`muscle`、`media`、`exercise`、`gym`、`equipment`、`program`、`plan`、`session`、`arrangement`、`activity`。
 - `data.id` 必须与文档 `id` 相同；当前安排唯一使用 `arrangement/current`。
 - `revision` 是服务器修订号，不是训练日期；不要根据它推断训练时间。
 - 保存时提供读取该文档时的 `baseRevision`，新资料使用 `0`。不要为了覆盖冲突自动读取新修订号重试。
@@ -88,6 +88,8 @@
 - 器械类别和位置可能变化，计划仍可保存和恢复；开始训练前需要确认该计划实际可执行。
 - 无日期且绑定分化项的计划可循环执行；指定日期和未绑定分化的计划不自动循环。未来计划编辑不会改写已有 Session。
 - 下一项训练优先按已安排日期及完成情况选择；同一分化项存在多份无日期计划时，由用户明确选用。
+- 自动轮换按当前方案关联的已完成实时训练及可唯一对应当前分化项的已导入历史计算。历史轮换使用保存的分类标签（推／推类训练、拉／拉类训练、腿／腿部训练／腿类训练）与当前分化项匹配；自由锻炼、无法唯一匹配的历史和其他方案关联的实时训练不推进当前轮换。按 UTC+8 真实训练日期及已有精确时间先后判断，服务器 `revision` 与重量修订不影响轮换顺序。
+
 - 当前方案、各方案的选用计划及下次手动指定保存为 `arrangement/current`：`programId` 可空，`selectedPlans` 按 `programId → slotId → planId` 嵌套，`nextOverrides` 按 `programId` 保存 `{id, slotId}`。
 - `nextOverrides.id` 是本次手动选择的稳定标识。开始训练时复制到 Session；完成该指定训练只消费同一个 ID，取消不消费，也不会清除训练开始后新设的选择。
 - 新建 arrangement 后必须保证方案、分化项和计划引用均有效。更新或删除被引用方案/计划时同步调整安排；无效引用不能自动换成别的计划。
@@ -106,7 +108,13 @@
 - `snapshot`、开始时间和已有动作教学不可改写。实时训练已有完成组的条目和目标不能替换。替换剩余动作时保留原条目与真实结果，将未执行部分标记跳过，再插入新执行条目。
 - 编辑未来计划不会修改已经开始的训练。
 
-`HistorySummary` 包含实际 `sessions`、`strengthSets`、`stretchSets` 和 `strengthSetsByMuscle`。统计包含进行中及取消训练中的真实完成组；分化轮换只考虑 `status=completed`。复合动作涉及多个主要部位，部位计数之和不一定等于总力量组数，不应据此重复统计总量。
+`HistorySummary` 包含实际 `sessions`、`strengthSets`、`stretchSets`、`strengthSetsByMuscle` 和独立 `activities`。统计包含进行中及取消训练中的真实完成组；分化轮换只考虑 `status=completed`。复合动作涉及多个主要部位，部位计数之和不一定等于总力量组数，不应据此重复统计总量。
+
+### 独立运动与历史查询
+
+- `ActivityRecord`：`id`、`name`（日历展示名称）、本地日期 `localDate`（`YYYY-MM-DD`）、可选 `durationSeconds`、可选 `distanceMeters`、`notes` 和可选稳定来源标识 `sourceId`。名称不能为空；日期必须有效；提供的时长和距离必须为正数，未知量值留空。
+- 独立运动以 `kind=activity` 通过通用文档查询、保存、删除和同步接口处理。其记录不属于 `Session`，不进入分化轮换或力量／拉伸组数统计。
+- `GET /v1/history` 的 `from` / `to` 为包含端点的日期范围，筛选历史训练的 `historicalSource.localDate`、实时训练的真实 UTC+8 日期，以及独立运动的 `localDate`。响应的 `activities` 仅含范围内活动；训练统计只由实际 `Session.results` 计算。
 
 ## 同步
 
@@ -133,8 +141,8 @@
 
 ZIP 内含：
 
-- `data.json`：新导出为 `{"formatVersion":3,"documents":[...],"exportedAt":epoch毫秒}`；读取端兼容版本 1、2 和 3。
+- `data.json`：新导出为 `{"formatVersion":4,"documents":[...],"exportedAt":epoch毫秒}`；读取端兼容版本 1、2、3 和 4。
 
-版本 3 保留 nullable 历史时间与计划、历史来源的 `sourceId` 和 `localDate`、`splitSlotName`、组内多段重量和未知重量含义。版本 1、2 读取时会移除已废弃的 `historicalSource.originalText`，其余原生字段及用户备注保持。0.0.3 旧库存、手机缓存与同步文档也会在 Session 解码边界定向投影移除此字段，避免要求清缓存或改写数据库；不会自动转换 `notes`。版本 3 导入和新文档写入包含该字段会被拒绝。导出会投影为版本 3，并仅移除旧库存中的该废弃字段，不改写数据库或用户备注。版本 1、2 的既有精确时间、计划与结果按原义恢复；导出不含凭据。不同内容必须明确允许替换；素材先完整准备，再提交数据库，失败不会覆盖已有可见图片。
+版本 4 保留既有 Session 字段，并支持独立 `activity` 文档。版本 1、2 读取时会移除已废弃的 `historicalSource.originalText`，其余原生字段及用户备注保持；版本 3、4 导入包含该字段会被拒绝。0.0.3 旧库存、手机缓存与同步文档也会在 Session 解码边界定向投影移除此字段，避免要求清缓存或改写数据库；不会自动转换 `notes`。导出会投影为版本 4，并仅移除旧库存中的该废弃字段，不改写数据库或用户备注。版本 1、2 的既有精确时间、计划与结果按原义恢复；导出不含凭据。不同内容必须明确允许替换；素材先完整准备，再提交数据库，失败不会覆盖已有可见图片。
 
-CLI 支持 `list/get/put/delete/sync/history/recommend/next/export/import/upload/download`。`TRAINING_URL` 指定后端；`TRAINING_TOKEN` 或 `TRAINING_TOKEN_FILE` 提供凭据。凭据不要放进命令参数、JSON、运动记录或临时文件。退出码 3 表示冲突，其他非零表示操作失败。
+CLI 支持 `list/get/put/delete/sync/history/recommend/next/export/import/upload/download`。可用文档种类包括 `activity`，例如 `python scripts/training.py list activity` 与 `python scripts/training.py get activity <活动ID>`；使用 `put activity <活动ID> --file <资料JSON> --base-revision 0` 新建活动，已有资料先 `get` 并提交读取到的修订号。`TRAINING_URL` 指定后端；`TRAINING_TOKEN` 或 `TRAINING_TOKEN_FILE` 提供凭据。凭据不要放进命令参数、JSON、运动记录或临时文件。退出码 3 表示冲突，其他非零表示操作失败。

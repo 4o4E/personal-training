@@ -43,7 +43,12 @@ import top.e404.training.shared.*
         InfoCard(if (current.type == "rest") "组间休息" else "动作计时") {
             Text(current.label)
             Text(current.displayText(now), style = MaterialTheme.typography.headlineLarge)
-            TextButton(onClick = viewModel::stopTimer) { Text(if (current.type == "rest") "结束休息" else "结束计时") }
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                if (current.notified && !current.alertDismissed) {
+                    TextButton(onClick = { viewModel.action { viewModel.repository.dismissTimerAlert(current) } }) { Text("停止提醒") }
+                }
+                TextButton(onClick = viewModel::stopTimer) { Text(if (current.type == "rest") "结束休息" else "结束计时") }
+            }
         }
     }
 }
@@ -63,6 +68,24 @@ import top.e404.training.shared.*
     val done = session.results.size
     val total = session.items.sumOf { item ->
         if (item.id in session.skippedItems) session.results.count { it.itemId == item.id } else item.sets.size
+    }
+    val historicalLoads = remember(state.documents.getValue(Kind.session), session.id) {
+        buildMap<Pair<String, String?>, MutableSet<Load>> {
+            state.documents.getValue(Kind.session).values
+                .filterNot { it.deleted || it.id == session.id }
+                .forEach { document ->
+                    val historical = document.value<Session>()
+                    historical.items.forEach { historicalItem ->
+                        val historicalExercise = historical.exercises.singleOrNull { it.id == historicalItem.exerciseId }
+                        if (historicalExercise != null) {
+                            val loads = historical.results.filter { it.itemId == historicalItem.id }
+                                .flatMap { result -> result.segments.mapNotNull { it.load } + listOfNotNull(result.load) }
+                            val key = historicalExercise.id to historicalItem.equipmentId
+                            getOrPut(key) { linkedSetOf() }.addAll(loads)
+                        }
+                    }
+                }
+        }.mapValues { it.value.toList() }
     }
     Column(Modifier.fillMaxSize().padding(horizontal = 12.dp)) {
         if (!reminderReady) Text("通知显示或定时唤醒授权未就绪：训练计时仍由前台服务运行；授权状态会影响到时通知或系统唤醒，请在设置中查看。", color = MaterialTheme.colorScheme.error)
@@ -111,7 +134,8 @@ import top.e404.training.shared.*
                             HorizontalDivider()
                             Text("当前第 ${nextIndex + 1} 组 · ${sideText(target.side)}", style = MaterialTheme.typography.titleSmall)
                             Text("计划：${targetText(target)}", style = MaterialTheme.typography.bodySmall)
-                            ActualSetRow(session.id, item, nextIndex, target, exercise, viewModel) { draft ->
+                            ActualSetRow(session, item, nextIndex, target, exercise, viewModel,
+                                historicalLoads[exercise.id to item.equipmentId].orEmpty()) { draft ->
                                 actualDraft = draft
                                 editingResult = item.id
                                 editingIndex = nextIndex
@@ -158,26 +182,78 @@ import top.e404.training.shared.*
 }
 
 @Composable private fun ActualSetRow(
-    sessionId: String, item: PlanItem, index: Int, planned: SetTarget, exercise: Exercise, viewModel: TrainingViewModel,
-    onEditReadings: (SetTarget) -> Unit
+    session: Session, item: PlanItem, index: Int, planned: SetTarget, exercise: Exercise, viewModel: TrainingViewModel,
+    historicalLoads: List<Load>, onEditReadings: (SetTarget) -> Unit
 ) {
-    val inputGoal = rememberSaveable(sessionId, item.id, index, saver = jsonSaver(SetTarget.serializer())) { planned }
+    val sessionId = session.id
+    val previous = session.results
+        .filter { it.itemId == item.id && it.setIndex < index }
+        .maxByOrNull { it.setIndex }
+    val previousSegment = previous?.segments?.lastOrNull()
+    val inherited = when {
+        previousSegment != null -> planned.copy(reps = previousSegment.reps, load = previousSegment.load, side = previous.side)
+        previous != null -> planned.copy(reps = previous.reps, seconds = previous.seconds, load = previous.load, side = previous.side)
+        else -> planned
+    }
+    val inputGoal = rememberSaveable(sessionId, item.id, index, saver = jsonSaver(SetTarget.serializer())) { inherited }
+    val loadTemplate = inputGoal.load ?: planned.load
     var amount by rememberSaveable(sessionId, item.id, index) { mutableStateOf(inputGoal.load?.let { numericText(it.value) } ?: "") }
     var reps by rememberSaveable(sessionId, item.id, index) { mutableStateOf(inputGoal.reps?.toString() ?: "") }
     var seconds by rememberSaveable(sessionId, item.id, index) { mutableStateOf(inputGoal.seconds?.toString() ?: "") }
+    var expanded by remember { mutableStateOf(false) }
     var submitting by remember(sessionId, item.id, index) { mutableStateOf(false) }
-    val currentSession = viewModel.repository.data.collectAsStateWithLifecycle().value
-        .record(Kind.session, sessionId)?.value<Session>()
-    val persisted = currentSession?.results?.any { it.itemId == item.id && it.setIndex == index } == true
+    val persisted = session.results.any { it.itemId == item.id && it.setIndex == index }
     val message by viewModel.message.collectAsStateWithLifecycle()
     LaunchedEffect(persisted, message) {
         if (persisted || message != null) submitting = false
     }
     fun input() = inputGoal.copy(reps = if (exercise.measurement == "reps") intInput(reps, "实际次数") else null, repsMax = null,
         seconds = if (exercise.measurement == "seconds") intInput(seconds, "实际秒数") else null,
-        load = inputGoal.load?.copy(value = doubleInput(amount, "重量")), restSeconds = planned.restSeconds)
+        load = if (amount.isBlank()) null else loadTemplate?.copy(value = doubleInput(amount, "重量")),
+        restSeconds = planned.restSeconds)
+    val commonLoads = remember(historicalLoads, session.items, session.results, item.id, loadTemplate?.unit) {
+        buildList {
+            addAll(historicalLoads)
+            session.results.filter { it.itemId == item.id }.forEach { result ->
+                addAll(result.segments.mapNotNull { it.load } + listOfNotNull(result.load))
+            }
+            addAll(item.sets.mapNotNull { it.load })
+        }.filter { loadTemplate != null && it.unit == loadTemplate.unit }
+            .distinctBy { it.value }.sortedBy { it.value }
+    }
+    if (loadTemplate != null) {
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
+            TextInput("重量 ${loadTemplate.unit}", amount, { amount = it }, numeric = true, modifier = Modifier.weight(1f))
+            Box {
+                TextButton(onClick = { expanded = true }, enabled = commonLoads.isNotEmpty()) { Text("常用") }
+                DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
+                    commonLoads.forEach { load ->
+                        DropdownMenuItem(text = { Text("${numericText(load.value)} ${load.unit}") }, onClick = {
+                            amount = numericText(load.value)
+                            expanded = false
+                        })
+                    }
+                }
+            }
+            TextButton(onClick = {
+                viewModel.action {
+                    val value = if (amount.isBlank()) 0.0 else doubleInput(amount, "重量")
+                    check(value.isFinite() && value >= 0.0) { "重量必须是非负有限数值" }
+                    amount = numericText((value - 1.0).coerceAtLeast(0.0))
+                }
+            }) { Text("−1") }
+            TextButton(onClick = {
+                viewModel.action {
+                    val value = if (amount.isBlank()) 0.0 else doubleInput(amount, "重量")
+                    check(value.isFinite() && value >= 0.0) { "重量必须是非负有限数值" }
+                    val next = value + 1.0
+                    check(next.isFinite()) { "重量必须是非负有限数值" }
+                    amount = numericText(next)
+                }
+            }) { Text("+1") }
+        }
+    }
     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-        inputGoal.load?.let { TextInput("重量 ${it.unit}", amount, { amount = it }, numeric = true, modifier = Modifier.weight(1f)) }
         if (exercise.measurement == "seconds") TextInput("实际秒数", seconds, { seconds = it }, numeric = true, modifier = Modifier.weight(1f))
         else TextInput("实际次数", reps, { reps = it }, numeric = true, modifier = Modifier.weight(1f))
     }

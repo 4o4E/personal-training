@@ -11,7 +11,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, quote, urlsplit
 from urllib.request import Request, urlopen
 
-KINDS = ("muscle", "media", "exercise", "gym", "equipment", "program", "plan", "session", "arrangement")
+KINDS = ("muscle", "media", "exercise", "gym", "equipment", "program", "plan", "session", "arrangement", "activity")
 
 
 class Client:

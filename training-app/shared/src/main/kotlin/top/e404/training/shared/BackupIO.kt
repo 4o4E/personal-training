@@ -15,7 +15,7 @@ import java.util.zip.ZipOutputStream
 @OptIn(ExperimentalSerializationApi::class)
 fun writeBackup(backup: Backup, output: OutputStream, openMedia: (String) -> InputStream?) {
     val documents = backup.documents.map(::withoutDeprecatedHistoricalText)
-    val export = backup.copy(formatVersion = 3, documents = documents)
+    val export = backup.copy(formatVersion = 4, documents = documents)
     ZipOutputStream(output).use { zip ->
         zip.putNextEntry(ZipEntry("data.json"))
         wireJson.encodeToStream(export, zip)
@@ -43,12 +43,12 @@ fun readBackup(input: InputStream, mediaDirectory: Path): Backup {
                 entry.isDirectory && entry.name == "media/" -> Unit
                 entry.name == "data.json" -> {
                     val decoded = wireJson.decodeFromStream<Backup>(zip)
-                    require(decoded.formatVersion in 1..3) { "不支持此数据包版本" }
+                    require(decoded.formatVersion in 1..4) { "不支持此数据包版本" }
                     backup = if (decoded.formatVersion < 3) decoded.copy(
                         documents = decoded.documents.map(::withoutDeprecatedHistoricalText)
                     ) else {
                         require(decoded.documents.none(::containsDeprecatedHistoricalText)) {
-                            "版本3数据包不能包含已废弃的 historicalSource.originalText"
+                            "版本${decoded.formatVersion}数据包不能包含已废弃的 historicalSource.originalText"
                         }
                         decoded
                     }

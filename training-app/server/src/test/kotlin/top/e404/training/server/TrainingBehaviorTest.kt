@@ -32,6 +32,73 @@ class TrainingBehaviorTest {
             results = listOf(SetResult("item", 0, reps = 10, load = Load(20.0, "kg", "per_hand"), completedAt = time + 1000)))
     }
     private fun Store.put(doc: Document, base: Long = 0): Document = sync(SyncRequest(mutations = listOf(Mutation(doc, base)))).accepted.single()
+    private val historicalProgram = Program(
+        "historical-program", "三分化",
+        listOf(
+            SplitSlot("push", "推类训练", listOf("chest")),
+            SplitSlot("pull", "拉类训练", listOf("lats")),
+            SplitSlot("legs", "腿部训练", listOf("quadriceps"))
+        )
+    )
+    private fun imported(id: String, date: String, label: String?) = Session(
+        id, "导入训练", null, listOf(dumbbell), null, status = "completed",
+        results = listOf(SetResult("item", 0, reps = 10)),
+        items = listOf(PlanItem("item", dumbbell.id, sets = listOf(SetTarget(reps = 10)))),
+        historicalSource = HistoricalSource("source-$id", date), splitSlotName = label
+    )
+
+    @Test fun `导入历史分类按既有别名接续当前分化`() {
+        assertEquals("pull", nextSlot(historicalProgram, listOf(imported("push-type", "2026-10-26", "推类训练"))).id)
+        assertEquals("pull", nextSlot(historicalProgram, listOf(imported("push-short", "2026-10-26", "推"))).id)
+        assertEquals("legs", nextSlot(historicalProgram, listOf(imported("pull-type", "2026-10-26", "拉类训练"))).id)
+        assertEquals("legs", nextSlot(historicalProgram, listOf(imported("pull-short", "2026-10-26", "拉"))).id)
+        assertEquals("push", nextSlot(historicalProgram, listOf(imported("legs", "2026-10-27", "腿部训练"))).id)
+        assertEquals("push", nextSlot(historicalProgram, listOf(imported("legs-type", "2026-10-27", "腿类训练"))).id)
+        assertEquals("push", nextSlot(historicalProgram, listOf(imported("legs-short", "2026-10-27", "腿"))).id)
+    }
+
+    @Test fun `自由历史及其他方案实时训练不推进当前分化`() {
+        val free = imported("free-history", "2026-10-27", null)
+        val otherProgramSession = session("other-program", "pull", "completed", start)
+            .copy(snapshot = plan("other-plan", "pull").copy(programId = "another-program"))
+        val ambiguousProgram = historicalProgram.copy(
+            slots = historicalProgram.slots + SplitSlot("pull-duplicate", "拉", listOf("upper_back"))
+        )
+        assertEquals("push", nextSlot(historicalProgram, listOf(free, otherProgramSession)).id)
+        assertEquals("push", nextSlot(historicalProgram, listOf(imported("unmatched", "2026-10-27", "腹部"))).id)
+        assertEquals("push", nextSlot(ambiguousProgram, listOf(imported("ambiguous", "2026-10-27", "拉"))).id)
+        assertEquals("自由锻炼", sessionTrainingLabel(free))
+    }
+
+    @Test fun `真实日期排序及较早记录重量修订不影响轮换位置`() {
+        val earlierTime = LocalDate.parse("2026-10-24").atStartOfDay(ZoneId.of("Asia/Shanghai")).toInstant().toEpochMilli()
+        val matchingProgram = program.copy(slots = listOf(
+            SplitSlot("push", "推类训练", listOf("chest")),
+            SplitSlot("pull", "拉类训练", listOf("lats")),
+            SplitSlot("legs", "腿部训练", listOf("quadriceps"))
+        ))
+        val oldLive = session("old-live", "push", "completed", earlierTime)
+        val newerLiveBase = session("newer-live", "pull", "completed", earlierTime + 2 * 86_400_000)
+        val newerLive = newerLiveBase.copy(results = newerLiveBase.results.map { it.copy(load = Load(35.0)) })
+        val olderImported = imported("older-import", "2026-10-25", "推")
+        assertEquals("legs", nextSlot(matchingProgram, listOf(oldLive, newerLive, olderImported)).id)
+        val correctedOldLive = oldLive.copy(results = oldLive.results.map { it.copy(load = Load(40.0)) })
+        assertEquals("legs", nextSlot(matchingProgram, listOf(correctedOldLive, newerLive, olderImported)).id)
+        val newestImported = imported("newest-import", "2026-10-27", "推")
+        assertEquals("pull", nextSlot(matchingProgram, listOf(newerLive, newestImported)).id)
+    }
+
+    @Test fun `手动安排优先且取消同标识不会消费`() {
+        val override = ArrangementOverride("manual-history", "legs")
+        val cancelled = session("cancelled-manual", "pull", "cancelled", start).copy(
+            snapshot = plan("cancelled-plan", "pull").copy(programId = historicalProgram.id),
+            arrangementOverrideId = override.id
+        )
+        assertEquals("legs", nextSlot(historicalProgram, listOf(cancelled), override).id)
+        val completed = session("manual-completed", "legs", "completed", start)
+            .copy(arrangementOverrideId = override.id)
+        assertEquals("push", nextSlot(program, listOf(completed), override).id)
+    }
 
     @Test fun `取消和进行中训练不推进轮换`() {
         val completed = session("completed", "push", "completed", start)
@@ -67,6 +134,57 @@ class TrainingBehaviorTest {
         assertEquals(Load(60.0, "lb", mode = "assistance"), summary.sessions.single().results[1].load)
         assertEquals(11, s.snapshot!!.items.sumOf { it.sets.size })
     }
+    @Test fun `独立活动在SQLite和完整备份中保留且不计入力量组`() {
+        val activity = ActivityRecord(
+            id = "activity-badminton", name = "羽毛球", localDate = "2026-10-22",
+            durationSeconds = 7200, notes = "约", sourceId = "source-badminton-2026-10-22"
+        )
+        val hike = ActivityRecord(
+            id = "activity-hike", name = "徒步", localDate = "2026-10-17",
+            durationSeconds = 13854, distanceMeters = 12040.0, sourceId = "source-hike-2026-10-17"
+        )
+        val legacySession = imported("historical-activity-test", "2026-10-22", "推类训练")
+        val source = directory.resolve("activity-source")
+        Store(source, seed).use { store ->
+            store.put(document(Kind.session, legacySession.id, legacySession))
+            val nextSlotBeforeActivities = nextSlot(historicalProgram, store.list(Kind.session).map { it.value<Session>() }).id
+            store.put(document(Kind.activity, activity.id, activity))
+            store.put(document(Kind.activity, hike.id, hike))
+
+            assertEquals(activity, store.get(Kind.activity, activity.id)!!.value<ActivityRecord>())
+            val allHistory = summarizeHistory(store.list(Kind.session).map { it.value<Session>() }, store.list(Kind.activity).map { it.value<ActivityRecord>() })
+            assertEquals(1, allHistory.strengthSets)
+            assertEquals(0, allHistory.stretchSets)
+            assertEquals(setOf(activity, hike), allHistory.activities.toSet())
+            assertEquals(nextSlotBeforeActivities, nextSlot(historicalProgram, store.list(Kind.session).map { it.value<Session>() }).id)
+
+            val bytes = java.io.ByteArrayOutputStream()
+            Archives(source, store).export(bytes)
+            val backup = readBackup(bytes.toByteArray().inputStream(), directory.resolve("activity-backup-media"))
+            assertEquals(4, backup.formatVersion)
+            assertEquals(setOf(activity, hike), backup.documents.filter { it.kind == Kind.activity }.map { it.value<ActivityRecord>() }.toSet())
+
+            Store(directory.resolve("activity-restored"), seed).use { restored ->
+                restored.import(backup, replace = false)
+                assertEquals(activity, restored.get(Kind.activity, activity.id)!!.value<ActivityRecord>())
+                assertEquals(hike, restored.get(Kind.activity, hike.id)!!.value<ActivityRecord>())
+                assertEquals(1, summarizeHistory(restored.list(Kind.session).map { it.value<Session>() }, restored.list(Kind.activity).map { it.value<ActivityRecord>() }).strengthSets)
+            }
+        }
+        assertFails {
+            validateDocument(
+                document(Kind.activity, "invalid-activity", activity.copy(id = "different")),
+                { emptyList() }, { _, _ -> null }
+            )
+        }
+        assertFails {
+            validateDocument(
+                document(Kind.activity, "bad-activity-date", activity.copy(id = "bad-activity-date", localDate = "not-a-date")),
+                { emptyList() }, { _, _ -> null }
+            )
+        }
+    }
+
     @Test fun `历史日期和组内降重在真实SQLite中保留且只计一组`() {
         val history = Session(
             id = "historical", name = "历史训练", snapshot = null, exercises = listOf(dumbbell),
@@ -78,7 +196,7 @@ class TrainingBehaviorTest {
             items = listOf(PlanItem("actual", dumbbell.id, sets = emptyList())),
             historicalSource = HistoricalSource("source-2026-10-13", "2026-10-13")
         )
-        Store(directory, seed).use { store ->
+        Store(directory.resolve("history-date"), seed).use { store ->
             val saved = store.put(document(Kind.session, history.id, history))
             val restored = saved.value<Session>()
             assertNull(restored.snapshot)
@@ -122,6 +240,27 @@ class TrainingBehaviorTest {
         }
         val migrated = readBackup(legacyBytes.toByteArray().inputStream(), directory.resolve("backup-media-v2"))
         val migratedDoc = migrated.documents.single()
+        val versionOne = legacy.copy(formatVersion = 1)
+        val versionOneBytes = java.io.ByteArrayOutputStream()
+        java.util.zip.ZipOutputStream(versionOneBytes).use { zip ->
+            zip.putNextEntry(java.util.zip.ZipEntry("data.json"))
+            zip.write(wireJson.encodeToString(versionOne).toByteArray())
+            zip.closeEntry()
+        }
+        val migratedV1 = readBackup(versionOneBytes.toByteArray().inputStream(), directory.resolve("backup-media-v1"))
+        assertEquals(1, migratedV1.formatVersion)
+        assertEquals(history, migratedV1.documents.single().value<Session>())
+
+        val versionThree = Backup(formatVersion = 3, documents = listOf(document(Kind.session, history.id, history)), exportedAt = start)
+        val versionThreeBytes = java.io.ByteArrayOutputStream()
+        java.util.zip.ZipOutputStream(versionThreeBytes).use { zip ->
+            zip.putNextEntry(java.util.zip.ZipEntry("data.json"))
+            zip.write(wireJson.encodeToString(versionThree).toByteArray())
+            zip.closeEntry()
+        }
+        val restoredV3 = readBackup(versionThreeBytes.toByteArray().inputStream(), directory.resolve("backup-media-v3"))
+        assertEquals(3, restoredV3.formatVersion)
+        assertEquals(history, restoredV3.documents.single().value<Session>())
         assertEquals(history, migratedDoc.value<Session>())
         assertFalse(migratedDoc.data["historicalSource"].toString().contains("originalText"))
 
@@ -139,7 +278,7 @@ class TrainingBehaviorTest {
             val exportedBytes = java.io.ByteArrayOutputStream()
             Archives(directory.resolve("legacy-store"), store).export(exportedBytes)
             val exported = readBackup(exportedBytes.toByteArray().inputStream(), directory.resolve("backup-media-export"))
-            assertEquals(3, exported.formatVersion)
+            assertEquals(4, exported.formatVersion)
             val exportedSession = exported.documents.single { it.kind == Kind.session && it.id == history.id }
             assertEquals("修改后的反馈", exportedSession.value<Session>().notes)
             assertFalse(exportedSession.data["historicalSource"].toString().contains("originalText"))
@@ -152,6 +291,14 @@ class TrainingBehaviorTest {
             zip.closeEntry()
         }
         assertFails { readBackup(invalidV3Bytes.toByteArray().inputStream(), directory.resolve("backup-media-invalid-v3")) }
+        val invalidV4 = legacy.copy(formatVersion = 4)
+        val invalidV4Bytes = java.io.ByteArrayOutputStream()
+        java.util.zip.ZipOutputStream(invalidV4Bytes).use { zip ->
+            zip.putNextEntry(java.util.zip.ZipEntry("data.json"))
+            zip.write(wireJson.encodeToString(invalidV4).toByteArray())
+            zip.closeEntry()
+        }
+        assertFails { readBackup(invalidV4Bytes.toByteArray().inputStream(), directory.resolve("backup-media-invalid-v4")) }
         Store(directory.resolve("reject-legacy-write"), seed).use { store ->
             assertFails { store.put(oldDocument) }
             assertFails { store.put(document(Kind.session, "invalid-active-history", history.copy(id = "invalid-active-history", status = "active"))) }

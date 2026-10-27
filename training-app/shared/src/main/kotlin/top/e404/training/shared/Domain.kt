@@ -6,7 +6,7 @@ import java.time.LocalDate
 
 val wireJson = Json { encodeDefaults = true; ignoreUnknownKeys = false }
 
-enum class Kind { muscle, media, exercise, gym, equipment, program, plan, session, arrangement }
+enum class Kind { muscle, media, exercise, gym, equipment, program, plan, session, arrangement, activity }
 
 @Serializable data class Muscle(val id: String, val name: String, val mapKeys: List<String> = emptyList())
 @Serializable data class Media(val id: String, val name: String, val fileName: String, val mimeType: String, val source: String = "", val sourceUrl: String = "")
@@ -62,13 +62,16 @@ enum class Kind { muscle, media, exercise, gym, equipment, program, plan, sessio
     val splitSlotName: String? = null
 )
 
-fun sessionTrainingLabel(session: Session): String = when (session.splitSlotName) {
-    null -> "自由锻炼"
+fun splitTrainingLabel(name: String?): String? = when (name) {
+    null, "自由锻炼" -> null
     "推类训练", "推" -> "推"
     "拉类训练", "拉" -> "拉"
     "腿部训练", "腿类训练", "腿" -> "腿"
-    else -> requireNotNull(session.splitSlotName)
+    else -> name
 }
+
+fun sessionTrainingLabel(session: Session): String =
+    splitTrainingLabel(session.splitSlotName) ?: "自由锻炼"
 
 @Serializable data class Document(
     val kind: Kind, val id: String, val data: JsonObject,
@@ -81,14 +84,22 @@ fun sessionTrainingLabel(session: Session): String = when (session.splitSlotName
     val cursor: Long, val documents: List<Document>, val accepted: List<Document> = emptyList(),
     val conflicts: List<Conflict> = emptyList()
 )
-@Serializable data class Backup(val formatVersion: Int = 3, val documents: List<Document>, val exportedAt: Long)
+@Serializable data class Backup(val formatVersion: Int = 4, val documents: List<Document>, val exportedAt: Long)
 @Serializable data class ApiError(val message: String)
 @Serializable data class TimerState(
     val deadline: Long, val label: String, val sessionId: String,
     val itemId: String, val setIndex: Int, val type: String = "rest",
-    val notified: Boolean = false
+    val notified: Boolean = false, val alertDismissed: Boolean = false
 )
-@Serializable data class HistorySummary(val sessions: List<Session>, val strengthSets: Int, val stretchSets: Int, val strengthSetsByMuscle: Map<String, Int>)
+@Serializable data class ActivityRecord(
+    val id: String, val name: String, val localDate: String,
+    val durationSeconds: Int? = null, val distanceMeters: Double? = null,
+    val notes: String = "", val sourceId: String? = null
+)
+@Serializable data class HistorySummary(
+    val sessions: List<Session>, val strengthSets: Int, val stretchSets: Int,
+    val strengthSetsByMuscle: Map<String, Int>, val activities: List<ActivityRecord> = emptyList()
+)
 
 inline fun <reified T> Document.value(): T = wireJson.decodeFromJsonElement(
     if (kind == Kind.session) withoutDeprecatedHistoricalText(this).data else data
@@ -137,7 +148,7 @@ fun validateDocument(doc: Document, list: (Kind) -> List<Document>, lookup: (Kin
                 list(Kind.program).any { p -> p.value<Program>().slots.any { doc.id in it.muscles } } ||
                 list(Kind.session).any { s -> s.value<Session>().exercises.any { doc.id in it.muscles || doc.id in it.secondaryMuscles } }
             Kind.plan -> arrangements.any { arrangement -> arrangement.selectedPlans.values.any { doc.id in it.values } }
-            Kind.session, Kind.arrangement -> false
+            Kind.session, Kind.arrangement, Kind.activity -> false
         }
         require(!inUse) { "该资料仍被计划、器械、安排或训练记录使用，请先解除关联" }
         return
@@ -181,7 +192,7 @@ fun validateDocument(doc: Document, list: (Kind) -> List<Document>, lookup: (Kin
             arrangement.nextOverrides.forEach { (programId, override) ->
                 require(override.id.isNotBlank()) { "下次安排缺少选择标识" }
                 val program = lookup(Kind.program, programId)?.takeUnless { it.deleted }?.value<Program>()
-                    ?: throw IllegalArgumentException("下次安排引用的分化方案不存在：$programId")
+                    ?: throw IllegalArgumentException("安排引用的分化方案不存在：$programId")
                 require(program.slots.any { it.id == override.slotId }) { "下次安排引用的分化项不存在：${override.slotId}" }
             }
         }.id
@@ -208,10 +219,14 @@ fun validateDocument(doc: Document, list: (Kind) -> List<Document>, lookup: (Kin
                 ref(Kind.exercise, p.exerciseId)
                 require(p.sets.isNotEmpty()) { "计划动作至少需要一组" }
                 p.sets.forEach(::checkTarget)
-                p.equipmentId?.let { id ->
-                    ref(Kind.equipment, id)
-                }
+                p.equipmentId?.let { id -> ref(Kind.equipment, id) }
             }
+        }.id
+        Kind.activity -> doc.value<ActivityRecord>().also { activity ->
+            require(activity.name.isNotBlank()) { "请填写活动名称" }
+            LocalDate.parse(activity.localDate)
+            require(activity.durationSeconds == null || activity.durationSeconds > 0) { "活动时长必须大于零" }
+            require(activity.distanceMeters == null || activity.distanceMeters.isFinite() && activity.distanceMeters > 0) { "活动距离必须是正数" }
         }.id
         Kind.session -> doc.value<Session>().also { session ->
             require(!doc.hasDeprecatedHistoricalText()) { "新写入不能包含已废弃的 historicalSource.originalText" }
@@ -286,15 +301,53 @@ fun recommendExercises(exercises: List<Exercise>, muscles: Set<String>, gymId: S
     }
         .sortedWith(compareByDescending<Exercise> { ex -> ex.muscles.count(muscles::contains) }.thenBy { it.name })
 
-/** 只有真正完成的训练推进轮换，取消及日历经过均不改变下一项。 */
+/** 只有真正完成的训练推进轮换；可唯一对应当前分化项的已导入历史也会接续轮换。 */
 fun nextSlot(program: Program, sessions: List<Session>, override: ArrangementOverride? = null): SplitSlot {
-    val completed = sessions.filter { it.status == "completed" && it.snapshot?.programId == program.id }
-    val last = completed.maxWithOrNull(compareBy<Session> { it.endedAt ?: it.startedAt ?: 0 }.thenBy { it.id })
-    val consumed = override?.takeIf { candidate -> completed.any { it.arrangementOverrideId == candidate.id } }
-    val effectiveOverride = override?.takeUnless { it.id == consumed?.id }
-    if (effectiveOverride != null) return program.slots.single { it.id == effectiveOverride.slotId }
-    val index = last?.let { s -> program.slots.indexOfFirst { it.id == s.snapshot?.slotId } } ?: -1
-    return program.slots[(index + 1) % program.slots.size]
+    var lastDate: LocalDate? = null
+    var lastTime = Long.MIN_VALUE
+    var lastId = ""
+    var lastSlotIndex = -1
+    var consumed = false
+    for (session in sessions) {
+        if (session.status != "completed") continue
+        val snapshot = session.snapshot
+        val slotIndex = if (snapshot?.programId == program.id) {
+            if (override != null && session.arrangementOverrideId == override.id) consumed = true
+            program.slots.indexOfFirst { it.id == snapshot.slotId }
+        } else if (snapshot == null && session.historicalSource != null && session.splitSlotName != null) {
+            val label = splitTrainingLabel(session.splitSlotName)
+            if (label == null) {
+                -1
+            } else {
+                var match = -1
+                var matches = 0
+                for (index in program.slots.indices) {
+                    if (splitTrainingLabel(program.slots[index].name) == label) {
+                        match = index
+                        matches++
+                    }
+                }
+                if (matches == 1) match else -1
+            }
+        } else {
+            -1
+        }
+        if (slotIndex < 0) continue
+
+        val date = sessionDate(session)
+        val time = session.endedAt ?: session.startedAt ?: Long.MIN_VALUE
+        val previousDate = lastDate
+        if (previousDate == null || date.isAfter(previousDate) ||
+            (date == previousDate && (time > lastTime || (time == lastTime && session.id > lastId)))) {
+            lastDate = date
+            lastTime = time
+            lastId = session.id
+            lastSlotIndex = slotIndex
+        }
+    }
+
+    if (override != null && !consumed) return program.slots.single { it.id == override.slotId }
+    return program.slots[(lastSlotIndex + 1) % program.slots.size]
 }
 
 /** 历史训练使用已记录的本地日期，实时训练从真实开始时间转换为 UTC+8。 */
@@ -306,7 +359,7 @@ fun sessionDate(session: Session): LocalDate = session.historicalSource?.let { L
 val sessionComparator: Comparator<Session> = compareByDescending<Session> { sessionDate(it) }
     .thenByDescending { it.startedAt ?: Long.MIN_VALUE }.thenBy { it.id }
 
-fun summarizeHistory(sessions: List<Session>): HistorySummary {
+fun summarizeHistory(sessions: List<Session>, activities: List<ActivityRecord> = emptyList()): HistorySummary {
     val ordered = sessions.sortedWith(sessionComparator)
     val counts = linkedMapOf<String, Int>()
     var strengthSets = 0
@@ -319,7 +372,7 @@ fun summarizeHistory(sessions: List<Session>): HistorySummary {
             exercise.muscles.forEach { muscle -> counts[muscle] = (counts[muscle] ?: 0) + 1 }
         }
     } }
-    return HistorySummary(ordered, strengthSets, stretchSets, counts)
+    return HistorySummary(ordered, strengthSets, stretchSets, counts, activities.sortedWith(compareByDescending<ActivityRecord> { it.localDate }.thenBy { it.id }))
 }
 
 fun loadText(load: Load?): String = if (load == null) "未记录外部负重" else {

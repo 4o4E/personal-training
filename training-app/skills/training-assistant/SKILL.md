@@ -21,9 +21,8 @@ python scripts/training.py list equipment
 python scripts/training.py list program
 python scripts/training.py list plan
 python scripts/training.py list muscle
-python scripts/training.py list exercise
-python scripts/training.py list arrangement
-python scripts/training.py get arrangement current
+python scripts/training.py list activity
+python scripts/training.py get activity <活动ID>
 python scripts/training.py get plan <计划ID>
 python scripts/training.py next <分化方案ID>
 python scripts/training.py recommend --type strength --muscles <部位ID列表> --gym <健身房ID>
@@ -33,6 +32,7 @@ python scripts/training.py put plan <计划ID> --file <资料JSON> --base-revisi
 python scripts/training.py sync --file <SyncRequest.json>
 python scripts/training.py export <备份ZIP路径>
 python scripts/training.py import <备份ZIP路径>
+python scripts/training.py put activity <活动ID> --file <资料JSON> --base-revision 0
 ```
 
 上述尖括号是命令参数说明，执行时必须替换为实际查询得到的值。新资料使用独立 UUID 和 `baseRevision = 0`。编辑已有资料保留 `get` 取得的完整 Document 及其 `revision`，只修改 `data`；完整 Document 文件可以省略 `--base-revision`，工具会使用文件中原有的修订号。
@@ -65,10 +65,10 @@ python scripts/training.py import <备份ZIP路径>
 ## 资料与备份
 
 - 器械与动作图片先 `upload`，再保存 `media` 文档并更新使用者引用。素材使用新的不可变文件名，避免覆盖仍被旧资料使用的文件。
-- 完整导出 ZIP 包含版本化 `data.json` 和 `media/`；不包含 token、手机授权和后端连接配置。
-- 导入默认为合并；遇到已有不同内容停止并说明。只有用户明确允许替换后才添加 `--replace`。
+- 完整导出 ZIP 包含版本化 `data.json` 和 `media/`；不包含 token、手机授权和后端连接配置。新导出为 formatVersion 4；读取兼容版本 1–4，版本 1、2 定向清理已废弃历史来源字段，版本 3、4 拒绝该字段。独立运动以 `activity` 文档保存并随完整备份迁移，不计入力量组数。
 
 - 历史来源合并仅限用户明确授权的 `record/1012.md`、`1013.md`、`1014.md`、`1015.md`、`1019.md`、`1020.md`、`1021.md` 和 `1026.md`；将它们作为历史会话合并导入，使用 `replace=false`。历史来源只保留 `sourceId` 与 `localDate`；整理后的真实反馈写入 `notes`，不把来源全文或计划表复制进记录。
+- 本轮另行指定的活动来源是 2026-10-22 羽毛球 7200 秒（备注保留“约”）及 2026-10-17 徒步 12040 米、13854 秒。它们是独立 `activity` 记录，不扩大上述历史会话来源授权；使用稳定 `sourceId` 和明确的读取修订号，遇到不同 revision 冲突时保留两份内容并由用户明确选择。本轮不创建导入生产脚本。
 - 导入前结合当时训练安排、实际动作及训练部位确定分类，写入 `splitSlotName` 后再提交。能够明确归入推、拉、腿的记录保存对应分类；确实无法明确归类的混合训练才保存空值。原始文件没有分类字段不代表自由锻炼。提交前逐日核对分类与实际组数，提交后核对接口及手机日历。
-- 生产导入前确认后端与客户端支持 formatVersion 3 历史备份；当前授权的生产操作须等应用与后端更新后执行。旧备份读取兼容版本 1、2、3；0.0.3 旧库存、手机缓存与同步文档在 Session 解码边界定向移除废弃的 `historicalSource.originalText`，不改写数据库，也不自动转换 `notes`。新文档写入与版本 3 导入仍拒绝该字段；导出投影为版本 3，仅清除旧库存中的该字段。
+- 生产导入须等应用与后端更新后，由主助手按指定数据单独执行。0.0.3 旧库存、手机缓存与同步文档在 Session 解码边界定向移除废弃的 `historicalSource.originalText`，不改写数据库，也不自动转换 `notes`。新文档写入仍拒绝该字段；导出投影为版本 4，仅清除旧库存中的该字段。
 - 删除使用明确修订号；被计划、器械或历史素材引用的内容需要先解除关联。删除实际训练会改变统计及分化顺序，必须先取得用户确认。

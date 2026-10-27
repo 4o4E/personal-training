@@ -1,6 +1,8 @@
 package top.e404.training
 
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -60,6 +62,7 @@ private fun planVolume(plan: Plan, state: AppData): String {
     }
 }
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable fun AdjustPrograms(state: AppData, viewModel: TrainingViewModel, edit: (Document) -> Unit, preview: (Plan) -> Unit, onAdjustCurrent: () -> Unit, setup: () -> Unit, setupDay: (DaySetupRequest) -> Unit, advanced: () -> Unit) {
     val programs = remember(state.documents[Kind.program]) { state.records(Kind.program).map { it.value<Program>() } }
     val plans = remember(state.documents[Kind.plan]) { state.records(Kind.plan).map { it.value<Plan>() } }
@@ -88,9 +91,26 @@ private fun planVolume(plan: Plan, state: AppData): String {
                 Button(onClick = setup) { Text(if (programs.isEmpty()) "配置整轮训练方案" else "新增整轮训练方案") }
                 program?.let { selected ->
                     val overrideSlot = state.arrangement?.nextOverrides?.get(selected.id)?.slotId
-                    Choice<String?>("下次训练项", overrideSlot, listOf(null to "按实际完成轮换") + selected.slots.map { it.id to it.name }, { id ->
-                        viewModel.action { viewModel.repository.selectNextOverride(selected.id, id) }
-                    })
+                    val next = nextSlot(
+                        selected, state.records(Kind.session).map { it.value<Session>() },
+                        state.arrangement?.nextOverrides?.get(selected.id)
+                    )
+                    Text("下次训练部位", style = MaterialTheme.typography.titleMedium)
+                    Text(if (overrideSlot == null) "自动轮换 · 按实际完成记录计算" else "手动指定 · 完成该项后接续循环；取消不会消耗安排",
+                        style = MaterialTheme.typography.bodySmall)
+                    Text("下次：${next.name}", style = MaterialTheme.typography.titleLarge)
+                    FlowRow(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        FilterChip(overrideSlot == null, { viewModel.selectNextOverride(selected.id, null) },
+                            label = { Text("自动轮换") })
+                        selected.slots.forEach { slot ->
+                            FilterChip(overrideSlot == slot.id, { viewModel.selectNextOverride(selected.id, slot.id) },
+                                label = { Text(slot.name) })
+                        }
+                    }
                 }
             }
         }

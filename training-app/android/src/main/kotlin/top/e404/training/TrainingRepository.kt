@@ -397,6 +397,34 @@ class TrainingRepository(
         }
         enqueueSync()
     }
+    /** 历史重量纠正只改实际重量，不接触活动训练、计时或其他训练事实。 */
+    suspend fun updateHistoricalResultLoads(sessionId: String, itemId: String, setIndex: Int, loads: List<Load?>) = withContext(Dispatchers.IO) {
+        initialize()
+        gate.withLock {
+            val original = requireNotNull(lookup(Kind.session, sessionId)) { "训练不存在" }
+            require(!original.deleted) { "训练记录不存在" }
+            val current = original.value<Session>()
+            require(current.status != "active") { "正在进行的训练请在训练页面修改" }
+            val resultIndex = current.results.indexOfFirst { it.itemId == itemId && it.setIndex == setIndex }
+            require(resultIndex >= 0) { "完成组不存在" }
+            val result = current.results[resultIndex]
+            val revisedResult = if (result.segments.isEmpty()) {
+                require(loads.size == 1) { "重量记录已变化，请重新打开编辑" }
+                result.copy(load = loads.single())
+            } else {
+                require(loads.size == result.segments.size) { "重量分段已变化，请重新打开编辑" }
+                result.copy(segments = result.segments.mapIndexed { index, segment -> segment.copy(load = loads[index]) })
+            }
+            val revised = current.copy(results = current.results.toMutableList().apply { set(resultIndex, revisedResult) })
+            val doc = document(Kind.session, sessionId, revised)
+            validateDocument(doc, ::list, ::lookup)
+            val old = cache.getValue(doc.key())
+            val entry = Cached(doc.copy(revision = old.document.revision), true, old.remote)
+            database.withTransaction { dao.put(entry.row()) }
+            install(listOf(entry))
+        }
+        enqueueSync()
+    }
     suspend fun setTimer(timer: TimerState?) = withContext(Dispatchers.IO) {
         gate.withLock {
             if (timer == null) dao.removeValue("timer") else dao.putValue(LocalValue("timer", wireJson.encodeToString(timer)))
@@ -410,7 +438,7 @@ class TrainingRepository(
             val current = _timer.value
             when {
                 current == null -> TimerEngine.clearActive(context)
-                current.type != "rest" && current.notified -> TimerEngine.finishExercise(context)
+                current.type != "rest" && current.notified && current.alertDismissed -> TimerEngine.finishExercise(context)
                 else -> TimerEngine.schedule(context, current, clearFinished = false)
             }
         }
@@ -428,10 +456,21 @@ class TrainingRepository(
                 dao.putValue(LocalValue("timer", wireJson.encodeToString(notified)))
                 _timer.value = notified
                 TimerEngine.notifyFinished(context, notified)
-                if (notified.type != "rest") TimerEngine.finishExercise(context)
-            } else if (current.type != "rest") {
-                TimerEngine.finishExercise(context)
+                TimerEngine.schedule(context, notified, clearFinished = false)
             }
+        }
+    }
+    suspend fun dismissTimerAlert(expected: TimerState) = withContext(Dispatchers.IO) {
+        initialize(triggerStartupSync = false)
+        gate.withLock {
+            val current = _timer.value ?: return@withLock
+            val sameTimer = current.sessionId == expected.sessionId && current.itemId == expected.itemId &&
+                current.setIndex == expected.setIndex && current.deadline == expected.deadline && current.type == expected.type
+            if (!sameTimer || !current.notified || current.alertDismissed) return@withLock
+            val dismissed = current.copy(alertDismissed = true)
+            dao.putValue(LocalValue("timer", wireJson.encodeToString(dismissed)))
+            _timer.value = dismissed
+            context.getSystemService(android.app.NotificationManager::class.java).cancel(TimerEngine.FINISHED)
         }
     }
 
