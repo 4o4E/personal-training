@@ -98,6 +98,7 @@
 
 - epoch 毫秒表示已知精确时间；日期筛选与实时训练日期统一 UTC+8，历史来源日期直接使用 `historicalSource.localDate`。
 - `status`：`active` / `completed` / `cancelled`。没有实际完成组的训练不能标记完成。
+- 历史导入须先结合当时训练安排、实际动作和训练部位整理 `splitSlotName`，再提交原生记录。明确的推、拉、腿写入对应名称；无法明确归类的混合训练使用空值。原始来源缺少此字段不等于自由锻炼。客户端按保存的分类展示，不根据当前方案重算。
 - `SetResult`：`itemId`、非负 `setIndex`、实际 `reps` / `seconds`、实际 `load`、`side`、可空 `completedAt` 和有序 `segments`。
 - `SetSegment` 保留分段实际 `reps` 与 `load`；分段次数之和必须等于整组次数，分段重量不可再压成一个组重量；一条 `SetResult` 仍只计一个实际组。
 - `Load.meaning` 支持 `total`、`per_hand`、`per_side`、`unknown`；未知含义保留原始数值与单位，界面仅显示数字和原始单位，不猜测重量含义；助力模式仍显示助力语义。
