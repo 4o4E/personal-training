@@ -80,31 +80,108 @@ fun previewPreset(count: Int, style: PresetStyle, actions: Int, exercises: Map<S
 
 data class RotationPlan(val slot: SplitSlot, val plan: Plan?)
 
-/** 日期安排只执行一次；无日期的分化计划循环使用。多份模板必须明确选择，不能猜测用户偏好。 */
+/** Resolve exact-date plans first, then chosen/reusable past plans, and use history only when no plan exists. */
 fun rotationPlans(
     program: Program, plans: List<Plan>, sessions: List<Session>, selectedPlans: Map<String, String>,
-    override: ArrangementOverride? = null
+    override: ArrangementOverride? = null,
+    date: java.time.LocalDate = java.time.Instant.now().atZone(java.time.ZoneId.of("Asia/Shanghai")).toLocalDate()
 ): List<RotationPlan> {
-    val completed = sessions.asSequence().filter { it.status == "completed" }.mapNotNull { it.snapshot?.id }.toHashSet()
     val next = nextSlot(program, sessions, override)
     val start = program.slots.indexOfFirst { it.id == next.id }
     return List(program.slots.size) { offset ->
         val slot = program.slots[(start + offset) % program.slots.size]
-        var dated: Plan? = null
-        var template: Plan? = null
-        var preferred: Plan? = null
-        var templateCount = 0
-        plans.forEach { plan ->
-            if (plan.programId == program.id && plan.slotId == slot.id) {
-                if (plan.date != null) {
-                    if (plan.id !in completed && (dated == null || plan.date < dated!!.date!!)) dated = plan
-                } else {
-                    templateCount++
-                    template = plan
-                    if (plan.id == selectedPlans[slot.id]) preferred = plan
-                }
-            }
-        }
-        RotationPlan(slot, dated ?: if (templateCount == 1) template else preferred)
+        RotationPlan(slot, resolveTrainingPlan(program, slot, plans, sessions, selectedPlans, date.plusDays(offset.toLong())))
     }
+}
+
+/** Shared deterministic resolver for daily preparation and previews. */
+fun resolveTrainingPlan(
+    program: Program,
+    slot: SplitSlot,
+    plans: List<Plan>,
+    sessions: List<Session>,
+    selectedPlans: Map<String, String>,
+    date: java.time.LocalDate
+): Plan? {
+    val matching = plans.filter { it.programId == program.id && it.slotId == slot.id }
+    val usedPlans = recordedPlanIds(sessions)
+    val selectedId = selectedPlans[slot.id]
+    val selected = selectedId?.let { id ->
+        matching.singleOrNull { it.id == id }
+            ?: throw IllegalArgumentException("已选训练计划不存在或与分化项不匹配：$id")
+    }
+    matching.filter { it.date == date.toString() && it.id !in usedPlans }.minByOrNull { it.id }?.let { return it }
+    val stableTemplateId = "template-${java.util.UUID.nameUUIDFromBytes("${program.id}/${slot.id}".toByteArray(Charsets.UTF_8))}"
+    selected?.let { plan ->
+        when {
+            plan.date == null -> return plan
+            plan.date == date.toString() && plan.id !in usedPlans -> return plan
+            plan.date < date.toString() -> return plan.copy(id = stableTemplateId, date = null)
+        }
+    }
+    val reusable = matching.filter { it.date == null }
+    if (reusable.size == 1) return reusable.single()
+    if (reusable.size > 1) return null
+    matching.filter { it.date != null && it.date < date.toString() }
+        .maxWithOrNull(compareBy<Plan> { it.date }.thenBy { it.id })
+        ?.let { return it.copy(id = stableTemplateId, date = null) }
+
+    val targetLabel = splitTrainingLabel(slot.name) ?: return null
+    data class ActualSource(val session: Session, val source: SessionSource, val itemIds: Set<String>)
+    val actualSources = sessions.flatMap { session ->
+        if (session.results.isEmpty() || sessionDate(session).isAfter(date)) return@flatMap emptyList()
+        val sourcedItems = session.sourceRecords.flatMapTo(hashSetOf()) { it.itemIds }
+        val nativeItems = session.items.map { it.id }.filterNot { it in sourcedItems }
+        val sources = session.sourceRecords + if (nativeItems.isNotEmpty()) listOf(
+            SessionSource(session.id, session.name, session.localDate, session.snapshot, session.startedAt,
+                session.endedAt, null, session.arrangementOverrideId, session.splitSlotName, nativeItems)
+        ) else emptyList()
+        sources.mapNotNull { source ->
+            val actualIds = source.itemIds.filterTo(hashSetOf()) { id -> session.results.any { it.itemId == id } }
+            if (actualIds.isEmpty()) return@mapNotNull null
+            val snapshot = source.snapshot
+            val matchesSlot = when {
+                snapshot != null && snapshot.programId != program.id -> false
+                snapshot?.programId == program.id -> snapshot.slotId == slot.id
+                else -> (splitTrainingLabel(source.splitSlotName) ?: "自由锻炼") == targetLabel
+            }
+            if (!matchesSlot) null else ActualSource(session, source, actualIds)
+        }
+    }
+    val selectedSource = actualSources.maxWithOrNull(
+        compareBy<ActualSource> { sessionDate(it.session) }
+            .thenBy { it.source.endedAt ?: it.source.startedAt ?: Long.MIN_VALUE }
+            .thenBy { it.source.sourceId }
+    ) ?: return null
+    val session = selectedSource.session
+    val source = selectedSource.source
+    val sourceSnapshotItems = source.snapshot?.items.orEmpty()
+    val items = session.items.filter { it.id in selectedSource.itemIds }.mapNotNull { item ->
+        val exercise = session.exercises.singleOrNull { it.id == item.exerciseId } ?: return@mapNotNull null
+        val actual = session.results.filter { it.itemId == item.id }.maxByOrNull { it.setIndex } ?: return@mapNotNull null
+        val sourceTargetItem = sourceSnapshotItems.firstOrNull { old ->
+            old.exerciseId == item.exerciseId && old.equipmentId == item.equipmentId
+        }
+        val targets = sourceTargetItem?.sets?.takeIf { it.isNotEmpty() }
+            ?: item.sets.takeIf { it.isNotEmpty() }
+            ?: run {
+                val segment = actual.segments.lastOrNull()
+                val fallback = SetTarget(
+                    reps = segment?.reps ?: actual.reps,
+                    seconds = actual.seconds,
+                    load = segment?.load ?: actual.load,
+                    side = actual.side,
+                    restSeconds = if (exercise.type == "stretch") 15 else 90
+                )
+                List(if (exercise.type == "stretch") 1 else 4) { fallback }
+            }
+        PlanItem(
+            id = "template-item-${java.util.UUID.nameUUIDFromBytes("${program.id}/${slot.id}/${item.id}".toByteArray(Charsets.UTF_8))}",
+            exerciseId = item.exerciseId, equipmentId = item.equipmentId, sets = targets, notes = item.notes
+        )
+    }
+    if (items.isEmpty()) return null
+    val stableId = "template-${java.util.UUID.nameUUIDFromBytes("${program.id}/${slot.id}".toByteArray(Charsets.UTF_8))}"
+    return Plan(stableId, "${slot.name}模板", program.id, slot.id,
+        source.snapshot?.gymId ?: session.snapshot?.gymId, items = items)
 }

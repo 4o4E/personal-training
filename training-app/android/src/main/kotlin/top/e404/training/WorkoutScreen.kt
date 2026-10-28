@@ -54,7 +54,7 @@ import top.e404.training.shared.*
 }
 
 @Composable fun WorkoutScreen(
-    session: Session, state: AppData, viewModel: TrainingViewModel, permissionRevision: Int, onAdjust: () -> Unit
+    session: Session, state: AppData, viewModel: TrainingViewModel, permissionRevision: Int
 ) {
     var detail by remember { mutableStateOf<Exercise?>(null) }
     var editingResult by rememberSaveable { mutableStateOf<String?>(null) }
@@ -67,7 +67,8 @@ import top.e404.training.shared.*
     val reminderReady = remember(permissionRevision) { TimerEngine.canSchedule(context) && TimerEngine.canNotify(context) }
     val done = session.results.size
     val total = session.items.sumOf { item ->
-        if (item.id in session.skippedItems) session.results.count { it.itemId == item.id } else item.sets.size
+        val completed = session.results.count { it.itemId == item.id }
+        if (item.id in session.skippedItems) completed else maxOf(item.sets.size, completed)
     }
     val historicalLoads = remember(state.documents.getValue(Kind.session), session.id) {
         buildMap<Pair<String, String?>, MutableSet<Load>> {
@@ -93,14 +94,13 @@ import top.e404.training.shared.*
         LazyColumn(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(10.dp), contentPadding = PaddingValues(bottom = 24.dp)) {
             item {
                 Text(session.name, style = MaterialTheme.typography.headlineSmall)
-                Text("已完成 $done / $total 组 · ${session.startedAt?.let(::localDateTime) ?: session.historicalSource?.localDate.orEmpty()}")
-                OutlinedButton(onClick = onAdjust) { Text("调整本次剩余内容") }
+                Text("已完成 $done / $total 组 · ${session.startedAt?.let(::localDateTime) ?: session.localDate}")
             }
             items(session.items, key = { it.id }) { item ->
                 val exercise = session.exercises.single { it.id == item.exerciseId }
                 val completed = session.results.count { it.itemId == item.id }
                 val skipped = item.id in session.skippedItems
-                val targetCount = if (skipped) completed else item.sets.size
+                val targetCount = if (skipped) completed else maxOf(item.sets.size, completed)
                 var showCompleted by rememberSaveable(session.id, item.id) { mutableStateOf(false) }
                 val nextIndex = item.sets.indices.firstOrNull { index ->
                     session.results.none { it.itemId == item.id && it.setIndex == index }
@@ -116,14 +116,16 @@ import top.e404.training.shared.*
                         }
                     }
                     if (showCompleted) {
-                        item.sets.indices.forEach { index ->
-                            session.results.firstOrNull { it.itemId == item.id && it.setIndex == index }?.let { result ->
-                                HorizontalDivider()
-                                Text("第 ${index + 1} 组：${resultText(result)}")
-                                Row {
-                                    TextButton(onClick = { actualDraft = null; editingResult = item.id; editingIndex = index }) { Text("修改实际记录") }
-                                    TextButton(onClick = { viewModel.undoSet(session.id, item.id, index) }) { Text("撤销完成") }
-                                }
+                        session.results.filter { it.itemId == item.id }.sortedBy { it.setIndex }.forEach { result ->
+                            HorizontalDivider()
+                            Text("第 ${result.setIndex + 1} 组：${resultText(result)}")
+                            Row {
+                                TextButton(onClick = {
+                                    actualDraft = null
+                                    editingResult = item.id
+                                    editingIndex = result.setIndex
+                                }) { Text("修改实际记录") }
+                                TextButton(onClick = { viewModel.undoSet(session.id, item.id, result.setIndex) }) { Text("撤销完成") }
                             }
                         }
                     }
@@ -141,7 +143,12 @@ import top.e404.training.shared.*
                                 editingIndex = nextIndex
                             }
                         }
-                        else -> Text("该动作计划组已完成。", style = MaterialTheme.typography.bodySmall)
+                        else -> {
+                            Text("该动作计划组已完成。", style = MaterialTheme.typography.bodySmall)
+                            if (completed > 0) {
+                                TextButton(onClick = { viewModel.appendSessionSet(session.id, item.id) }) { Text("追加一组待执行目标") }
+                            }
+                        }
                     }
                 }
             }
@@ -158,7 +165,13 @@ import top.e404.training.shared.*
     editingResult?.let { id ->
         val item = session.items.single { it.id == id }
         val result = session.results.firstOrNull { it.itemId == id && it.setIndex == editingIndex }
-        val target = item.sets[editingIndex]
+        val target = item.sets.getOrNull(editingIndex) ?: SetTarget(
+            reps = result?.segments?.lastOrNull()?.reps ?: result?.reps,
+            seconds = result?.seconds,
+            load = result?.segments?.lastOrNull()?.load ?: result?.load,
+            side = result?.side ?: "both",
+            restSeconds = if (session.exercises.single { it.id == item.exerciseId }.type == "stretch") 15 else 90
+        )
         val input = actualDraft ?: target.copy(reps = result?.reps ?: target.reps, seconds = result?.seconds ?: target.seconds,
             load = result?.load ?: target.load, side = result?.side ?: target.side)
         val equipment = item.equipmentId?.let { state.record(Kind.equipment, it)?.value<Equipment>() }
@@ -172,7 +185,7 @@ import top.e404.training.shared.*
     }
     finishMode?.let { mode ->
         AlertDialog(onDismissRequest = { finishMode = null }, title = { Text(if (mode == "complete") "完成本次训练？" else "取消本次训练？") },
-            text = { Text(if (mode == "complete") "未完成的计划组不会计为完成。" else "已经完成的组仍会保留，但取消不会推进分化顺序。") },
+            text = { Text(if (mode == "complete") "未完成的计划组不会计为完成。" else "已完成的组仍会保留；有实际组时按练过推进，零组取消不推进。") },
             confirmButton = { TextButton(onClick = { viewModel.finish(session.id, mode == "cancel"); finishMode = null }) { Text("确认") } },
             dismissButton = { TextButton(onClick = { finishMode = null }) { Text("继续训练") } })
     }

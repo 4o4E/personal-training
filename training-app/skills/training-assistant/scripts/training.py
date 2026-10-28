@@ -12,6 +12,7 @@ from urllib.parse import urlencode, quote, urlsplit
 from urllib.request import Request, urlopen
 
 KINDS = ("muscle", "media", "exercise", "gym", "equipment", "program", "plan", "session", "arrangement", "activity")
+HEALTH_DATASETS = ("steps", "calories", "heartRate", "restingHeartRate", "sleep", "body", "activity")
 
 
 class Client:
@@ -85,9 +86,19 @@ def parser():
     recommend.add_argument("--gym")
     next_training = sub.add_parser("next", help="查询分化方案的下一项训练")
     next_training.add_argument("program_id")
-    export = sub.add_parser("export", help="导出含版本化 data.json 和素材的 ZIP")
+    sub.add_parser("capabilities", help="查询配套格式和健康接口能力")
+    sub.add_parser("health-status", help="查询健康覆盖范围和采集阶段")
+    health_days = sub.add_parser("health-days", help="按日期范围读取健康日汇总")
+    health_days.add_argument("--from", dest="from_date", required=True)
+    health_days.add_argument("--to", dest="to_date", required=True)
+    health_records = sub.add_parser("health-records", help="读取一个日期和数据集的一页健康详情")
+    health_records.add_argument("--date", required=True)
+    health_records.add_argument("--dataset", choices=HEALTH_DATASETS, required=True)
+    health_records.add_argument("--cursor")
+    sub.add_parser("health-collect", help="请求或合并一次服务器健康采集")
+    export = sub.add_parser("export", help="在线导出完整 ZIP 与全量健康备份")
     export.add_argument("file")
-    import_data = sub.add_parser("import", help="导入 ZIP，默认不替换已有不同资料")
+    import_data = sub.add_parser("import", help="在线导入 ZIP；完整健康备份需联网，默认不替换")
     import_data.add_argument("file")
     import_data.add_argument("--replace", action="store_true")
     upload = sub.add_parser("upload", help="上传独立图片；另行保存 media 资料与引用")
@@ -135,6 +146,20 @@ def run(args, client):
         return client.request("GET", "/v1/recommendations?" + urlencode(query))
     if args.command == "next":
         return client.request("GET", f"/v1/programs/{quote(args.program_id, safe='')}/next")
+    if args.command == "capabilities":
+        return client.request("GET", "/v1/capabilities")
+    if args.command == "health-status":
+        return client.request("GET", "/v1/health/status")
+    if args.command == "health-days":
+        query = {"from": args.from_date, "to": args.to_date}
+        return client.request("GET", "/v1/health/days?" + urlencode(query))
+    if args.command == "health-records":
+        query = {"date": args.date, "dataset": args.dataset}
+        if args.cursor:
+            query["cursor"] = args.cursor
+        return client.request("GET", "/v1/health/records?" + urlencode(query))
+    if args.command == "health-collect":
+        return client.request("POST", "/v1/health/collection/request")
     if args.command == "export":
         return client.request("GET", "/v1/export", output=args.file)
     if args.command == "import":

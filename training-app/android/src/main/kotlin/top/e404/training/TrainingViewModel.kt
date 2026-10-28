@@ -3,9 +3,12 @@ package top.e404.training
 import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import top.e404.training.shared.*
 import java.io.IOException
 import java.time.Instant
@@ -20,18 +23,74 @@ class TrainingViewModel(application: Application) : AndroidViewModel(application
     val repository = (application as TrainingApplication).repository
     private val _message = MutableStateFlow<String?>(null)
     val message: StateFlow<String?> = _message
+    private var healthLoadJob: Job? = null
     init { action { repository.initialize() } }
     fun dismissMessage() { _message.value = null }
+    private fun healthAction(block: suspend () -> Unit) {
+        viewModelScope.launch {
+            try { block() }
+            catch (error: CancellationException) { throw error }
+            catch (error: Exception) { repository.healthFailure(error.message ?: "健康数据读取失败") }
+        }
+    }
+    fun selectHealthDate(date: java.time.LocalDate) {
+        healthLoadJob?.cancel()
+        healthLoadJob = viewModelScope.launch {
+            try { repository.selectHealthDate(date) }
+            catch (error: CancellationException) { throw error }
+            catch (error: Exception) { repository.healthFailure(error.message ?: "健康日期选择失败") }
+        }
+    }
+    fun refreshHealthDays(from: java.time.LocalDate, to: java.time.LocalDate) =
+        healthAction { repository.refreshHealthDays(from, to) }
+    fun loadHealthDate(date: java.time.LocalDate) {
+        healthLoadJob?.cancel()
+        healthLoadJob = viewModelScope.launch {
+            try { repository.loadHealthDate(date) }
+            catch (error: CancellationException) { throw error }
+            catch (error: Exception) { repository.healthFailure(error.message ?: "健康数据读取失败") }
+        }
+    }
+    fun requestCollection() {
+        viewModelScope.launch {
+            try { repository.requestHealthCollection() }
+            catch (error: CancellationException) { throw error }
+            catch (_: Exception) { /* repository stores the collection-stage failure */ }
+        }
+    }
+    suspend fun observeCollectionStatus() {
+        val activeStages = setOf("requested", "running", "submitted")
+        while (true) {
+            val current = repository.data.value.health
+            val collection = current.healthStatus?.collection ?: return
+            if (collection.stage !in activeStages || current.collectionError != null) return
+            delay(5_000)
+            val afterDelay = repository.data.value.health
+            if (afterDelay.healthStatus?.collection?.stage !in activeStages || afterDelay.collectionError != null) return
+            try {
+                repository.refreshHealthStatus()
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Exception) {
+                repository.collectionFailure(error.message ?: "读取服务器采集状态失败")
+                return
+            }
+        }
+    }
+    fun retryAll() = healthAction { repository.retryAll() }
     fun action(block: suspend () -> Unit) {
         viewModelScope.launch {
             try { block() }
+            catch (error: CancellationException) { throw error }
             catch (error: IllegalArgumentException) { _message.value = error.message ?: "输入内容不正确" }
-            catch (error: ApiProblem) { _message.value = error.message; repository.syncFailure(error.message!!) }
-            catch (error: IOException) { _message.value = "网络或文件读取失败，手机中的已有记录保持保存"; repository.syncFailure("未完成同步，请检查网络或文件") }
+            catch (error: ApiProblem) { _message.value = error.message }
+            catch (error: IOException) { _message.value = "网络或文件操作失败；手机中已有资料保持保存" }
         }
     }
     fun save(doc: Document, original: Document, done: () -> Unit = {}) = action { repository.save(doc, original); done() }
-    fun start(plan: Plan) = action { repository.beginSession(plan) }
+    fun resumeToday(date: java.time.LocalDate) = action { repository.resumeToday(date) }
+    fun prepareToday(date: java.time.LocalDate, done: () -> Unit) = action { repository.prepareToday(date); done() }
+    fun appendSessionSet(sessionId: String, itemId: String) = action { repository.appendSessionSet(sessionId, itemId) }
     fun selectProgram(programId: String?) = action { repository.selectProgram(programId) }
     fun selectPlan(programId: String, slotId: String, planId: String?) = action { repository.selectPlan(programId, slotId, planId) }
     fun selectNextOverride(programId: String, slotId: String?) = action { repository.selectNextOverride(programId, slotId) }

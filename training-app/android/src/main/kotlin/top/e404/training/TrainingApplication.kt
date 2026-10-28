@@ -10,7 +10,11 @@ import coil.decode.GifDecoder
 import coil.decode.ImageDecoderDecoder
 import coil.decode.SvgDecoder
 class TrainingApplication : Application(), ImageLoaderFactory {
-    val database: TrainingDatabase by lazy { Room.databaseBuilder(this, TrainingDatabase::class.java, "training.db").build() }
+    val database: TrainingDatabase by lazy {
+        Room.databaseBuilder(this, TrainingDatabase::class.java, "training.db")
+            .addMigrations(HEALTH_CACHE_MIGRATION_1_2)
+            .build()
+    }
     val vault: ConnectionVault by lazy { ConnectionVault(this) }
     val preferences: AppPreferences by lazy { AppPreferences(this) }
     val repository: TrainingRepository by lazy { TrainingRepository(this, database, vault) }

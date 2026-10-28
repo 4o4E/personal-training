@@ -1,6 +1,6 @@
 ---
 name: training-assistant
-description: 通过个人训练应用的同一套开放接口安排分化训练、按实际器械查找动作与拉伸、读取真实完成记录并分析恢复；支持原始 kg/lb、修订冲突和完整备份。
+description: 通过个人训练应用的同一受鉴权接口安排分化训练、读取真实训练与健康记录、请求服务器采集并处理修订冲突和完整备份。
 ---
 
 # 个人训练应用操作
@@ -42,8 +42,8 @@ python scripts/training.py put activity <活动ID> --file <资料JSON> --base-re
 ## 安排训练
 
 1. 读取健身房、器械、分化方案、已有计划和最近实际训练；不猜测健身房已有器械。
-2. 查询 `next` 得到按完成情况计算的下一项。日期是可选安排，休息与取消不推进顺序；没有用户给定日期时只安排顺序，不假定连续每天训练。
-3. 用部位和实际健身房查询多个动作候选。说明器械条件；无候选时说明缺少什么条件，不编造器械或动作。
+2. 查询 `next` 得到按真实组推进的下一项。每天至多一份训练记录；有至少一组实际结果即视为练过，取消保留实际组也推进，零组不推进。没有用户给定日期时只安排顺序，不假定连续每天训练。
+3. 用部位和实际健身房查询多个动作候选。说明器械条件；无候选时说明缺少什么条件，不编造器械或动作。动作目录中的教学步骤为空表示没有已记录的具体形式；保留名称、部位、计量等真实字段，不用同名器械或经验补写教学。
 4. 重量优先采用用户明确调整值，其次采用相同实际器械的最近真实记录。保留每组 `kg` / `lb`、总重量 / 单只重量 / 单侧配重、负重 / 助力；不进行显示单位归一化，不把未知重量写为零，不将助力等同于负重。
 5. 力量动作通常预填 4 组，具体次数与负重按用户记录及当前要求配置；拉伸保留时长、次数、侧别及其自己的组要求。
 6. 根据所选训练动作查询拉伸候选。只提供建议，确认用户选择及加入位置后才把拉伸写进计划，不自动追加固定收尾阶段。
@@ -52,23 +52,47 @@ python scripts/training.py put activity <活动ID> --file <资料JSON> --base-re
 
 ## 分析实际记录
 
-- 查询 `history`，时间统一 UTC+8。历史训练按 `historicalSource.localDate` 筛选；实时训练按真实 `startedAt` 转换日期，未知具体时间不构造顺序。
-- 历史展示读取已整理的 `splitSlotName`；空值显示“自由锻炼”，标准推/拉/腿名称简写，其他明确分化名称原样保留。分类整理在导入前完成，读取时不随当前方案重新归类。
-- 只有 `results` 中存在的组才是实际完成。`snapshot` 可为空；`items[].sets` 都是目标，不能当作训练完成量。
+- 查询 `history`，时间统一 UTC+8。所有 Session 以必填 `localDate` 筛选；实时来源的精确时间保留在 `sourceRecords.startedAt`，未知具体时间不构造顺序。
+- 每日唯一 `Session` 使用 `day-YYYY-MM-DD`。`sourceRecords` 仅保留来源事实（原Session id、名称、日期、原计划快照、已知时间、分类、动作映射和来源原反馈），不复制实际组或Markdown正文；真实组、分段和当前可编辑反馈只在canonical Session根字段。canonical读取/备份/重启保持原payload，不按旧来源反馈重建根反馈。
+- `sessionTrainingLabels` 从实际组关联的来源分类汇总；同日存在多个真实分类时全部保留。零组准备内容按自身计划分类；空分类显示“自由锻炼”，标准推/拉/腿名称简写，其他明确名称原样保留。
+- 只有 `results` 中存在的组才是实际完成。`snapshot` 可为空；`items[].sets` 都是目标，不能当作训练完成量。只有实际组关联的根或来源 `snapshot` 才算已执行计划。
 - 完成组的 `completedAt` 可为空；`segments` 按发生顺序保存组内多段重量与次数，一组仍只计一次。`Load.meaning=unknown` 表示保留读数但含义未知，显示时仅显示数值和单位。
-- 完成、取消与进行中分开说明。取消训练中的实际完成组仍是事实，但取消不推进分化。
-- `strengthSets` 与 `stretchSets` 分开；`strengthSetsByMuscle` 是主要部位涉及的力量组，复合动作可涉及多个部位，不把部位之和当作总组数。
+- 完成、取消与进行中分开说明；只要存在实际组，轮换都会推进。仅状态、计划或零组记录不推进。
 - 同动作、同实际器械和同原始重量含义之间才比较负重。不同器械读数不能直接横向比较；不把助力增加解释为外部负重增加。
 - 不从计划日期、空白组、界面计时或后台心率推断已完成训练。没有主观恢复反馈时明确未知，不虚构疲劳、受伤或恢复状态。
 - 手机仍有待同步或断网时，后端不是完整的最新记录；说明读取到的数据时间范围，不宣称已经取得尚未上传的数据。
 
+## 健康数据与服务器采集
+
+健康操作与 Android 共用同一个受鉴权 `/v1` API 和 token；不要访问源SQLite或建立助手专用接口。先读取 `GET /v1/capabilities`，只有 `formatVersion=6` 且 `healthApiVersion=1` 才使用本轮健康契约；能力不符时停止写入并按真实状态提示升级端点。
+
+
+从本目录使用现有 `scripts/training.py`，凭据继续由 `TRAINING_URL` 与 `TRAINING_TOKEN` / `TRAINING_TOKEN_FILE` 提供。每条命令只返回对应接口的JSON；`health-records` 每次仅读取一页，不自动遍历后续游标。
+
+```sh
+python scripts/training.py capabilities
+python scripts/training.py health-status
+python scripts/training.py health-days --from 2026-10-01 --to 2026-10-31
+python scripts/training.py health-records --date 2026-10-27 --dataset heartRate
+python scripts/training.py health-records --date 2026-10-27 --dataset heartRate --cursor "<nextCursor>"
+```
+
+仅在用户明确要求时执行 `python scripts/training.py health-collect`；它对 `/v1/health/collection/request` 发送无请求体的POST，不会自动下载所有健康明细。
+- 按日期范围读取 `GET /v1/health/days?from=YYYY-MM-DD&to=YYYY-MM-DD`，两端日期包含在内；查看真实明细使用 `GET /v1/health/records?date=YYYY-MM-DD&dataset=steps&cursor=...`。数据集仅为 `steps`、`calories`、`heartRate`、`restingHeartRate`、`sleep`、`body`、`activity`。详情页固定最多500条，按返回的 `nextCursor` 续读；只有同一日期修订下所有分页完成才算完整，未取到数据不等于没有记录。
+- `GET /v1/health/status` 返回 `coveredDates`、日期修订及采集状态；阶段为 `idle`、`requested`、`running`、`submitted`、`published`、`succeeded` 或 `failed`，含最近阶段时间与错误。`published` 只表示既有来源资料已提交，`succeeded` 才表示本轮云端采集及提交全部完成。用户明确要求重试时，对 `POST /v1/health/collection/request` 发不带请求体的 POST；已有请求或任务运行时会合并。失败后再次调用该请求以真实重试，不能把仅刷新健康记录称为采集成功。采集器通过 `POST /v1/health/collection/state` 报告 `started`、`submitted`、`published`、`succeeded` 或 `failed` 事件。
+- 只有使用实际归一化来源批次时才调用 `POST /v1/health/import`，请求体是 `{dataset, records}`；每条记录为 `{sourceId, localDate, measuredAt, payload}`，响应包含实际 `accepted`、`unchanged` 与 `revisionByDate`。同一数据重试必须保持自然来源键不变以实现幂等。保留源字段、缺失值与原单位，时间戳为epoch毫秒、日期为UTC+8；睡眠 `asleepMinutes`、`awakeMinutes`，活动 `durationSeconds`、`mainPosture` 均可能为空，`mainPosture` 保留源整数编码；不能构造样例健康记录或填充缺失测量。
+- 通过 `GET /v1/export` 获取后端完整资料；清单位于 `data.json.healthManifest`，其 `scope`、`coveredDates`、`datasets`、`recordCount` 描述范围；健康明细逐行位于 `health.jsonl`，每行 `{dataset,record}`，其中record为 `{sourceId,localDate,measuredAt,payload}`。只有 `scope=complete` 才是完整健康备份。完整资料在线通过 `POST /v1/import?replace=false` 恢复；不同内容返回冲突且不修改。仅用户明确选择覆盖已有差异时才用 `replace=true`。手机本机ZIP的 `scope=cache` 只包含已下载缓存范围，不代表后端完整备份。
+
+服务器采集只在已配置持久状态、种子副本和token文件后运行；定时器与服务器重试使用同一串行任务，不在个人电脑另开自动采集。
+
+
 ## 资料与备份
 
 - 器械与动作图片先 `upload`，再保存 `media` 文档并更新使用者引用。素材使用新的不可变文件名，避免覆盖仍被旧资料使用的文件。
-- 完整导出 ZIP 包含版本化 `data.json` 和 `media/`；不包含 token、手机授权和后端连接配置。新导出为 formatVersion 4；读取兼容版本 1–4，版本 1、2 定向清理已废弃历史来源字段，版本 3、4 拒绝该字段。独立运动以 `activity` 文档保存并随完整备份迁移，不计入力量组数。
+- 完整训练导出含版本化 `data.json` 和 `media/`，不包含 token、手机授权和后端连接配置。当前格式为 v6，读取兼容 v1–v5；v1–v4 历史来源归并规则不变，v5 canonical 每日训练保持原内容和明确恢复/冲突约束。完整后端 ZIP 的健康清单位于 `data.json.healthManifest`，逐条记录另存为 `health.jsonl`；只有 `scope=complete` 才可称完整健康备份。手机导出范围必须按清单说明，不能当作完整后端备份。完整健康资料须在线经既有 `/v1/export`、`/v1/import?replace=false|true` 迁移，替换前必须取得明确授权。
 
-- 历史来源合并仅限用户明确授权的 `record/1012.md`、`1013.md`、`1014.md`、`1015.md`、`1019.md`、`1020.md`、`1021.md` 和 `1026.md`；将它们作为历史会话合并导入，使用 `replace=false`。历史来源只保留 `sourceId` 与 `localDate`；整理后的真实反馈写入 `notes`，不把来源全文或计划表复制进记录。
+- 历史来源合并仅限用户明确授权的 `record/1012.md`、`1013.md`、`1014.md`、`1015.md`、`1019.md`、`1020.md`、`1021.md` 和 `1026.md`；将它们作为历史会话合并导入，使用 `replace=false`。`sourceRecords` 只保留必要原事实及来源原反馈，不复制完成组或来源正文；重复旧来源导入不覆盖canonical根级用户反馈。v5 canonical每日训练仍按原规则要求用户明确选择整日恢复。
 - 本轮另行指定的活动来源是 2026-10-22 羽毛球 7200 秒（备注保留“约”）及 2026-10-17 徒步 12040 米、13854 秒。它们是独立 `activity` 记录，不扩大上述历史会话来源授权；使用稳定 `sourceId` 和明确的读取修订号，遇到不同 revision 冲突时保留两份内容并由用户明确选择。本轮不创建导入生产脚本。
 - 导入前结合当时训练安排、实际动作及训练部位确定分类，写入 `splitSlotName` 后再提交。能够明确归入推、拉、腿的记录保存对应分类；确实无法明确归类的混合训练才保存空值。原始文件没有分类字段不代表自由锻炼。提交前逐日核对分类与实际组数，提交后核对接口及手机日历。
-- 生产导入须等应用与后端更新后，由主助手按指定数据单独执行。0.0.3 旧库存、手机缓存与同步文档在 Session 解码边界定向移除废弃的 `historicalSource.originalText`，不改写数据库，也不自动转换 `notes`。新文档写入仍拒绝该字段；导出投影为版本 4，仅清除旧库存中的该字段。
+- 生产训练迁移须等应用与后端更新后，由主助手按指定数据单独执行；v1、v2读取时清理废弃的`historicalSource.originalText`，v3、v4拒绝该字段，v5强制canonical每日格式。健康缓存与记录位于独立缓存，不进入普通训练documents；按Room非破坏性迁移保留既有离线资料。
 - 删除使用明确修订号；被计划、器械或历史素材引用的内容需要先解除关联。删除实际训练会改变统计及分化顺序，必须先取得用户确认。

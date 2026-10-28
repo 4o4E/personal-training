@@ -22,9 +22,10 @@ import java.nio.file.Path
 import java.security.MessageDigest
 import java.security.SecureRandom
 import java.time.LocalDate
-import java.time.ZoneOffset
 import java.time.format.DateTimeParseException
+import java.time.ZoneOffset
 import java.util.Base64
+import java.util.Properties
 
 fun main() {
     val data = Path.of(System.getenv("TRAINING_DATA") ?: "data").toAbsolutePath()
@@ -67,10 +68,40 @@ fun Application.trainingApplication(store: Store, archives: Archives, token: Str
             }
         }
     }
+    val appVersion = Properties().also { properties ->
+        val resource = requireNotNull(Thread.currentThread().contextClassLoader.getResourceAsStream("app-version.properties")) {
+            "缺少app-version.properties，无法声明服务端版本"
+        }
+        resource.use { properties.load(it) }
+    }.getProperty("version")?.trim()?.takeIf { it.isNotEmpty() }
+        ?: error("app-version.properties缺少version")
     routing {
         get("/health") { call.respond(buildJsonObject { put("status", "ok") }) }
         authenticate("personal-token") {
             route("/v1") {
+                get("/capabilities") {
+                    call.respond(HealthCapabilities(appVersion))
+                }
+                post("/health/import") {
+                    call.respond(withContext(Dispatchers.IO) { store.healthImport(call.receive<HealthImportRequest>()) })
+                }
+                get("/health/status") { call.respond(withContext(Dispatchers.IO) { store.healthStatus() }) }
+                get("/health/days") {
+                    val from = LocalDate.parse(requireNotNull(call.request.queryParameters["from"]) { "缺少from日期" })
+                    val to = LocalDate.parse(requireNotNull(call.request.queryParameters["to"]) { "缺少to日期" })
+                    call.respond(withContext(Dispatchers.IO) { store.healthDays(from, to) })
+                }
+                get("/health/records") {
+                    val date = LocalDate.parse(requireNotNull(call.request.queryParameters["date"]) { "缺少date日期" })
+                    val dataset = HealthDataset.valueOf(requireNotNull(call.request.queryParameters["dataset"]) { "缺少dataset" })
+                    call.respond(withContext(Dispatchers.IO) { store.healthRecords(date, dataset, call.request.queryParameters["cursor"]) })
+                }
+                post("/health/collection/request") {
+                    call.respond(withContext(Dispatchers.IO) { store.collectionRequest() })
+                }
+                post("/health/collection/state") {
+                    call.respond(withContext(Dispatchers.IO) { store.collectionState(call.receive<HealthCollectionStateRequest>()) })
+                }
                 get("/documents") {
                     val kind = call.request.queryParameters["kind"]?.let(Kind::valueOf)
                     val deleted = call.request.queryParameters["includeDeleted"] == "true"
