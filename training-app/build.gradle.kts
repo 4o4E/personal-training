@@ -7,7 +7,7 @@ plugins {
 }
 
 // 标签、APK 与后端使用同一版本；偏移一位以支持覆盖既有 versionCode=1 的安装。
-val releaseVersion = providers.gradleProperty("releaseVersion").orElse("0.0.5").get()
+val releaseVersion = providers.gradleProperty("releaseVersion").orElse("0.0.7").get()
 require(Regex("(0|[1-9][0-9]*)\\.(0|[1-9][0-9]{0,2})\\.(0|[1-9][0-9]{0,2})").matches(releaseVersion)) {
     "版本必须为 MAJOR.MINOR.PATCH，次版本与修订号不超过 999"
 }

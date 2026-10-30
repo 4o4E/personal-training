@@ -10,9 +10,7 @@ import android.os.VibrationAttributes
 import android.os.VibrationEffect
 import android.os.Vibrator
 import android.os.VibratorManager
-import android.provider.Settings
-
-/** Service-owned alarm-volume audio and vibration for its one active timer. */
+/** Service-owned media-volume audio and alarm vibration for its one active timer. */
 class AlertPlayback {
     private var player: MediaPlayer? = null
     private var vibrator: Vibrator? = null
@@ -22,12 +20,11 @@ class AlertPlayback {
     fun start(context: Context, timer: top.e404.training.shared.TimerState, selectedUri: String?) {
         if (target == timer && ringtoneUri == selectedUri) return
         stop()
-        val sound = if (selectedUri == "") null else {
-            val uri = selectedUri?.let(Uri::parse) ?: Settings.System.DEFAULT_ALARM_ALERT_URI
-            MediaPlayer.create(context.applicationContext, uri, null,
-                AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_ALARM)
+        val sound = selectedUri?.takeIf { it.isNotEmpty() }?.let { selected ->
+            MediaPlayer.create(context.applicationContext, Uri.parse(selected), null,
+                AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_MEDIA)
                     .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION).build(), 0)
-                ?: throw IllegalStateException("无法打开所选闹钟铃声")
+                ?: throw IllegalStateException("无法打开所选铃声")
         }
         try {
             sound?.isLooping = true

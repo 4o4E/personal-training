@@ -15,12 +15,15 @@ import top.e404.training.shared.*
 @Composable fun PlanItemEditor(
     original: PlanItem, exercise: Exercise, gymId: String?, state: AppData, viewModel: TrainingViewModel,
     positions: List<Pair<Int, String>>, initialPosition: Int,
-    onDismiss: () -> Unit, onSave: (PlanItem, Int) -> Unit
+    onDismiss: () -> Unit, allowMeasurementChange: Boolean = false,
+    onSave: (PlanItem, Int) -> Unit
 ) {
     var draft by rememberSaveable(stateSaver = jsonSaver(PlanItem.serializer())) { mutableStateOf(original) }
     var position by rememberSaveable { mutableStateOf(initialPosition) }
+    val measurement = targetMeasurement(draft.sets.firstOrNull(), exercise.measurement)
     var editingSet by rememberSaveable { mutableStateOf<Int?>(null) }
     var details by remember { mutableStateOf(false) }
+    val equipmentUnknown = SOURCE_UNKNOWN_EQUIPMENT_TAG in exercise.equipmentTags
     val equipment = remember(state.documents[Kind.equipment], gymId, exercise.id) {
         state.records(Kind.equipment).map { it.value<Equipment>() }.filter { it.gymId == gymId && exercise.equipmentTags.firstOrNull() in it.tags }
     }
@@ -33,7 +36,17 @@ import top.e404.training.shared.*
     }) {
         TextButton(onClick = { details = true }) { Text("查看动作教学与肌肉图") }
         Choice("加入位置", position, positions, { position = it })
-        if (exercise.equipmentTags.isNotEmpty()) {
+        if (allowMeasurementChange) {
+            Choice("该计划动作录入方式", measurement, listOf("reps" to "按次数", "seconds" to "按时长（秒）"), { next ->
+                draft = draft.copy(sets = draft.sets.map { target ->
+                    if (next == "seconds") target.copy(reps = null, repsMax = null, seconds = target.seconds ?: exercise.defaultSeconds)
+                    else target.copy(reps = target.reps ?: 10, seconds = null)
+                })
+            })
+        }
+        if (equipmentUnknown) {
+            Text("器械条件未知；可主动加入计划，但不关联具体器械。", style = MaterialTheme.typography.bodySmall)
+        } else if (exercise.equipmentTags.isNotEmpty()) {
             Choice<String?>("使用的实际器械", draft.equipmentId,
                 listOf(null to "不指定，保留计划中的原始读数") + equipment.map { it.id to "${it.name} · ${it.unit}" },
                 { draft = draft.copy(equipmentId = it) })
@@ -68,6 +81,7 @@ import top.e404.training.shared.*
     var itemDraft by rememberSaveable(stateSaver = jsonSaver(PlanItem.serializer().nullable)) { mutableStateOf<PlanItem?>(null) }
     var itemPosition by rememberSaveable { mutableStateOf(0) }
     var details by remember { mutableStateOf<Exercise?>(null) }
+    var pickedExercise by remember { mutableStateOf<Exercise?>(null) }
     val programs = remember(state.documents[Kind.program]) { state.records(Kind.program).map { it.value<Program>() } }
     val gyms = remember(state.documents[Kind.gym]) { state.records(Kind.gym).map { it.value<Gym>() } }
     val exercises = remember(state.documents[Kind.exercise]) { state.records(Kind.exercise).associate { it.id to it.value<Exercise>() } }
@@ -96,7 +110,7 @@ import top.e404.training.shared.*
             InfoCard("${index + 1}. ${exercise?.name ?: "动作已删除，请替换"}") {
                 Text("${item.sets.size} 组 · " + item.sets.firstOrNull()?.let(::targetText).orEmpty())
                 Row {
-                    TextButton(onClick = { if (exercise != null) { itemDraft = item; itemPosition = index } }, enabled = exercise != null) { Text("编辑要求") }
+                    TextButton(onClick = { if (exercise != null) { pickedExercise = exercise; itemDraft = item; itemPosition = index } }, enabled = exercise != null) { Text("编辑要求") }
                     TextButton(onClick = { replacingId = item.id; pickerType = exercise?.type ?: "strength" }) { Text("替换动作") }
                     TextButton(onClick = { if (exercise != null) details = exercise }, enabled = exercise != null) { Text("查看教学") }
                 }
@@ -117,18 +131,22 @@ import top.e404.training.shared.*
             else replacingId?.let { id -> draft.items.firstOrNull { it.id == id }?.let { exercises[it.exerciseId]?.muscles?.toSet() } } ?: slot?.muscles?.toSet() ?: emptySet()
         ExercisePicker(state, viewModel.repository, draft.gymId, targetMuscles, type, { pickerType = null; replacingId = null }) { exercise ->
             val old = draft.items.firstOrNull { it.id == replacingId }
+            pickedExercise = exercise
             itemDraft = newPlanItem(exercise, draft.gymId, state, old?.sets?.size)
             itemPosition = old?.let { draft.items.indexOf(it) } ?: draft.items.size
             pickerType = null
         }
     }
     itemDraft?.let { item ->
-        val exercise = exercises.getValue(item.exerciseId)
+        val exercise = exercises[item.exerciseId] ?: pickedExercise?.takeIf { it.id == item.exerciseId } ?: return@let
         val remaining = draft.items.filterNot { it.id == item.id || it.id == replacingId }
         val positions = (0..remaining.size).map { index -> index to if (index == 0) "放在最前面" else "放在 ${exercises[remaining[index - 1].exerciseId]?.name ?: "上一动作"} 之后" }
-        PlanItemEditor(item, exercise, draft.gymId, state, viewModel, positions, itemPosition.coerceAtMost(remaining.size), { itemDraft = null; replacingId = null }) { updated, position ->
+        PlanItemEditor(item, exercise, draft.gymId, state, viewModel, positions, itemPosition.coerceAtMost(remaining.size),
+            { itemDraft = null; pickedExercise = null; replacingId = null },
+            allowMeasurementChange = exercise.id.startsWith("smartworkout_")
+        ) { updated, position ->
             draft = draft.copy(items = remaining.toMutableList().apply { add(position, updated) })
-            itemDraft = null; replacingId = null
+            itemDraft = null; pickedExercise = null; replacingId = null
         }
     }
     if (choosingDate) {

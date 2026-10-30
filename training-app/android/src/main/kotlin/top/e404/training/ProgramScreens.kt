@@ -12,61 +12,16 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import top.e404.training.shared.*
 
-private fun planMuscles(plan: Plan, state: AppData): String = plan.items.flatMap { item ->
-    state.record(Kind.exercise, item.exerciseId)?.value<Exercise>()?.takeIf { it.type == "strength" }?.muscles ?: emptyList()
-}.distinct().joinToString("、") { state.record(Kind.muscle, it)?.displayName() ?: it }
 private fun planVolume(plan: Plan, state: AppData): String {
     val strength = plan.items.filter { state.record(Kind.exercise, it.exerciseId)?.value<Exercise>()?.type == "strength" }
     val stretch = plan.items.filter { state.record(Kind.exercise, it.exerciseId)?.value<Exercise>()?.type == "stretch" }
     return "力量 ${strength.size} 个动作 · ${strength.sumOf { it.sets.size }} 组；拉伸 ${stretch.size} 个动作 · ${stretch.sumOf { it.sets.size }} 组"
 }
-
-@Composable fun StartOverview(state: AppData, start: (Plan) -> Unit, preview: (Plan) -> Unit, adjust: () -> Unit) {
-    val programs = remember(state.documents[Kind.program]) { state.records(Kind.program).map { it.value<Program>() } }
-    val plans = remember(state.documents[Kind.plan]) { state.records(Kind.plan).map { it.value<Plan>() } }
-    val sessions = remember(state.documents[Kind.session]) { state.records(Kind.session).map { it.value<Session>() } }
-    val arrangement = state.arrangement
-    val program = programs.firstOrNull { it.id == arrangement?.programId }
-    val selectedPlans = program?.let { arrangement?.selectedPlans?.get(it.id).orEmpty() }.orEmpty()
-    val nextSplitSlot = program?.let { nextSlot(it, sessions, arrangement?.nextOverrides?.get(it.id)) }
-    val nextPlan = program?.let { selected ->
-        rotationPlans(selected, plans, sessions, selectedPlans, arrangement?.nextOverrides?.get(selected.id))
-            .firstOrNull()?.let { entry -> entry.plan?.takeIf { it.date != null || it.id == selectedPlans[entry.slot.id] } }
-    }
-    LazyColumn(Modifier.fillMaxSize().padding(horizontal = 12.dp), verticalArrangement = Arrangement.spacedBy(12.dp), contentPadding = PaddingValues(bottom = 20.dp)) {
-        item {
-            InfoCard("下一次训练") {
-                if (program == null) {
-                    Text(if (programs.isEmpty()) "还没有训练分化。请先在调整计划中配置整轮计划。" else "当前分化尚未由云端安排选定。")
-                    Button(onClick = adjust) { Text("前往调整计划") }
-                } else if (nextSplitSlot == null) {
-                    Text("当前分化没有可安排的训练项。")
-                    Button(onClick = adjust) { Text("前往调整计划") }
-                } else {
-                    Text("${program.name} · ${nextSplitSlot.name}", style = MaterialTheme.typography.titleLarge)
-                    Text("按实际完成记录推进；取消不会消耗手动指定的下一项。", style = MaterialTheme.typography.bodySmall)
-                    if (nextPlan != null) {
-                        Text(nextPlan.name, style = MaterialTheme.typography.titleMedium)
-                        nextPlan.date?.let { Text("指定日期：$it", style = MaterialTheme.typography.bodySmall) }
-                        Text(planMuscles(nextPlan, state)); Text(planVolume(nextPlan, state))
-                        Button(onClick = { start(nextPlan) }, enabled = nextPlan.items.isNotEmpty()) { Text("开始这次训练") }
-                        TextButton(onClick = { preview(nextPlan) }) { Text("预览动作与教学") }
-                    } else {
-                        Text("此项尚未在云端安排中选定计划；不自动推断候选。")
-                        Button(onClick = adjust) { Text("前往调整计划") }
-                    }
-                }
-            }
-        }
-        item { OutlinedButton(onClick = adjust) { Text("调整未来计划") } }
-    }
-}
-
 @OptIn(ExperimentalLayoutApi::class)
-@Composable fun AdjustPrograms(state: AppData, viewModel: TrainingViewModel, edit: (Document) -> Unit, preview: (Plan) -> Unit, onAdjustCurrent: () -> Unit, setup: () -> Unit, setupDay: (DaySetupRequest) -> Unit, advanced: () -> Unit) {
+@Composable fun AdjustPrograms(state: AppData, viewModel: TrainingViewModel, edit: (Document) -> Unit, preview: (Plan) -> Unit, onAdjustCurrent: () -> Unit, setup: () -> Unit, setupDay: (DaySetupRequest) -> Unit, advanced: () -> Unit, currentSession: Session? = null) {
     val programs = remember(state.documents[Kind.program]) { state.records(Kind.program).map { it.value<Program>() } }
     val plans = remember(state.documents[Kind.plan]) { state.records(Kind.plan).map { it.value<Plan>() } }
-    val activeSession = remember(state.documents[Kind.session]) { state.records(Kind.session).firstOrNull { it.value<Session>().status == "active" }?.value<Session>() }
+    val activeSession = currentSession
     val program = programs.firstOrNull { it.id == state.arrangement?.programId }
     val exercises = remember(state.documents[Kind.exercise]) { state.records(Kind.exercise).associate { it.id to it.value<Exercise>() } }
     val templates = remember(program, exercises) {
@@ -84,7 +39,7 @@ private fun planVolume(plan: Plan, state: AppData): String {
         }
         item {
             InfoCard("训练安排") {
-                Text("整轮、各次计划和下次部位在此维护；开始训练只执行已确定的安排。")
+                Text("整轮、各次计划和下次部位在此维护；训练页直接记录已确定的安排。")
                 if (programs.isNotEmpty()) Choice<String?>("当前训练分化", program?.id, programs.map { it.id to "${it.name} · ${it.slots.size}分化" }, { id ->
                     viewModel.action { viewModel.repository.selectProgram(id) }
                 })
@@ -96,7 +51,7 @@ private fun planVolume(plan: Plan, state: AppData): String {
                         state.arrangement?.nextOverrides?.get(selected.id)
                     )
                     Text("下次训练部位", style = MaterialTheme.typography.titleMedium)
-                    Text(if (overrideSlot == null) "自动轮换 · 按实际完成记录计算" else "手动指定 · 完成该项后接续循环；取消不会消耗安排",
+                    Text(if (overrideSlot == null) "自动轮换 · 按实际完成记录计算" else "手动指定 · 有实际组便接续循环；零组取消不推进",
                         style = MaterialTheme.typography.bodySmall)
                     Text("下次：${next.name}", style = MaterialTheme.typography.titleLarge)
                     FlowRow(
@@ -139,7 +94,7 @@ private fun planVolume(plan: Plan, state: AppData): String {
             item { TextButton(onClick = { edit(state.record(Kind.program, selected.id)!!) }) { Text("自定义分化部位与顺序") } }
         }
         item { OutlinedButton(onClick = advanced) { Text("全部计划与日期安排") } }
-        item { Text("本页编辑整轮与单日未来计划；当前训练仅通过上方「调整本次剩余内容」入口修改。", style = MaterialTheme.typography.bodySmall) }
+        item { Text("本页编辑整轮与单日未来计划。", style = MaterialTheme.typography.bodySmall) }
     }
 }
 

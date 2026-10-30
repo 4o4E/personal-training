@@ -10,6 +10,19 @@ services:
       - PORT=8080
       - TRAINING_TOKEN
     volumes:
-      - training-data:/data
-volumes:
-  training-data:
+      - ./training-data:/data
+  collector:
+    image: ghcr.io/4o4e/personal-training-collector:latest
+    pull_policy: always
+    restart: unless-stopped
+    depends_on:
+      - training
+    environment:
+      - TRAINING_URL=http://training:8080
+      - TRAINING_TOKEN
+      - TRAINING_TOKEN_FILE=/data/token
+      - MISPORTS_SOURCE_DIR=/app/misports
+      - COLLECTOR_STATE_DIR=/data/collector
+      - COLLECTOR_SEED_DB=/data/misports.db
+    volumes:
+      - ./training-data:/data

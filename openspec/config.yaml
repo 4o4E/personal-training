@@ -14,7 +14,7 @@ context: |
   Project engineering skills come from 4o4E/skills, ref feat/openspec-decisions.
   Domain terms are maintained in GLOSSARY.md.
   The confirmed backend is Kotlin Ktor with SQLite. The Android client uses Room for complete offline training and later synchronization.
-  Rotation advances after completed training; dates are optional. Stretches are recommended automatically but inserted manually.
+  Rotation follows actual recorded sets by UTC+8 training date: any recorded set counts as trained; a day with no recorded sets does not advance. Each date has one training record. Stretches are recommended automatically but inserted manually.
   The user approved an independent application database; existing sports records and misports.db must remain unchanged.
   Concrete notification APIs and final media selections are implementation details to verify, not additional user architecture choices.
 

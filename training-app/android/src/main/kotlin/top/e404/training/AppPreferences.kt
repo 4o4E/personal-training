@@ -13,8 +13,13 @@ import top.e404.training.shared.wireJson
     // 仅用于将升级前的本机业务选择迁移到云端；确认迁移成功后立即清除。
     val programId: String? = null,
     val slotPlans: Map<String, Map<String, String>> = emptyMap(),
-    val timerRingtoneUri: String? = null
+    val timerRingtoneUri: String? = "",
+    val weightSteps: Map<String, Double> = emptyMap()
 )
+
+internal fun weightStepKey(exerciseId: String, equipmentId: String?, unit: String): String =
+    "$exerciseId|${equipmentId.orEmpty()}|$unit"
+
 
 /** 本机交互偏好不进入训练资料、开放接口或备份；连接凭据仍由 ConnectionVault 独立管理。 */
 class AppPreferences(context: Context) {
@@ -31,4 +36,6 @@ class AppPreferences(context: Context) {
         mutable.value.programId to mutable.value.slotPlans
     fun clearLegacyChoices() = save(mutable.value.copy(programId = null, slotPlans = emptyMap()))
     fun timerRingtone(value: String?) = save(mutable.value.copy(timerRingtoneUri = value))
+    fun weightStep(key: String, value: Double) =
+        save(mutable.value.copy(weightSteps = mutable.value.weightSteps + (key to value)))
 }

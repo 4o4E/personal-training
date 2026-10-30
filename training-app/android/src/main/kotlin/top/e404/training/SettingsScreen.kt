@@ -23,7 +23,7 @@ import androidx.compose.ui.unit.dp
 import top.e404.training.shared.*
 import android.media.RingtoneManager
 
-@Composable fun SettingsScreen(state: AppData, viewModel: TrainingViewModel, permissionRevision: Int, preferences: AppPreferences, onDismiss: () -> Unit) {
+@Composable fun SettingsScreen(viewModel: TrainingViewModel, permissionRevision: Int, preferences: AppPreferences) {
     val context = LocalContext.current
     val repository = viewModel.repository
     val connection = remember { repository.vault.load() }
@@ -36,11 +36,18 @@ import android.media.RingtoneManager
     var importUri by rememberSaveable { mutableStateOf<String?>(null) }
     var transferMessage by rememberSaveable { mutableStateOf<String?>(null) }
     var importing by remember { mutableStateOf(false) }
+    var choosingCompleteRestore by rememberSaveable { mutableStateOf(false) }
     val askNotifications = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { permissionChanged++ }
     val export = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/zip")) { uri ->
         if (uri != null) viewModel.action {
-            context.contentResolver.openOutputStream(uri)!!.use { repository.export(it) }
-            transferMessage = "已导出训练资料与素材，不包含连接 token。"
+            requireNotNull(context.contentResolver.openOutputStream(uri)) { "无法创建本机备份文件" }.use { repository.export(it) }
+            transferMessage = "已导出本机训练资料；健康数据仅包含已下载缓存，不是完整健康备份。"
+        }
+    }
+    val exportComplete = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/zip")) { uri ->
+        if (uri != null) viewModel.action {
+            requireNotNull(context.contentResolver.openOutputStream(uri)) { "无法创建完整备份文件" }.use { repository.exportCompleteBackup(it) }
+            transferMessage = "已从后端导出完整备份，包含其完整健康资料。"
         }
     }
     val import = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri -> importUri = uri?.toString() }
@@ -48,6 +55,26 @@ import android.media.RingtoneManager
         if (result.resultCode == android.app.Activity.RESULT_OK) {
             val uri = result.data?.getParcelableExtra<Uri>(RingtoneManager.EXTRA_RINGTONE_PICKED_URI)
             preferences.timerRingtone(uri?.toString() ?: "")
+        }
+    }
+    fun importBackup(uri: String, complete: Boolean, replace: Boolean) {
+        importing = true
+        viewModel.action {
+            try {
+                requireNotNull(context.contentResolver.openInputStream(Uri.parse(uri))) { "无法打开所选备份文件" }.use { input ->
+                    if (complete) repository.restoreCompleteBackup(input, replace) else repository.import(input, replace)
+                }
+                transferMessage = when {
+                    complete && replace -> "完整备份已明确替换恢复。"
+                    complete -> "完整备份已合并恢复。"
+                    replace -> "本机训练资料已替换导入。"
+                    else -> "本机训练资料已合并导入。"
+                }
+                importUri = null
+                choosingCompleteRestore = false
+            } finally {
+                importing = false
+            }
         }
     }
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
@@ -61,23 +88,21 @@ import android.media.RingtoneManager
         InfoCard("计时与系统提醒") {
             Text(if (notifications) "通知显示已具备" else "通知未授权或提醒渠道已关闭", color = if (notifications) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error)
             Text(if (exact) "精确定时唤醒权限已具备" else "精确定时唤醒权限未具备", color = if (exact) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error)
-            Text("持续提醒使用系统闹钟音量和闹钟勿扰规则；正常倒计时通知静默。系统勿扰可能抑制声音或振动。", style = MaterialTheme.typography.bodySmall)
+            Text("默认仅振动；选择铃声后按系统媒体音量播放。正常倒计时通知静默。系统勿扰可能抑制声音或振动。", style = MaterialTheme.typography.bodySmall)
             val ringtoneLabel = when {
-                choices.timerRingtoneUri == "" -> "无声音（仅振动）"
-                choices.timerRingtoneUri == null -> "系统默认闹钟铃声"
+                choices.timerRingtoneUri.isNullOrEmpty() -> "无声音（仅振动）"
                 else -> RingtoneManager.getRingtone(context, Uri.parse(choices.timerRingtoneUri))?.getTitle(context) ?: "已选择的系统铃声"
             }
             Text("到时铃声：$ringtoneLabel")
             OutlinedButton(onClick = {
                 chooseTimerSound.launch(Intent(RingtoneManager.ACTION_RINGTONE_PICKER).apply {
                     putExtra(RingtoneManager.EXTRA_RINGTONE_TYPE, RingtoneManager.TYPE_ALARM)
-                    putExtra(RingtoneManager.EXTRA_RINGTONE_TITLE, "选择计时提醒铃声")
+                    putExtra(RingtoneManager.EXTRA_RINGTONE_TITLE, "选择提醒铃声")
                     putExtra(RingtoneManager.EXTRA_RINGTONE_SHOW_SILENT, true)
                     putExtra(RingtoneManager.EXTRA_RINGTONE_SHOW_DEFAULT, true)
-                    putExtra(RingtoneManager.EXTRA_RINGTONE_EXISTING_URI, choices.timerRingtoneUri?.takeIf { it.isNotEmpty() }?.let(Uri::parse)
-                        ?: if (choices.timerRingtoneUri == null) Settings.System.DEFAULT_ALARM_ALERT_URI else null)
+                    putExtra(RingtoneManager.EXTRA_RINGTONE_EXISTING_URI, choices.timerRingtoneUri?.takeIf { it.isNotEmpty() }?.let(Uri::parse))
                 })
-            }) { Text("选择系统闹钟铃声") }
+            }) { Text("选择提醒铃声") }
             Button(onClick = {
                 if (Build.VERSION.SDK_INT >= 33 && context.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != android.content.pm.PackageManager.PERMISSION_GRANTED)
                     askNotifications.launch(Manifest.permission.POST_NOTIFICATIONS)
@@ -101,119 +126,62 @@ import android.media.RingtoneManager
                         .putExtra(Settings.EXTRA_APP_PACKAGE, context.packageName))
                 }) { Text("实时活动显示设置") }
             }
-            Text("休息结束时发送静默倒计时/结果通知；持续振动及所选铃声由系统闹钟音量控制。", style = MaterialTheme.typography.bodySmall)
         }
         InfoCard("自有后端") {
             TextInput("后端地址", url, { url = it }, keyboardType = KeyboardType.Uri)
             OutlinedTextField(value = token, onValueChange = { token = it }, label = { Text("唯一 token") }, visualTransformation = PasswordVisualTransformation(), keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password, autoCorrectEnabled = false), singleLine = true, modifier = Modifier.fillMaxWidth())
             Text("公网连接使用 HTTPS；离线训练不需要网络。")
             Row {
-                Button(onClick = { viewModel.action { repository.saveConnection(BackendConnection(url, token.trim())) } }) { Text("保存并同步") }
-                TextButton(onClick = { viewModel.action { repository.sync() } }) { Text("立即同步") }
+                Button(onClick = { viewModel.action { repository.saveConnection(BackendConnection(url, token.trim())) } }) { Text("保存连接") }
             }
-            Text(state.syncMessage)
-            Text("${when (state.syncStatus) { SyncStatus.offline -> "离线"; SyncStatus.syncing -> "同步中"; SyncStatus.synced -> "已同步"; SyncStatus.pending -> "待上传"; SyncStatus.conflict -> "存在冲突"; SyncStatus.error -> "同步失败" }} · 最近成功同步 ${state.lastSuccessfulSyncAt?.let(::localDateTime) ?: "尚无"}")
-            Text("待上传 ${state.pending} 项 · 冲突 ${state.conflicts.size} 项 · 素材 ${when (state.mediaSyncStatus) { MediaSyncStatus.idle -> "未开始"; MediaSyncStatus.checking -> "检查中"; MediaSyncStatus.ready -> "已就绪"; MediaSyncStatus.error -> "有错误" }}")
             TextButton(onClick = { viewModel.action { repository.disconnect(); url = ""; token = "" } }) { Text("断开连接，保留手机资料") }
         }
-        val tagNames = equipmentNames()
-        state.conflicts.forEach { conflict ->
-            InfoCard("内容冲突：${conflict.local.displayName()}") {
-                Text("手机：\n${documentDescription(conflict.local, state, tagNames)}")
-                ConflictImages(conflict.local, state, repository)
-                Text("后端：\n${documentDescription(conflict.remote, state, tagNames)}")
-                ConflictImages(conflict.remote, state, repository)
-                Text("请选择要保留的内容，不会按时间自动覆盖。", style = MaterialTheme.typography.bodySmall)
-                Row {
-                    TextButton(onClick = { viewModel.action { repository.resolveConflict(conflict.local.kind, conflict.local.id, true) } }) { Text("保留手机内容") }
-                    TextButton(onClick = { viewModel.action { repository.resolveConflict(conflict.local.kind, conflict.local.id, false) } }) { Text("使用后端内容") }
-                }
-            }
-        }
         InfoCard("导入与导出") {
-            Text("完整数据包包含计划、器械、实际训练记录和教学素材，保留每组的原始单位。")
-            Button(onClick = { export.launch("个人训练-${java.time.LocalDate.now(java.time.ZoneOffset.ofHours(8))}.zip") }) { Text("导出完整 ZIP") }
-            OutlinedButton(onClick = { import.launch(arrayOf("application/zip", "application/octet-stream")) }, enabled = !importing) { Text("选择 ZIP 导入") }
+            Text("本机资料备份的健康内容仅含已下载缓存；后端完整备份包含完整健康资料，在线导出与恢复。")
+            Button(onClick = { export.launch("本机资料-${java.time.LocalDate.now(java.time.ZoneOffset.ofHours(8))}.zip") }) { Text("导出本机资料 ZIP") }
+            OutlinedButton(onClick = { exportComplete.launch("完整备份-${java.time.LocalDate.now(java.time.ZoneOffset.ofHours(8))}.zip") }) { Text("导出后端完整备份") }
+            OutlinedButton(onClick = { import.launch(arrayOf("application/zip", "application/octet-stream")) }, enabled = !importing) { Text("选择 ZIP 导入或恢复") }
             transferMessage?.let { Text(it) }
         }
         InfoCard("教学素材") {
             Text("训练动作图解与中文说明：Hevy 公开动作目录。拉伸图解：RepDB、WorkoutGuide。肌肉部位示意：react-body-highlighter。")
-            Text("动作资料和图片保存在应用内，可在离线时查看；通过自己的后端同步自建资料。")
+            Text("内置动作资料和图解可离线查看；SmartWorkout教学和视频需要连接后端及互联网。自建资料通过自己的后端同步。")
         }
     }
-    importUri?.let { uri ->
-        AlertDialog(onDismissRequest = { if (!importing) importUri = null }, title = { Text("选择导入方式") }, text = { Text("合并会保留已有不同内容并报告冲突；明确替换则使用数据包内容覆盖手机中的同名标识，不会删除包外资料。导入之后仍需与后端同步。") },
-            confirmButton = { TextButton(enabled = !importing, onClick = { importing = true; viewModel.action { try { context.contentResolver.openInputStream(Uri.parse(uri))!!.use { repository.import(it, true) }; transferMessage = "导入完成，已有内容已按数据包替换。"; importUri = null } finally { importing = false } } }) { Text("明确替换后导入") } },
-            dismissButton = { Row {
-                TextButton(enabled = !importing, onClick = { importing = true; viewModel.action { try { context.contentResolver.openInputStream(Uri.parse(uri))!!.use { repository.import(it, false) }; transferMessage = "合并导入完成。"; importUri = null } finally { importing = false } } }) { Text("仅合并相同与新增内容") }
-                TextButton(enabled = !importing, onClick = { importUri = null }) { Text("取消") }
-            } })
-    }
-}
-
-private fun documentDescription(doc: Document, state: AppData, tagNames: Map<String, String>): String {
-    if (doc.deleted) return "已删除"
-    fun parts(ids: List<String>) = ids.joinToString("、") { state.record(Kind.muscle, it)?.displayName() ?: "部位资料未取得" }
-    return when (doc.kind) {
-        Kind.plan -> doc.value<Plan>().let { plan -> buildString {
-            append("${plan.name} · ${plan.date ?: "未指定日期"}\n")
-            plan.items.forEachIndexed { index, item ->
-                append("${index + 1}. ${state.record(Kind.exercise, item.exerciseId)?.displayName() ?: "动作资料未取得"}\n")
-                item.sets.forEachIndexed { group, target -> append("第 ${group + 1} 组：${targetText(target)}\n") }
-                if (item.notes.isNotBlank()) append("${item.notes}\n")
-            }
-            append(plan.notes)
-        } }
-        Kind.session -> doc.value<Session>().let { session -> buildString {
-            append("${session.name} · ${session.startedAt?.let(::localDateTime) ?: session.historicalSource?.localDate ?: "时间未记录"}\n")
-            append(when (session.status) { "active" -> "进行中\n"; "completed" -> "已完成\n"; else -> "已取消\n" })
-            session.items.forEach { item ->
-                append("${session.exercises.single { it.id == item.exerciseId }.name}\n")
-                session.results.forEach { result -> if (result.itemId == item.id) append("第 ${result.setIndex + 1} 组：${sideText(result.side)} · ${resultText(result)}\n") }
-            }
-            append(session.notes)
-        } }
-        Kind.arrangement -> doc.value<top.e404.training.shared.Arrangement>().let { arrangement -> buildString {
-            val currentProgramId = arrangement.programId
-            val currentProgram = currentProgramId?.let { state.record(Kind.program, it)?.value<Program>() }
-            append("当前分化：${currentProgram?.name ?: if (currentProgramId == null) "未选择" else "分化资料未取得"}\n")
-            if (arrangement.selectedPlans.isEmpty()) append("尚未选用循环计划。\n")
-            arrangement.selectedPlans.forEach { (programId, slots) ->
-                val program = state.record(Kind.program, programId)?.value<Program>()
-                slots.forEach { (slotId, planId) ->
-                    val slotName = program?.slots?.firstOrNull { it.id == slotId }?.name ?: "训练项资料未取得"
-                    val planName = state.record(Kind.plan, planId)?.value<Plan>()?.name ?: "计划资料未取得"
-                    append("${program?.name ?: "分化资料未取得"} · $slotName → $planName\n")
+    if (importUri != null && !choosingCompleteRestore) {
+        val uri = importUri!!
+        AlertDialog(
+            onDismissRequest = { if (!importing) importUri = null },
+            title = { Text("选择导入方式") },
+            text = { Text("旧训练包继续使用离线本机导入。包含完整健康资料的备份必须通过在线恢复；未连接后端时会在任何本机资料修改前拒绝。请选择恢复范围与合并/替换策略。") },
+            confirmButton = {
+                Column(Modifier.fillMaxWidth()) {
+                    TextButton(enabled = !importing, onClick = { choosingCompleteRestore = true }) { Text("在线完整恢复…") }
+                    TextButton(enabled = !importing, onClick = { importBackup(uri, complete = false, replace = false) }) { Text("合并本机训练包") }
+                    TextButton(enabled = !importing, onClick = { importBackup(uri, complete = false, replace = true) }) { Text("明确替换本机训练包") }
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+                        TextButton(enabled = !importing, onClick = { importUri = null }) { Text("取消") }
+                    }
                 }
             }
-            arrangement.nextOverrides.forEach { (programId, override) ->
-                val program = state.record(Kind.program, programId)?.value<Program>()
-                val slotName = program?.slots?.firstOrNull { it.id == override.slotId }?.name ?: "训练项资料未取得"
-                append("下次训练：${program?.name ?: "分化资料未取得"} · $slotName\n")
+        )
+    }
+    if (importUri != null && choosingCompleteRestore) {
+        val uri = importUri!!
+        AlertDialog(
+            onDismissRequest = { if (!importing) choosingCompleteRestore = false },
+            title = { Text("在线完整备份恢复") },
+            text = { Text("此操作通过已配置后端恢复完整训练与健康资料。合并保留已有不同内容并报告冲突；明确替换会按服务端规则覆盖同名资料。离线时请求会在手机本机资料变更前拒绝。") },
+            confirmButton = {
+                Column(Modifier.fillMaxWidth()) {
+                    TextButton(enabled = !importing, onClick = { importBackup(uri, complete = true, replace = false) }) { Text("合并恢复") }
+                    TextButton(enabled = !importing, onClick = { importBackup(uri, complete = true, replace = true) }) { Text("明确替换恢复") }
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+                        TextButton(enabled = !importing, onClick = { choosingCompleteRestore = false }) { Text("返回") }
+                    }
+                }
             }
-        } }
-        Kind.program -> doc.value<Program>().let { "${it.name}\n" + it.slots.joinToString("\n") { slot -> "${slot.name}：${parts(slot.muscles)}" } }
-        Kind.equipment -> doc.value<Equipment>().let { "${it.name} · ${it.unit} · " + when (it.meaning) { "per_hand" -> "单只重量"; "per_side" -> "单侧配重"; else -> "总重量" } + "\n" + it.tags.joinToString("、") { tag -> tagNames[tag] ?: tag } + "\n${it.instructions}\n${it.notes}" }
-        Kind.gym -> doc.value<Gym>().let { "${it.name}\n${it.notes}" }
-        Kind.exercise -> doc.value<Exercise>().let { "${it.name}\n主要部位：${parts(it.muscles)}\n辅助部位：${parts(it.secondaryMuscles)}\n" + it.instructions.joinToString("\n") + "\n${it.notes}" }
-        Kind.activity -> doc.value<ActivityRecord>().let { activity -> buildString {
-            append("${activity.name} · ${activity.localDate}\n")
-            activity.durationSeconds?.let { append("时长：${it} 秒\n") }
-            activity.distanceMeters?.let { append("距离：${it} 米\n") }
-            if (activity.notes.isNotBlank()) append(activity.notes)
-        } }
-        Kind.media -> doc.value<Media>().let { "${it.name} · ${it.source}" }
-        Kind.muscle -> doc.value<Muscle>().name
+        )
     }
 }
 
-@Composable private fun ConflictImages(doc: Document, state: AppData, repository: TrainingRepository) {
-    if (doc.deleted) return
-    val images = when (doc.kind) {
-        Kind.media -> listOf(doc.value<Media>())
-        Kind.exercise -> doc.value<Exercise>().mediaIds.mapNotNull { state.record(Kind.media, it)?.value<Media>() }
-        Kind.equipment -> listOfNotNull(doc.value<Equipment>().mediaId?.let { state.record(Kind.media, it)?.value<Media>() })
-        else -> emptyList()
-    }
-    images.forEach { MediaImage(it, repository, Modifier.fillMaxWidth().height(160.dp)) }
-}

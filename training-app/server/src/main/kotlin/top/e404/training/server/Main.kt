@@ -22,9 +22,17 @@ import java.nio.file.Path
 import java.security.MessageDigest
 import java.security.SecureRandom
 import java.time.LocalDate
-import java.time.ZoneOffset
 import java.time.format.DateTimeParseException
+import java.time.ZoneOffset
 import java.util.Base64
+import java.util.Properties
+
+private fun isSameSmartWorkoutExercise(existing: Document, proposed: Document): Boolean =
+    existing.kind == Kind.exercise &&
+        !existing.deleted &&
+        existing.data["name"] == proposed.data["name"] &&
+        existing.data["type"] == proposed.data["type"] &&
+        existing.data["instructions"] == proposed.data["instructions"]
 
 fun main() {
     val data = Path.of(System.getenv("TRAINING_DATA") ?: "data").toAbsolutePath()
@@ -39,18 +47,27 @@ fun main() {
         }
         Files.readString(tokenFile).trim().also { require(it.isNotBlank()) { "token 文件不能为空" } }
     }
-    val seed = Thread.currentThread().contextClassLoader.getResourceAsStream("catalog.json")!!.bufferedReader().use {
+    val guides = ExerciseGuides.load()
+    val smartWorkout = SmartWorkoutCatalog.load()
+    val classLoader = Thread.currentThread().contextClassLoader
+    val seed = classLoader.getResourceAsStream("catalog.json")!!.bufferedReader().use {
         wireJson.decodeFromString<List<Document>>(it.readText())
     }
     val store = Store(data, seed)
     val archives = Archives(data, store)
     Runtime.getRuntime().addShutdownHook(Thread { store.close() })
     embeddedServer(Netty, host = System.getenv("TRAINING_HOST") ?: "0.0.0.0", port = (System.getenv("PORT") ?: "8080").toInt()) {
-        trainingApplication(store, archives, token)
+        trainingApplication(store, archives, token, guides, smartWorkout)
     }.start(wait = true)
 }
 
-fun Application.trainingApplication(store: Store, archives: Archives, token: String) {
+fun Application.trainingApplication(
+    store: Store,
+    archives: Archives,
+    token: String,
+    guides: ExerciseGuides,
+    smartWorkout: SmartWorkoutCatalog,
+) {
     install(ContentNegotiation) { json(wireJson) }
     install(StatusPages) {
         exception<ImportConflict> { call, error -> call.respond(HttpStatusCode.Conflict, ApiError(error.message!!)) }
@@ -67,10 +84,40 @@ fun Application.trainingApplication(store: Store, archives: Archives, token: Str
             }
         }
     }
+    val appVersion = Properties().also { properties ->
+        val resource = requireNotNull(Thread.currentThread().contextClassLoader.getResourceAsStream("app-version.properties")) {
+            "缺少app-version.properties，无法声明服务端版本"
+        }
+        resource.use { properties.load(it) }
+    }.getProperty("version")?.trim()?.takeIf { it.isNotEmpty() }
+        ?: error("app-version.properties缺少version")
     routing {
         get("/health") { call.respond(buildJsonObject { put("status", "ok") }) }
         authenticate("personal-token") {
             route("/v1") {
+                get("/capabilities") {
+                    call.respond(HealthCapabilities(appVersion))
+                }
+                post("/health/import") {
+                    call.respond(withContext(Dispatchers.IO) { store.healthImport(call.receive<HealthImportRequest>()) })
+                }
+                get("/health/status") { call.respond(withContext(Dispatchers.IO) { store.healthStatus() }) }
+                get("/health/days") {
+                    val from = LocalDate.parse(requireNotNull(call.request.queryParameters["from"]) { "缺少from日期" })
+                    val to = LocalDate.parse(requireNotNull(call.request.queryParameters["to"]) { "缺少to日期" })
+                    call.respond(withContext(Dispatchers.IO) { store.healthDays(from, to) })
+                }
+                get("/health/records") {
+                    val date = LocalDate.parse(requireNotNull(call.request.queryParameters["date"]) { "缺少date日期" })
+                    val dataset = HealthDataset.valueOf(requireNotNull(call.request.queryParameters["dataset"]) { "缺少dataset" })
+                    call.respond(withContext(Dispatchers.IO) { store.healthRecords(date, dataset, call.request.queryParameters["cursor"]) })
+                }
+                post("/health/collection/request") {
+                    call.respond(withContext(Dispatchers.IO) { store.collectionRequest() })
+                }
+                post("/health/collection/state") {
+                    call.respond(withContext(Dispatchers.IO) { store.collectionState(call.receive<HealthCollectionStateRequest>()) })
+                }
                 get("/documents") {
                     val kind = call.request.queryParameters["kind"]?.let(Kind::valueOf)
                     val deleted = call.request.queryParameters["includeDeleted"] == "true"
@@ -107,6 +154,7 @@ fun Application.trainingApplication(store: Store, archives: Archives, token: Str
                     val sessions = documents.filter { it.kind == Kind.session }.map { it.value<Session>() }
                         .filter { session -> (from == null || sessionDate(session) >= from) && (until == null || sessionDate(session) <= until) }
                     val activities = documents.filter { it.kind == Kind.activity }.map { it.value<ActivityRecord>() }
+                        .filterNot(ActivityRecord::isXiaomiAutoProjection)
                         .filter { activity ->
                             val date = LocalDate.parse(activity.localDate)
                             (from == null || date >= from) && (until == null || date <= until)
@@ -126,6 +174,64 @@ fun Application.trainingApplication(store: Store, archives: Archives, token: Str
                         muscleIds.addAll(ex.muscles); muscleIds.addAll(ex.secondaryMuscles)
                     }
                     call.respond(recommendExercises(exercises, muscleIds, call.request.queryParameters["gymId"], docs.filter { it.kind == Kind.equipment }.map { it.value<Equipment>() }, type))
+                }
+                get("/smartworkout/exercises") {
+                    call.respond(smartWorkout.list())
+                }
+                get("/smartworkout/exercises/{sourceId}/guide") {
+                    val sourceId = call.parameters["sourceId"]!!
+                    val guide = smartWorkout.guide(sourceId)
+                    if (guide == null) call.respond(HttpStatusCode.NotFound, ApiError("线上动作不存在"))
+                    else call.respond(guide)
+                }
+                post("/smartworkout/exercises/{sourceId}/select") {
+                    val sourceId = call.parameters["sourceId"]!!
+                    val request = call.receive<SmartWorkoutSelectionRequest>()
+                    require(request.type in setOf("strength", "stretch")) { "动作类型必须来自当前训练或拉伸添加上下文" }
+                    val existingId = smartWorkout.associatedExerciseId(sourceId, request.type)
+                    if (existingId != null) {
+                        val existing = withContext(Dispatchers.IO) { store.get(Kind.exercise, existingId) }
+                        if (existing == null || existing.deleted) {
+                            call.respond(HttpStatusCode.Conflict, ApiError("已关联的既有动作不存在或已删除；为保护历史不自动恢复"))
+                        } else {
+                            call.respond(existing)
+                        }
+                    } else {
+                        val document = smartWorkout.exerciseDocument(sourceId, request.type)
+                        if (document == null) {
+                            call.respond(HttpStatusCode.NotFound, ApiError("线上动作不存在"))
+                        } else {
+                            val current = withContext(Dispatchers.IO) { store.get(Kind.exercise, document.id) }
+                            when {
+                                current != null && isSameSmartWorkoutExercise(current, document) ->
+                                    call.respond(current)
+                                current != null ->
+                                    call.respond(HttpStatusCode.Conflict, ApiError("动作目录与已有资料冲突；原资料未被覆盖"))
+                                else -> {
+                                    val response = withContext(Dispatchers.IO) {
+                                        store.sync(SyncRequest(mutations = listOf(Mutation(document, 0))))
+                                    }
+                                    if (response.conflicts.isNotEmpty()) {
+                                        val raced = withContext(Dispatchers.IO) { store.get(Kind.exercise, document.id) }
+                                        if (raced != null && isSameSmartWorkoutExercise(raced, document)) {
+                                            call.respond(raced)
+                                        } else {
+                                            call.respond(HttpStatusCode.Conflict, ApiError("动作目录与已有资料冲突；原资料未被覆盖"))
+                                        }
+                                    } else {
+                                        call.respond(requireNotNull(response.accepted.singleOrNull()) {
+                                            "新动作写入后没有服务端确认资料"
+                                        })
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                get("/exercise-guide/{exerciseId}") {
+                    val exerciseId = call.parameters["exerciseId"]!!
+                    val guide = guides[exerciseId]
+                    if (guide == null) call.respond(HttpStatusCode.NotFound, ApiError("动作教学资料不存在")) else call.respond(guide)
                 }
                 get("/programs/{id}/next") {
                     val docs = withContext(Dispatchers.IO) { store.list() }

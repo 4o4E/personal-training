@@ -22,4 +22,20 @@ dependencies {
     testRuntimeOnly("org.junit.jupiter:junit-jupiter-engine:5.11.4")
     testRuntimeOnly("org.junit.platform:junit-platform-launcher:1.11.4")
 }
+val generatedAppVersion = layout.buildDirectory.file("generated/version-resource/app-version.properties")
+val generateAppVersionResource by tasks.registering {
+    val appVersion = project.version.toString()
+    inputs.property("appVersion", appVersion)
+    outputs.file(generatedAppVersion)
+    doLast {
+        generatedAppVersion.get().asFile.apply {
+            parentFile.mkdirs()
+            writeText("version=$appVersion\n")
+        }
+    }
+}
+tasks.processResources {
+    dependsOn(generateAppVersionResource)
+    from(generatedAppVersion)
+}
 tasks.test { useJUnitPlatform() }

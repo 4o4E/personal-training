@@ -3,57 +3,56 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.ui.draw.drawWithCache
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.overscroll
+import androidx.compose.foundation.rememberOverscrollEffect
+import androidx.compose.foundation.withoutVisualEffect
 import androidx.compose.foundation.layout.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.draw.alpha
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
-import androidx.compose.ui.Alignment
+import androidx.compose.ui.graphics.Shape
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.PathEffect
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.drawscope.clipRect
+import androidx.compose.ui.graphics.drawOutline
+import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.drawText
+import androidx.compose.ui.text.rememberTextMeasurer
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.sp
 import top.e404.training.shared.*
+import java.time.DayOfWeek
 import java.time.LocalDate
 import java.time.YearMonth
-import java.time.ZoneOffset
 import java.time.format.DateTimeFormatter
+import java.time.temporal.TemporalAdjusters
 import java.util.Locale
-
-private fun syncStatusText(status: SyncStatus): String = when (status) {
-    SyncStatus.offline -> "离线"
-    SyncStatus.syncing -> "同步中"
-    SyncStatus.synced -> "已同步"
-    SyncStatus.pending -> "待同步"
-    SyncStatus.conflict -> "存在冲突"
-    SyncStatus.error -> "同步失败"
-}
-
-private fun sessionStatusText(status: String): String = when (status) {
-    "active" -> "进行中"
-    "completed" -> "已完成"
-    "cancelled" -> "已取消"
-    else -> "状态未知"
-}
-
-private fun Modifier.dashedOutline(color: androidx.compose.ui.graphics.Color): Modifier = drawWithCache {
-    val strokeWidth = 1.dp.toPx()
-    val dash = PathEffect.dashPathEffect(floatArrayOf(5.dp.toPx(), 4.dp.toPx()))
-    onDrawWithContent {
-        drawContent()
-        drawRoundRect(color = color, style = Stroke(width = strokeWidth, pathEffect = dash))
-    }
-}
-
-@Composable fun HistoryCalendarScreen(state: AppData, onDay: (String) -> Unit, onNewActivity: (String) -> Unit) {
+private data class CalendarMonthWatermark(
+    val month: YearMonth,
+    val firstWeekIndex: Int,
+    val lastWeekIndex: Int,
+    val text: androidx.compose.ui.text.TextLayoutResult
+)
+@OptIn(androidx.compose.material3.ExperimentalMaterial3Api::class)
+@Composable fun HistoryCalendarScreen(state: AppData, today: LocalDate, viewModel: TrainingViewModel, onDay: (String) -> Unit) {
     val allSessions = remember(state.documents[Kind.session]) { state.records(Kind.session).map { it.value<Session>() } }
     val sessions = remember(allSessions) { allSessions.filter { it.results.isNotEmpty() } }
-    val activities = remember(state.documents[Kind.activity]) { state.records(Kind.activity).map { it.value<ActivityRecord>() } }
+    val activities = remember(state.documents[Kind.activity]) { state.records(Kind.activity).map { it.value<ActivityRecord>() }.filterNot(ActivityRecord::isXiaomiAutoProjection) }
     val plans = remember(state.documents[Kind.plan]) { state.records(Kind.plan).map { it.value<Plan>() } }
-    val sessionsByDate = remember(sessions) { sessions.groupBy(::sessionDate) }
+    val sessionsByDate = remember(sessions) {
+        sessions.groupBy(::sessionDate).mapValues { (_, dailySessions) -> dailySessions.singleOrNull()?.let(::listOf).orEmpty() }
+    }
     val activitiesByDate = remember(activities) { activities.groupBy { LocalDate.parse(it.localDate) } }
     val arrangement = remember(
         state.documents[Kind.arrangement], state.documents[Kind.session],
@@ -61,203 +60,237 @@ private fun Modifier.dashedOutline(color: androidx.compose.ui.graphics.Color): M
     ) { state.arrangement }
     val programDocument = arrangement?.programId?.let { state.record(Kind.program, it) }
     val program = remember(programDocument) { programDocument?.value<Program>() }
-    val today = remember { LocalDate.now(ZoneOffset.ofHours(8)) }
     val previewDays = program?.slots?.size ?: 0
+    val selectedPlans = program?.let { arrangement?.selectedPlans?.get(it.id).orEmpty() }.orEmpty()
     val override = program?.let { arrangement?.nextOverrides?.get(it.id) }
-    val previews = remember(today, previewDays, program, allSessions, plans, override) {
-        futureCalendarPlans(today, previewDays, program, allSessions, plans, override)
+    val previews = remember(today, previewDays, program, allSessions, plans, selectedPlans, override) {
+        futureCalendarPlans(today, previewDays, program, allSessions, plans, selectedPlans, override)
     }
-    val currentMonth = remember(today) { YearMonth.from(today) }
-    val actualDates = remember(sessions, activities) { sessions.map(::sessionDate) + activities.map { LocalDate.parse(it.localDate) } }
-    val firstDate = remember(actualDates, today) { actualDates.minOrNull()?.coerceAtMost(today) ?: today }
-    val lastDate = remember(today, previewDays) { today.plusDays(previewDays.toLong()) }
-    val months = remember(firstDate, lastDate) { calendarMonths(YearMonth.from(firstDate), YearMonth.from(lastDate)) }
-    val currentMonthIndex = months.indexOf(currentMonth).coerceAtLeast(0)
-    val listState = rememberLazyListState(initialFirstVisibleItemIndex = currentMonthIndex)
-
-    Column(Modifier.fillMaxSize().padding(horizontal = 12.dp, vertical = 8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        OutlinedButton(onClick = { onNewActivity(today.toString()) }, modifier = Modifier.fillMaxWidth()) { Text("记录其他运动") }
-        LazyColumn(state = listState, modifier = Modifier.weight(1f).fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            items(months, key = { "month-$it" }) { month ->
-                MonthCalendar(month, sessionsByDate, activitiesByDate, previews, onDay)
-            }
+    val coveredHealthDates = remember(state.health.healthStatus?.coveredDates) {
+        state.health.healthStatus?.coveredDates.orEmpty().map { LocalDate.parse(it) }
+    }
+    val actualDates = remember(sessions, activities, state.health.days, coveredHealthDates) {
+        sessions.map(::sessionDate) + activities.map { LocalDate.parse(it.localDate) } +
+            state.health.days.map { LocalDate.parse(it.localDate) } + coveredHealthDates
+    }
+    val firstAllowed = remember(actualDates, today) {
+        YearMonth.from(actualDates.minOrNull()?.coerceAtMost(today) ?: today).atDay(1)
+    }
+    val lastAllowedDate = remember(today, previews) { previews.keys.maxOrNull()?.coerceAtLeast(today) ?: today }
+    val lastAllowed = remember(lastAllowedDate) { YearMonth.from(lastAllowedDate).atEndOfMonth() }
+    val firstWeek = remember(firstAllowed) { firstAllowed.with(TemporalAdjusters.previousOrSame(DayOfWeek.MONDAY)) }
+    val lastWeek = remember(lastAllowed) { lastAllowed.with(TemporalAdjusters.nextOrSame(DayOfWeek.SUNDAY)) }
+    val weeks = remember(firstWeek, lastWeek) {
+        generateSequence(firstWeek) { previous -> previous.plusWeeks(1).takeIf { !it.isAfter(lastWeek) } }
+            .map { start -> (0L..6L).map(start::plusDays) }
+            .toList()
+    }
+    val todayWeek = remember(weeks, today) { weeks.indexOfFirst { today in it }.coerceAtLeast(0) }
+    val listState = rememberLazyListState(initialFirstVisibleItemIndex = todayWeek)
+    val visibleMonth by remember(weeks, firstAllowed, lastAllowed, listState) {
+        derivedStateOf {
+            val layout = listState.layoutInfo
+            val viewportCenter = (layout.viewportStartOffset + layout.viewportEndOffset) / 2
+            val visibleWeekIndex = layout.visibleItemsInfo
+                .minByOrNull { kotlin.math.abs(it.offset + it.size / 2 - viewportCenter) }
+                ?.index ?: listState.firstVisibleItemIndex
+            val week = weeks.getOrNull(visibleWeekIndex) ?: weeks.first()
+            YearMonth.from(week[3].coerceIn(firstAllowed, lastAllowed))
         }
     }
-}
-
-@Composable private fun MonthCalendar(
-    month: YearMonth,
-    sessionsByDate: Map<LocalDate, List<Session>>,
-    activitiesByDate: Map<LocalDate, List<ActivityRecord>>,
-    previews: Map<LocalDate, List<CalendarPlanPreview>>,
-    onDay: (String) -> Unit
-) {
-    val startOffset = month.atDay(1).dayOfWeek.value - 1
-    val cellCount = ((startOffset + month.lengthOfMonth() + 6) / 7) * 7
-    val dates = (0 until cellCount).map { index ->
-        val day = index - startOffset + 1
-        if (day in 1..month.lengthOfMonth()) month.atDay(day) else null
+    LaunchedEffect(visibleMonth) {
+        viewModel.refreshHealthDays(visibleMonth.atDay(1), visibleMonth.atEndOfMonth())
     }
-    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-        Text(month.format(DateTimeFormatter.ofPattern("yyyy年 M月", Locale.CHINA)), style = MaterialTheme.typography.titleMedium)
-        Row(Modifier.fillMaxWidth()) {
+    val monthFormatter = remember { DateTimeFormatter.ofPattern("yyyy年 M月", Locale.CHINA) }
+    val months = remember(firstAllowed, lastAllowed) {
+        val finalMonth = YearMonth.from(lastAllowed)
+        generateSequence(YearMonth.from(firstAllowed)) { month ->
+            month.plusMonths(1).takeIf { !it.isAfter(finalMonth) }
+        }.toList()
+    }
+    val watermarkStyle = MaterialTheme.typography.displayLarge.copy(
+        fontSize = 150.sp, lineHeight = 150.sp, fontWeight = FontWeight.Black
+    )
+    val textMeasurer = rememberTextMeasurer()
+    // 月份背景固定在所属日期周行的中心；滚动只改变绘制偏移，不重测文字或重算日期。
+    val monthWatermarks = remember(months, firstWeek, firstAllowed, lastAllowed, watermarkStyle, textMeasurer) {
+        months.map { month ->
+            val firstDate = maxOf(firstAllowed, month.atDay(1))
+            val lastDate = minOf(lastAllowed, month.atEndOfMonth())
+            val firstWeekDate = firstDate.with(TemporalAdjusters.previousOrSame(DayOfWeek.MONDAY))
+            val lastWeekDate = lastDate.with(TemporalAdjusters.previousOrSame(DayOfWeek.MONDAY))
+            CalendarMonthWatermark(
+                month = month,
+                firstWeekIndex = java.time.temporal.ChronoUnit.WEEKS.between(firstWeek, firstWeekDate).toInt(),
+                lastWeekIndex = java.time.temporal.ChronoUnit.WEEKS.between(firstWeek, lastWeekDate).toInt(),
+                text = textMeasurer.measure(AnnotatedString(month.monthValue.toString()), style = watermarkStyle)
+            )
+        }
+    }
+    val watermarkInk = if (MaterialTheme.colorScheme.surface.luminance() < 0.5f) Color.White else Color.Black
+    val currentWatermarkColor = watermarkInk.copy(alpha = 0.34f)
+    val otherWatermarkColor = watermarkInk.copy(alpha = 0.14f)
+    val overscrollEffect = rememberOverscrollEffect()
+    // 列表处理边缘拖动，外层统一绘制月份与日期，避免只拉伸日期内容。
+    val scrollEvents = remember(overscrollEffect) { overscrollEffect?.withoutVisualEffect() }
+
+    Column(Modifier.fillMaxSize().padding(horizontal = 12.dp, vertical = 8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Column(Modifier.weight(1f).fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Text(visibleMonth.format(monthFormatter), style = MaterialTheme.typography.titleMedium)
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
             listOf("一", "二", "三", "四", "五", "六", "日").forEach { weekday ->
                 Text(weekday, Modifier.weight(1f), textAlign = TextAlign.Center, style = MaterialTheme.typography.labelLarge)
             }
         }
-        dates.chunked(7).forEach { week ->
-            Row(Modifier.fillMaxWidth()) {
-                week.forEach { date ->
-                    if (date == null) {
-                        Spacer(Modifier.weight(1f).height(80.dp).padding(1.dp))
-                    } else {
-                        val dailySessions = sessionsByDate[date].orEmpty()
-                        val dailyActivities = activitiesByDate[date].orEmpty()
-                        val planned = previews[date].orEmpty()
-                        val hasActual = dailySessions.isNotEmpty() || dailyActivities.isNotEmpty()
-                        val sessionLabels = dailySessions.map(::sessionTrainingLabel).map { if (it == "自由锻炼") "自由" else it }.distinct()
-                        val completedSets = dailySessions.sumOf { it.results.size }
-                        Column(
-                            Modifier.weight(1f).height(80.dp).padding(1.dp)
-                                .background(if (hasActual) MaterialTheme.colorScheme.surfaceVariant else MaterialTheme.colorScheme.surface, MaterialTheme.shapes.small)
-                                .then(if (planned.isNotEmpty()) Modifier.dashedOutline(MaterialTheme.colorScheme.primary) else Modifier)
-                                .clickable { onDay(date.toString()) }
-                                .padding(horizontal = 2.dp, vertical = 4.dp),
-                            horizontalAlignment = Alignment.CenterHorizontally
-                        ) {
-                            Text(date.dayOfMonth.toString(), style = MaterialTheme.typography.bodyMedium)
-                            if (sessionLabels.isNotEmpty()) {
-                                Text(sessionLabels.joinToString("、"), maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.labelSmall, textAlign = TextAlign.Center)
-                                Text("${completedSets}组", maxLines = 1, style = MaterialTheme.typography.labelSmall, textAlign = TextAlign.Center)
+        Box(Modifier.weight(1f).fillMaxWidth()) {
+            LazyColumn(
+                state = listState,
+                overscrollEffect = scrollEvents,
+                modifier = Modifier.fillMaxSize().overscroll(overscrollEffect).drawWithCache {
+                    val rowSpacing = 6.dp.toPx()
+                    onDrawBehind {
+                        val layout = listState.layoutInfo
+                        val anchor = layout.visibleItemsInfo.firstOrNull()
+                        if (anchor != null) {
+                            val rowStride = anchor.size + rowSpacing
+                            val viewportTop = layout.viewportStartOffset.toFloat()
+                            clipRect(left = 0f, top = 0f, right = size.width, bottom = size.height) {
+                                monthWatermarks.forEach { watermark ->
+                                    val firstRowCenter = anchor.offset - viewportTop + anchor.size / 2f +
+                                        (watermark.firstWeekIndex - anchor.index) * rowStride
+                                    val lastRowCenter = anchor.offset - viewportTop + anchor.size / 2f +
+                                        (watermark.lastWeekIndex - anchor.index) * rowStride
+                                    val textTop = (firstRowCenter + lastRowCenter - watermark.text.size.height) / 2f
+                                    if (textTop + watermark.text.size.height >= 0f && textTop <= size.height) {
+                                        drawText(
+                                            watermark.text,
+                                            color = if (watermark.month == visibleMonth) currentWatermarkColor else otherWatermarkColor,
+                                            topLeft = Offset(
+                                                (size.width - watermark.text.size.width) / 2f,
+                                                textTop
+                                            )
+                                        )
+                                    }
+                                }
                             }
-                            if (dailyActivities.isNotEmpty()) {
-                                Text(dailyActivities.joinToString("、") { it.name }, maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.labelSmall, textAlign = TextAlign.Center)
-                            }
-                            if (planned.isNotEmpty()) {
-                                Text(planned.joinToString("、") { it.shortLabel }, maxLines = 1, overflow = TextOverflow.Ellipsis, color = MaterialTheme.colorScheme.primary, style = MaterialTheme.typography.labelSmall, textAlign = TextAlign.Center)
+                        }
+                    }
+                },
+                verticalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                items(weeks, key = { week -> "week-${week.first()}" }) { week ->
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        week.forEach { date ->
+                            val selectable = date >= firstAllowed && date <= lastAllowed
+                            val dailySessions = sessionsByDate[date].orEmpty()
+                            val dailyActivities = activitiesByDate[date].orEmpty()
+                            val planned = previews[date].orEmpty()
+                            val sessionLabels = dailySessions.singleOrNull()?.let(::sessionTrainingLabels).orEmpty()
+                                .map { if (it == "自由锻炼") "自由" else it }
+                            val completedSets = dailySessions.singleOrNull()?.results?.size ?: 0
+                            val todayCell = date == today
+                            val currentMonthCell = date.year == visibleMonth.year && date.monthValue == visibleMonth.monthValue
+                            Column(
+                                Modifier.weight(1f).height(56.dp)
+                                    .background(
+                                        when {
+                                            todayCell -> MaterialTheme.colorScheme.primaryContainer
+                                            currentMonthCell -> MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.65f)
+                                            else -> MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.3f)
+                                        },
+                                        MaterialTheme.shapes.small
+                                    )
+                                    .then(
+                                        if (planned.isNotEmpty()) Modifier.calendarOutline(MaterialTheme.colorScheme.primary, MaterialTheme.shapes.small, dashed = true)
+                                        else if (todayCell) Modifier.calendarOutline(MaterialTheme.colorScheme.primary, MaterialTheme.shapes.small, dashed = false)
+                                        else Modifier
+                                    )
+                                    .then(if (selectable) Modifier.clickable { onDay(date.toString()) } else Modifier)
+                                    .then(if (selectable) Modifier else Modifier.alpha(0.38f))
+                                    .padding(horizontal = 2.dp, vertical = 2.dp),
+                                horizontalAlignment = Alignment.CenterHorizontally
+                            ) {
+                                Text(
+                                    date.dayOfMonth.toString(),
+                                    modifier = if (!currentMonthCell && !todayCell) Modifier.alpha(0.48f) else Modifier,
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    maxLines = 1
+                                )
+                                val colors = MaterialTheme.colorScheme
+                                val summary = androidx.compose.ui.text.buildAnnotatedString {
+                                    var hasSummary = false
+                                    fun appendSummary(label: String, category: String) {
+                                        if (hasSummary) append(" · ")
+                                        val color = if (category.isNotEmpty()) sessionCategoryColor(category, colors) else colors.secondary
+                                        pushStyle(androidx.compose.ui.text.SpanStyle(color = color))
+                                        append(label)
+                                        pop()
+                                        hasSummary = true
+                                    }
+                                    sessionLabels.forEach { appendSummary(it, it) }
+                                    dailyActivities.forEach { appendSummary(it.name, "") }
+                                    planned.forEach { appendSummary(it.shortLabel, it.shortLabel) }
+                                }
+                                Text(
+                                    summary,
+                                    modifier = Modifier.fillMaxWidth(),
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                    style = MaterialTheme.typography.labelSmall,
+                                    textAlign = TextAlign.Center
+                                )
+                                val targetSets = planned.mapNotNull { it.targetSets }
+                                val groupLabel = when {
+                                    completedSets > 0 -> "${completedSets}组"
+                                    targetSets.isNotEmpty() -> "${targetSets.sum()}组"
+                                    else -> ""
+                                }
+                                Text(groupLabel, maxLines = 1, style = MaterialTheme.typography.labelSmall, textAlign = TextAlign.Center)
                             }
                         }
                     }
                 }
             }
         }
+    }
+            }
+}
+
+private fun sessionCategoryColor(label: String, colors: ColorScheme) = when {
+    label.startsWith("推") -> androidx.compose.ui.graphics.Color(if (colors.primary.luminance() > 0.4f) 0xFF81C784 else 0xFF2E7D32)
+    label.startsWith("拉") -> androidx.compose.ui.graphics.Color(if (colors.primary.luminance() > 0.4f) 0xFF82B1FF else 0xFF1565C0)
+    label.startsWith("腿") -> androidx.compose.ui.graphics.Color(if (colors.primary.luminance() > 0.4f) 0xFFFFB74D else 0xFFC65D00)
+    label.contains("自由") -> androidx.compose.ui.graphics.Color(if (colors.primary.luminance() > 0.4f) 0xFFBDBDBD else 0xFF616161)
+    else -> colors.secondary
+}
+
+
+internal fun sessionStatusText(status: String): String = when (status) {
+    "active" -> "进行中"
+    "completed" -> "已完成"
+    "cancelled" -> "已取消"
+    else -> "状态未知"
+}
+
+private fun Modifier.calendarOutline(color: androidx.compose.ui.graphics.Color, shape: Shape, dashed: Boolean): Modifier = drawWithCache {
+    val strokeWidth = 1.dp.toPx()
+    val inset = strokeWidth / 2
+    val outline = shape.createOutline(
+        androidx.compose.ui.geometry.Size(size.width - strokeWidth, size.height - strokeWidth),
+        layoutDirection,
+        this
+    )
+    val effect = if (dashed) PathEffect.dashPathEffect(floatArrayOf(5.dp.toPx(), 4.dp.toPx())) else null
+    val stroke = Stroke(width = strokeWidth, pathEffect = effect)
+    onDrawWithContent {
+        drawContent()
+        drawContext.transform.translate(inset, inset)
+        drawOutline(outline, color = color, style = stroke)
+        drawContext.transform.translate(-inset, -inset)
     }
 }
 
-@Composable fun DayHistoryScreen(
-    date: String,
-    state: AppData,
-    viewModel: TrainingViewModel,
-    remove: (Document) -> Unit,
-    editActivity: (Document) -> Unit,
-    addActivity: (String) -> Unit
-) {
-    val day = LocalDate.parse(date)
-    val sessionRecords = remember(state.documents[Kind.session]) { state.records(Kind.session).map { it to it.value<Session>() } }
-    val allSessions = remember(sessionRecords) { sessionRecords.map { it.second } }
-    val sessions = remember(sessionRecords, day) {
-        sessionRecords.filter { (_, session) -> sessionDate(session) == day && session.results.isNotEmpty() }
-            .sortedWith(compareBy(sessionComparator) { it.second })
-    }
-    val activityRecords = remember(state.documents[Kind.activity]) { state.records(Kind.activity).map { it to it.value<ActivityRecord>() } }
-    val activities = remember(activityRecords, day) {
-        activityRecords.filter { (_, activity) -> LocalDate.parse(activity.localDate) == day }
-            .sortedWith(compareBy({ it.second.name }, { it.first.id }))
-    }
-    val arrangement = remember(
-        state.documents[Kind.arrangement], state.documents[Kind.session],
-        state.pendingArrangementMigration, state.arrangementCloudRead
-    ) { state.arrangement }
-    val programDocument = arrangement?.programId?.let { state.record(Kind.program, it) }
-    val program = remember(programDocument) { programDocument?.value<Program>() }
-    val today = remember { LocalDate.now(ZoneOffset.ofHours(8)) }
-    val plans = remember(state.documents[Kind.plan]) { state.records(Kind.plan).map { it.value<Plan>() } }
-    val override = program?.let { arrangement?.nextOverrides?.get(it.id) }
-    val previewByDate = remember(today, program, allSessions, plans, override) {
-        futureCalendarPlans(today, program?.slots?.size ?: 0, program, allSessions, plans, override)
-    }
-    val previews = previewByDate[day].orEmpty()
-
-    Column(Modifier.fillMaxSize().padding(horizontal = 16.dp, vertical = 12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        Text("$date 运动记录", style = MaterialTheme.typography.headlineSmall)
-        if (previews.isNotEmpty()) InfoCard("未来计划预览 · 不计入实际记录") {
-            previews.forEach { Text(it.fullName) }
-        }
-        if (sessions.isEmpty() && activities.isEmpty()) {
-            Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) { Text("这一天没有实际运动记录。") }
-        } else LazyColumn(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(12.dp), contentPadding = PaddingValues(bottom = 24.dp)) {
-            items(sessions, key = { "session-${it.first.id}" }) { (document, session) ->
-                var editingResult by remember { mutableStateOf<SetResult?>(null) }
-                val dirty = state.documentSync["${document.kind.name}/${document.id}"]?.dirty == true
-                val conflict = state.documentSync["${document.kind.name}/${document.id}"]?.conflict == true
-                val startedAt = session.startedAt
-                val snapshot = session.snapshot
-                InfoCard(sessionTrainingLabel(session)) {
-                    Text(when {
-                        conflict -> "同步冲突 · 本机记录保留"
-                        dirty -> "本机待上传"
-                        state.syncStatus == SyncStatus.synced -> "云端已同步"
-                        else -> "本机保存副本 · ${syncStatusText(state.syncStatus)}"
-                    }, color = if (dirty || conflict) MaterialTheme.colorScheme.tertiary else MaterialTheme.colorScheme.secondary)
-                    if (startedAt != null) Text("开始：${localDateTime(startedAt)}")
-                    else Text("训练日期：${session.historicalSource?.localDate ?: date} · 未记录具体时间")
-                    session.endedAt?.let { Text("结束：${localDateTime(it)}") }
-                    Text("状态：${sessionStatusText(session.status)}")
-                    if (snapshot != null) Text("开始时计划：${snapshot.name}") else Text("开始时计划：未记录")
-                    session.items.forEach { item ->
-                        val exercise = session.exercises.firstOrNull { it.id == item.exerciseId }
-                        val results = session.results.filter { it.itemId == item.id }.sortedBy { it.setIndex }
-                        if (results.isNotEmpty()) {
-                            HorizontalDivider()
-                            Text(exercise?.name ?: "动作", style = MaterialTheme.typography.titleMedium)
-                            results.forEach { result ->
-                                val completedAt = result.completedAt?.let(::localDateTime)?.let { " · $it" }.orEmpty()
-                                Text("第 ${result.setIndex + 1} 组$completedAt：${resultText(result)}")
-                                if (session.status != "active") TextButton(onClick = { editingResult = result }) { Text("修改重量") }
-                            }
-                        }
-                    }
-                    if (session.notes.isNotBlank()) Text("反馈：${session.notes}")
-                    Text("实际完成 ${session.results.size} 组")
-                    if (session.status != "active") {
-                        TextButton(onClick = { remove(document) }, colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.error)) {
-                            Text("删除这次记录")
-                        }
-                    }
-                }
-                editingResult?.let { result ->
-                    val item = session.items.single { it.id == result.itemId }
-                    val exercise = session.exercises.single { it.id == item.exerciseId }
-                    HistoricalWeightEditor(result, exercise, viewModel, { editingResult = null }) { loads ->
-                        viewModel.repository.updateHistoricalResultLoads(session.id, result.itemId, result.setIndex, loads)
-                    }
-                }
-            }
-            items(activities, key = { "activity-${it.first.id}" }) { (document, activity) ->
-                val dirty = state.documentSync["${document.kind.name}/${document.id}"]?.dirty == true
-                val conflict = state.documentSync["${document.kind.name}/${document.id}"]?.conflict == true
-                InfoCard(activity.name) {
-                    Text(when {
-                        conflict -> "同步冲突 · 本机记录保留"
-                        dirty -> "本机待上传"
-                        state.syncStatus == SyncStatus.synced -> "云端已同步"
-                        else -> "本机保存副本 · ${syncStatusText(state.syncStatus)}"
-                    }, color = if (dirty || conflict) MaterialTheme.colorScheme.tertiary else MaterialTheme.colorScheme.secondary)
-                    Text("日期：${activity.localDate}")
-                    activity.durationSeconds?.let { Text("时长：${formatActivityDuration(it)}") }
-                    activity.distanceMeters?.let { Text("距离：${formatActivityDistance(it)}") }
-                    if (activity.notes.isNotBlank()) Text("备注：${activity.notes}")
-                    Row {
-                        TextButton(onClick = { editActivity(document) }) { Text("编辑") }
-                        TextButton(onClick = { remove(document) }, colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.error)) { Text("删除") }
-                    }
-                }
-            }
-        }
-    }
-}
-
-private fun formatActivityDuration(seconds: Int): String = buildString {
+internal fun formatActivityDuration(seconds: Int): String = buildString {
     val hours = seconds / 3600
     val minutes = seconds % 3600 / 60
     val remainingSeconds = seconds % 60
@@ -266,5 +299,5 @@ private fun formatActivityDuration(seconds: Int): String = buildString {
     if (remainingSeconds > 0 || hours == 0 && minutes == 0) append("${remainingSeconds}秒")
 }
 
-private fun formatActivityDistance(meters: Double): String =
+internal fun formatActivityDistance(meters: Double): String =
     if (meters >= 1000) "${numericText(meters / 1000)}公里" else "${numericText(meters)}米"

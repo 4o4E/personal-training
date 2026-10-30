@@ -49,6 +49,7 @@ dependencies {
     implementation("androidx.activity:activity-compose:1.12.1")
     implementation("androidx.navigation:navigation-compose:2.9.6")
     implementation("androidx.compose.material3:material3")
+    implementation("androidx.compose.material:material-icons-core")
     implementation("androidx.compose.foundation:foundation")
     implementation("androidx.compose.ui:ui")
     implementation("androidx.compose.ui:ui-tooling-preview")
@@ -66,4 +67,5 @@ dependencies {
     implementation("io.coil-kt:coil-svg:2.7.0")
     implementation("io.coil-kt:coil-gif:2.7.0")
     debugImplementation("androidx.compose.ui:ui-tooling")
+    testImplementation(kotlin("test-junit"))
 }

@@ -44,9 +44,20 @@
 | `PUT /v1/documents/{kind}/{id}` | 提交 `{"document": Document, "baseRevision": number}` | `SyncResponse`；版本冲突为 409 |
 | `DELETE /v1/documents/{kind}/{id}?revision=number` | 带修订号删除 | `SyncResponse`；版本冲突为 409 |
 | `POST /v1/sync` | 批量提交并拉取修订变化 | `SyncResponse`，逐份返回版本冲突 |
+| `GET /v1/capabilities` | 查询互相配套的客户端与数据格式 | `HealthCapabilities` |
+| `POST /v1/health/import` | 按单数据集分批幂等提交健康记录 | `HealthImportResult` |
+| `GET /v1/health/status` | 读取已覆盖日期、修订和采集状态 | `HealthStatus` |
+| `GET /v1/health/days?from=YYYY-MM-DD&to=YYYY-MM-DD` | 读取包含端点的有限范围日汇总 | `HealthDaysResponse` |
+| `GET /v1/health/records?date=YYYY-MM-DD&dataset=heartRate&cursor=` | 读取指定日期/数据集的有界详情页 | `HealthRecordsPage` |
+| `POST /v1/health/collection/request` | 请求或合并一次服务器采集 | `HealthCollectionRequestResult` |
+| `POST /v1/health/collection/state` | 由采集器报告 started/submitted/succeeded/failed | `HealthCollectionState` |
 | `GET /v1/history?from=YYYY-MM-DD&to=YYYY-MM-DD` | 按真实 UTC+8 训练日期查询，包含两端日期 | `HistorySummary` |
 | `GET /v1/recommendations?type=strength&muscles=chest,triceps&gymId=ID` | 按部位和实际器械选择训练候选 | `Exercise[]` |
 | `GET /v1/recommendations?type=stretch&exercises=ID1,ID2&gymId=ID` | 按所选动作的主要及辅助部位推荐拉伸 | `Exercise[]`，不会写入计划 |
+| `GET /v1/smartworkout/exercises` | 查询网站来源动作轻量目录 | 来源标识、名称及已知分类/器械 |
+| `GET /v1/smartworkout/exercises/{sourceId}/guide` | 不创建动作地查看网站教学 | 来源、线上媒体地址、说明、步骤、提示及常见错误；不存在时 404 |
+| `POST /v1/smartworkout/exercises/{sourceId}/select` | 按当前训练或拉伸入口选择来源动作 | 提交 `{"type":"strength"}` 或 `{"type":"stretch"}`；返回确认后的动作 `Document` |
+| `GET /v1/exercise-guide/{exerciseId}` | 按现有或已选动作身份读取网站教学 | 同上，不存在时 404 |
 | `GET /v1/programs/{id}/next` | 按已完成训练与当前手动选择计算下一项 | `SplitSlot` |
 | `GET /v1/files/{name}` | 下载图解或器械图片 | 实际图像字节，缺失时 404 |
 | `PUT /v1/files/{name}` | 上传独立图像 | 204；同名同内容可重复，同名不同内容为 409 |
@@ -55,67 +66,59 @@
 | `POST /v1/import?replace=true` | 明确允许替换已有不同内容 | 已保存文档列表 |
 
 缺少有效 token 返回 401；不正确的业务输入返回 400，格式为 `{"message":"具体原因"}`。单份读写接口返回的 `SyncResponse.documents` 也可能包含其他修订变化；CLI 对单次修改只显示 `accepted` 和 `conflicts`，不会将这些额外变化当作本次修改结果。
-
 ## 业务数据
 
-字段完整定义位于 `shared/src/main/kotlin/top/e404/training/shared/Domain.kt`；以下说明业务含义。
+字段完整定义位于 `shared/src/main/kotlin/top/e404/training/shared/Domain.kt`。
 
 ### 部位、动作与素材
 
 - `Muscle`：`id`、中文 `name`、肌肉示意图使用的 `mapKeys`。
-- `Media`：`id`、`name`、不可变 `fileName`、`mimeType`、来源 `source` 和 `sourceUrl`。支持 JPEG、PNG、WebP、GIF、SVG。
-- `Exercise`：`id`、`name`、`type`（`strength` / `stretch`）、`muscles`、`secondaryMuscles`、`equipmentTags`、中文步骤 `instructions`、`mediaIds`、`unilateral`、`bodyweight`、`measurement`（`reps` / `seconds`）、`defaultSeconds`、`notes`、`loadMode`（`external` / `assistance`）。
-- 动作与素材身份独立。替换图解时先上传新文件名，再修改 `Media.fileName` 或动作的素材引用，不创建重复动作。
-- 器械类别名称保存在 `catalog/equipment-tags.json`。动作要求的多个类别可以由同一健身房内不同器械共同提供，例如哑铃加训练凳。第一类别是选择具体器械时使用的主要类别。
+- `Media`：`id`、`name`、不可变 `fileName`、`mimeType`、来源 `source` 和 `sourceUrl`。
+- `Exercise`：名称、动作类型、主要/辅助部位、器械类别、步骤、素材引用、单双侧及计量方式。空步骤表示没有记录教学说明，不可据此推测动作形式。
+- 动作与素材身份独立；替换图解使用新的不可变文件名，再更新素材引用。
+- 网站来源动作在用户选择后才创建对应动作文档；可靠关联的已有动作保留原标识。来源素材直接访问其线上地址，不属于 `/v1/files` 的本地素材文件，也不进入训练备份。`source_unknown` 器械标签表示来源条件未知，不代表无需器械；自动筛选不将其视为健身房已具备。具体训练组的次数或时长由 `SetTarget` 表达，不改写已有训练快照。
 
-### 健身房和器械
+### 健身房、器械、分化和计划
 
-- `Gym`：`id`、`name`、`notes`。
-- `Equipment`：`id`、`name`、`gymId`、`tags`、原始 `unit`、`meaning`、可选 `mediaId`、`instructions`、`notes`。
-`unit`：`kg` / `lb`；`meaning`：`total`（总重量）、`per_hand`（单只重量）、`per_side`（单侧配重）、`unknown`（重量含义未记录）。器械配置是录入参考，各组仍独立保留原始读数。
-- 只提供已经记录的器械条件，不把动作目录里存在某器械解释为健身房已经拥有该器械。
+- `Gym` 保存健身房名称及备注；`Equipment` 保存所属健身房、类别、原始重量单位/含义和可选素材。器械配置不是当前现场可用的保证。
+- `Program.slots` 是有序的用户分化项；分化项数量即 N，不固定推拉腿。
+- `Plan` 保存动作、目标组、器械选择及备注。计划快照不会改写已开始训练。
+- 负重读数保留原始单位与 `meaning`，不做全局换算；`load=null` 表示没有记录外部重量，不代表零重量。
+- 下一项按真实完成组推进：至少一组真实结果才算练过，完全无组不推进。自由训练和无法唯一匹配分化项的记录不推进。
 
-### 分化方案、具体计划和组目标
+### 实际训练与独立活动
 
-- `Program`：`id`、`name`、有序 `slots`。
-- `SplitSlot`：`id`、`name`、目标 `muscles`。`slots` 的数量就是 N，推拉腿不是固定枚举。
-- `Plan`：`id`、`name`、可选 `programId` / `slotId`、可选 `gymId`、可选本地日期 `date`、有序 `items`、`notes`。
-- `PlanItem`：`id`、`exerciseId`、可选实际 `equipmentId`、有序 `sets`、`notes`。
-- `SetTarget`：可选 `reps` / `repsMax` 或 `seconds`、可选 `load`、`side`、`restSeconds`。
-- `Load`：`value`、`unit`、`meaning`、`mode`。`mode=assistance` 是助力，不是外部负重。
-- `side`：`both`（双侧或不分侧）、`left`、`right`。单侧拉伸可按左右各一组表示。
-- `load=null` 表示没有记录外部读数，不等同于零重量；同一训练中 `20 kg` 与 `60 lb` 原样保留，不进行全局显示换算。
-- 器械类别和位置可能变化，计划仍可保存和恢复；开始训练前需要确认该计划实际可执行。
-- 无日期且绑定分化项的计划可循环执行；指定日期和未绑定分化的计划不自动循环。未来计划编辑不会改写已有 Session。
-- 下一项训练优先按已安排日期及完成情况选择；同一分化项存在多份无日期计划时，由用户明确选用。
-- 自动轮换按当前方案关联的已完成实时训练及可唯一对应当前分化项的已导入历史计算。历史轮换使用保存的分类标签（推／推类训练、拉／拉类训练、腿／腿部训练／腿类训练）与当前分化项匹配；自由锻炼、无法唯一匹配的历史和其他方案关联的实时训练不推进当前轮换。按 UTC+8 真实训练日期及已有精确时间先后判断，服务器 `revision` 与重量修订不影响轮换顺序。
+- 每个业务日期只有一个 `Session`，`id=day-YYYY-MM-DD`，使用UTC+8日期。根字段记录真实组、反馈、快照和状态；来源原事实以 `sourceRecords` 保存，不复制重复组。
+- `startedAt`、`endedAt`、组完成时间可以为空，未知精度不补造。状态为 `active`、`completed` 或 `cancelled`；没有完成组不能标记完成。
+- `ActivityRecord` 使用独立 `kind=activity`，字段含 `id`、`name`、`localDate`、可空 `durationSeconds`、`distanceMeters`、`notes`、`sourceId`、`startedAt`、`endedAt`。已知结束不得早于开始；起始时间已知时日期必须匹配其UTC+8日期。来源时长与起止间隔分别保留。
+- 活动不属于 `Session`，不进入训练组统计或分化轮换。用户活动及日历记录只包含用户明确手动录入或明确导入的活动；自动采集的小米摘要不创建或更新`ActivityRecord`，只在健康数据详情读取。既有自动投影仅在`id`以`xiaomi-`开头且`sourceId`以`misports:activities:`开头时识别为隐藏条目；不得只按`sourceId`前缀过滤，例如明确导入徒步`activity-misports-20261017-walking`及手动UUID必须保留。此规则不删除或修改活动及健康原始资料，不改变schema和格式版本。
+- `GET /v1/history` 的日期筛选同时作用于 Session 与可见的用户活动，但训练统计只依据实际 Session 组计算。
 
-- 当前方案、各方案的选用计划及下次手动指定保存为 `arrangement/current`：`programId` 可空，`selectedPlans` 按 `programId → slotId → planId` 嵌套，`nextOverrides` 按 `programId` 保存 `{id, slotId}`。
-- `nextOverrides.id` 是本次手动选择的稳定标识。开始训练时复制到 Session；完成该指定训练只消费同一个 ID，取消不消费，也不会清除训练开始后新设的选择。
-- 新建 arrangement 后必须保证方案、分化项和计划引用均有效。更新或删除被引用方案/计划时同步调整安排；无效引用不能自动换成别的计划。
+## 健康数据 API v1
 
-### 实际训练
+除 `GET /health` 外，以上所有路径均使用 `Authorization: Bearer <唯一token>`。健康数据使用专用SQLite表，不进入 `documents`、`/v1/sync` 或普通历史文档流。时间戳全部为 epoch 毫秒，`localDate` 为 UTC+8 日期；健康源秒时间只在采集边界乘以 1000。缺失字段使用 `null` 或省略，绝不将缺失写成 0。自然来源键相同且内容完全相同的重试返回 `unchanged`，不增加日期修订。
 
-`Session` 保存 `id`、`name`、动作教学 `exercises`、`status`、`results`、`notes`、实际执行安排 `items`、被替代的 `skippedItems` 和开始时明确选择的可空 `splitSlotName`。实时训练要求 `snapshot: Plan` 与真实 `startedAt`；只有日期的历史训练允许 `snapshot`、`startedAt`、`endedAt` 和组 `completedAt` 为 `null`，并提供不可变 `historicalSource: {sourceId, localDate}`。历史训练不能标记为进行中，也不能推断精确时间。
+`GET /v1/capabilities` 返回 `{"appVersion":"0.0.6","formatVersion":6,"backupFormatVersion":6,"healthApiVersion":1}`。客户端必须在写入前核对三个格式版本；不匹配时停止写入并要求升级配套端。
 
-- epoch 毫秒表示已知精确时间；日期筛选与实时训练日期统一 UTC+8，历史来源日期直接使用 `historicalSource.localDate`。
-- `status`：`active` / `completed` / `cancelled`。没有实际完成组的训练不能标记完成。
-- 历史导入须先结合当时训练安排、实际动作和训练部位整理 `splitSlotName`，再提交原生记录。明确的推、拉、腿写入对应名称；无法明确归类的混合训练使用空值。原始来源缺少此字段不等于自由锻炼。客户端按保存的分类展示，不根据当前方案重算。
-- `SetResult`：`itemId`、非负 `setIndex`、实际 `reps` / `seconds`、实际 `load`、`side`、可空 `completedAt` 和有序 `segments`。
-- `SetSegment` 保留分段实际 `reps` 与 `load`；分段次数之和必须等于整组次数，分段重量不可再压成一个组重量；一条 `SetResult` 仍只计一个实际组。
-- `Load.meaning` 支持 `total`、`per_hand`、`per_side`、`unknown`；未知含义保留原始数值与单位，界面仅显示数字和原始单位，不猜测重量含义；助力模式仍显示助力语义。
-- 完成部分组后仍可明确结束为完成，以实际量保存并推进分化；取消也保存已经练过的组，但不推进分化。
-- `snapshot`、开始时间和已有动作教学不可改写。实时训练已有完成组的条目和目标不能替换。替换剩余动作时保留原条目与真实结果，将未执行部分标记跳过，再插入新执行条目。
-- 编辑未来计划不会修改已经开始的训练。
+健康导入请求形如 `{"dataset":"steps","records":[{"sourceId":"...", "localDate":"2026-10-27","measuredAt":179...,"payload":{"steps":123,"distanceMeters":45.0,"caloriesKcal":2.1,"deviceId":null,"source":"cloud"}}]}`。每批只能包含一个 `HealthDataset`，来源标识在该批内唯一；服务端严格解码对应的共享 `@Serializable` payload，未知字段拒绝。`HealthImportResult` 为 `accepted`、`unchanged`、`revisionByDate`。
 
-`HistorySummary` 包含实际 `sessions`、`strengthSets`、`stretchSets`、`strengthSetsByMuscle` 和独立 `activities`。统计包含进行中及取消训练中的真实完成组；分化轮换只考虑 `status=completed`。复合动作涉及多个主要部位，部位计数之和不一定等于总力量组数，不应据此重复统计总量。
+共享payload：
 
-### 独立运动与历史查询
+- `steps`: `steps: Long`、`distanceMeters: Double?`（m）、`caloriesKcal: Double?`（计步热量，kcal）、`deviceId: String?`、`source: String?`。
+- `calories`: `caloriesKcal: Double`（独立活动热量，kcal）、`deviceId: String?`、`source: String?`。不可与计步热量合并。
+- `heartRate`：`bpm: Int`、`sampleType: "active"|"passive"`、`deviceId: String?`、`source: String?`。小米运动真实心率明细使用 `sampleType="active"`、`source="xiaomi_workout"`，`measuredAt`为该样本的实际epoch毫秒，BPM必须是实际大于零的读数；稳定 `sourceId` 格式为 `workout:<activity.source_id>:<offset_s>`，其中offset来自该活动的运动采样相对位置。日常采样仍按其原有类型和来源保存，不用于拼成运动心率曲线。运动明细经现有 `/v1/health/import` 导入，可由既有分页与离线缓存读取；重复来源及相同内容保持幂等，不需要数据库结构变更。
+- `restingHeartRate`: `bpm: Int`、`source: String?`。
+- `sleep`: `startAt/endAt: Long`、`durationMinutes: Int`、`asleepMinutes/awakeMinutes: Int?`、`awakeCount: Int?`、`avgHeartRate/minHeartRate/maxHeartRate: Double?`、`deepMinutes/lightMinutes/remMinutes: Int?`、`score: Double?`、`isNap: Boolean`、`algorithmVersion: Int?`、`stages: [{startAt: Long,endAt: Long,stage: String}]`。来源睡眠分钟数与端点时间分别保留；`asleepMinutes`、`awakeMinutes` 在来源为空时保持空，按起床日期归档。
+- `body`: `weightKg: Double`、`bmi/bodyFatPct/muscleMassKg/muscleRatePct/skeletalMuscleMassKg/bodyMoistureMassKg/moistureRatePct/boneMassKg/proteinMassKg/proteinRatePct/fatMassKg/fatFreeBodyKg/visceralFat/basalMetabolismKcal/bodyAge/bodyScore/whr/standardWeightKg: Double?`、`extra: JsonObject?`、`deviceId: String?`。体脂等率值保留源数值，不再猜测比例换算。
+- `activity`: `sportKey: String`、`sportCategory: String?`、`sportTypeCode: Int?`、`startAt/endAt: Long`、`durationSeconds: Int?`、`mainPosture: Int?` 原样保留源编码不解释成文本，其余摘要值依 `ActivityPayload` 定义。距离是米、时长是秒、速度是米/秒、步幅是厘米、配速依字段分别为秒/公里或秒/100米；来源运动时长不由端点差重算。
 
-- `ActivityRecord`：`id`、`name`（日历展示名称）、本地日期 `localDate`（`YYYY-MM-DD`）、可选 `durationSeconds`、可选 `distanceMeters`、`notes` 和可选稳定来源标识 `sourceId`。名称不能为空；日期必须有效；提供的时长和距离必须为正数，未知量值留空。
-- 独立运动以 `kind=activity` 通过通用文档查询、保存、删除和同步接口处理。其记录不属于 `Session`，不进入分化轮换或力量／拉伸组数统计。
-- `GET /v1/history` 的 `from` / `to` 为包含端点的日期范围，筛选历史训练的 `historicalSource.localDate`、实时训练的真实 UTC+8 日期，以及独立运动的 `localDate`。响应的 `activities` 仅含范围内活动；训练统计只由实际 `Session.results` 计算。
+`HealthDaySummary`含`localDate`、`revision`及可空`steps`、`distanceMeters`、`stepCaloriesKcal`、`calorieMinutesKcal`、`heartRateSamples`、`restingHeartRateBpm`、`sleepSessions`、`bodyMeasurements`、`activities`。每个字段无观测时为空；其中`activities`是只读健康运动摘要，不代表用户活动`ActivityRecord`，不自动投影进用户运动列表或日历。`HealthDaysResponse`为`days`和`revisionByDate`。日汇总只在请求范围内查询。
 
+详情页固定最多 500 条，按 `measuredAt,sourceId` 升序。`HealthRecordsPage` 包含 `date`、`dataset`、该日期 `revision`、`records` 和可空 `nextCursor`；把游标原样传给下一页。页间 revision 改变必须重新读取该日期/数据集，不能标记混合版本完整。
+
+`POST /v1/health/collection/request`不需要请求体；已有待执行、运行中或提交中的请求会合并并返回`requested:false`。`HealthStatus`的`coveredDates`和`revisionByDate`表示服务端已有记录的日期，`collection`为`HealthCollectionState`：`requested`、`stage`、`phase`、`requestedAt`、`startedAt`、`submittedAt`、`lastSuccessAt`、`failedAt`、`error`（除`stage`外可空）。阶段为`idle/requested/running/submitted/published/succeeded/failed`。状态事件请求为`{"event":"started|submitted|published|succeeded|failed","phase":null,"error":null}`；`published`只表示发布已有资料，不推进`lastSuccessAt`，但更新`submittedAt`并清除本次错误；只有`succeeded`（完整采集轮次成功）推进`lastSuccessAt`。`published`为终态，可再次请求采集；`failed`不更新`lastSuccessAt`。健康运动摘要是只读健康事实；采集及`/v1/health/import`不得自动创建或更新用户`ActivityRecord`。
+
+所有健康DTO位于 `shared/src/main/kotlin/top/e404/training/shared/HealthDomain.kt`，可直接复用 `HealthRecord.decodePayload<T>()`；不要在客户端另建同义模型。
 ## 同步
 
 请求格式：
@@ -124,16 +127,18 @@
 {"cursor":0,"mutations":[]}
 ```
 
-每个修改为 `{"document": Document, "baseRevision": number}`。响应字段：
+每个修改为 `{"document": Document, "baseRevision": number, "restoreSession": boolean}`。`restoreSession` 可省略，默认 `false`。仅在用户明确选择恢复完整备份中的一份非删除每日 `Session` 时设为 `true`；它允许恢复该日完整的canonical内容（包括撤销备份后追加的来源、动作、目标、完成状态及反馈）。改变内容仍必须匹配 `baseRevision`；相同内容的重试按幂等提交确认，不增加修订。此标记不能用于计划、其他资料或删除标记。普通编辑、同步和历史来源归并都必须保持默认 `false`。
+
+响应字段：
 
 - `cursor`：本次读取到的服务器修订位置。
 - `documents`：该游标之后的最新文档及删除标记。
 - `accepted`：已保存或重复确认的提交，包含服务器修订号。
 - `conflicts`：`{"local": Document, "remote": Document}`，本地修改和当前服务器内容都保留。
 
-相同内容重复提交直接确认已有修订，不增加实际记录或重复记账。版本不一致且内容不同的文档不覆盖服务器；同一批内不冲突且符合业务关联的文档仍可保存。新增和更新按关联先后处理，删除按相反顺序处理。
+相同内容的提交直接确认已有修订，不增加实际记录或重复记账（包括显式恢复请求的相同内容重试）。内容不同且版本不一致的文档不覆盖服务器；变更内容的显式恢复也遵守此冲突规则。同一批内不冲突且符合业务关联的文档仍可保存。新增和更新按关联先后处理，删除按相反顺序处理。
 
-手机在 Room 中先提交实际组及计时状态，再交给网络同步。断网不阻止训练。重新联网后上传待同步资料；有冲突时在设置中查看两份具体内容并明确选择。素材下载中断后会重新检查缺失文件，不把已经确认的元数据等同于图像已经下载成功。
+手机在 Room 中先提交实际组及计时状态，再交给网络同步。日期弹窗的统一修改先验证全部输入，并在一个本地事务中保存变更，再复用相同同步接口；云端仍按文档返回接收或修订冲突，不承诺跨文档原子提交。断网不阻止训练及本机编辑。重新联网后上传待同步资料；有冲突时从运动记录右上角同步图标打开详情，查看两份具体内容并明确选择。同步结果仅短暂提示，详细原因、重试和采集入口按需打开；不改变服务端协议。素材下载中断后会重新检查缺失文件，不把已经确认的元数据等同于图像已经下载成功。
 
 连接到另一套后端时使用完整备份迁移：先导出，再将 ZIP 导入目标后端，之后配置手机地址和 token。不要把更改地址当作清空服务器或自动复制另一套服务器的操作。
 
@@ -141,8 +146,10 @@
 
 ZIP 内含：
 
-- `data.json`：新导出为 `{"formatVersion":4,"documents":[...],"exportedAt":epoch毫秒}`；读取端兼容版本 1、2、3 和 4。
+`data.json` 新导出为 `{"formatVersion":6,"documents":[...],"exportedAt":epoch毫秒,"healthManifest":{...}}`，读取端兼容版本1至6。版本6必须具有健康清单；`healthManifest` 字段为 `scope`（`complete` 或 `cache`）、`coveredDates: String[]`、`datasets: HealthDataset[]`、`recordCount: Long`。健康数据不塞入 `data.json`，独立写入 `health.jsonl`，每行一个 `{"dataset":"steps","record":{"sourceId":"...","localDate":"YYYY-MM-DD","measuredAt":epoch毫秒,"payload":{...}}}`，流式读写避免把历史采样全装进内存。
 
-版本 4 保留既有 Session 字段，并支持独立 `activity` 文档。版本 1、2 读取时会移除已废弃的 `historicalSource.originalText`，其余原生字段及用户备注保持；版本 3、4 导入包含该字段会被拒绝。0.0.3 旧库存、手机缓存与同步文档也会在 Session 解码边界定向投影移除此字段，避免要求清缓存或改写数据库；不会自动转换 `notes`。导出会投影为版本 4，并仅移除旧库存中的该废弃字段，不改写数据库或用户备注。版本 1、2 的既有精确时间、计划与结果按原义恢复；导出不含凭据。不同内容必须明确允许替换；素材先完整准备，再提交数据库，失败不会覆盖已有可见图片。
+服务器 `/v1/export` 始终导出 `scope=complete` 和全量健康资料；服务器 `/v1/import` 只接受完整范围，缓存包必须拒绝，不得用部分资料覆盖服务器。`replace=false` 对健康自然键已有的不同内容返回409并保留冲突；`replace=true` 才允许覆盖。内容相同重复导入幂等，不增加记录或日期修订。手机离线备份可设为 `scope=cache`，清单只声明本机已下载日期/数据集，不能称作完整健康备份；含完整健康资料的恢复需在线使用同一后端导入接口。
 
-CLI 支持 `list/get/put/delete/sync/history/recommend/next/export/import/upload/download`。可用文档种类包括 `activity`，例如 `python scripts/training.py list activity` 与 `python scripts/training.py get activity <活动ID>`；使用 `put activity <活动ID> --file <资料JSON> --base-revision 0` 新建活动，已有资料先 `get` 并提交读取到的修订号。`TRAINING_URL` 指定后端；`TRAINING_TOKEN` 或 `TRAINING_TOKEN_FILE` 提供凭据。凭据不要放进命令参数、JSON、运动记录或临时文件。退出码 3 表示冲突，其他非零表示操作失败。
+版本5和6使用每日canonical Session 格式，非canonical活跃Session拒绝读取。旧v1—v4读取时保留来源原payload，只清理废弃字段；导入阶段显式归并为稳定 `day-YYYY-MM-DD` 文档，按来源稳定标识去重实际组，动作ID确定性重映射；旧来源以删除标记退出同步。合并保留真实组、分段、原始单位、已知时间、分类、计划快照与反馈，不补造未知时间或目标。重复导入相同旧来源不增加组或覆盖根级反馈。`replace=true` 将完整canonical每日训练作为显式整日恢复；普通数据写入和旧版本历史归并仍受来源、动作、目标及已记录完成组的不可改写规则约束。canonical singleton从备份读取、导出及重启归一时保持原payload，不再投影改写。
+
+CLI 支持 `list/get/put/delete/sync/history/recommend/next/export/import/upload/download`。健康只读/请求命令为 `capabilities`、`health-status`、`health-days --from YYYY-MM-DD --to YYYY-MM-DD`、`health-records --date YYYY-MM-DD --dataset <steps|calories|heartRate|restingHeartRate|sleep|body|activity> [--cursor CURSOR]`、`health-collect`（请求或合并服务端采集任务，不采集手机本地数据）。可用文档种类包括 `activity`，例如 `python scripts/training.py list activity` 与 `python scripts/training.py get activity <活动ID>`；使用 `put activity <活动ID> --file <资料JSON> --base-revision 0` 新建活动，已有资料先 `get` 并提交读取到的修订号。`TRAINING_URL` 指定后端；`TRAINING_TOKEN` 或 `TRAINING_TOKEN_FILE` 提供凭据。凭据不要放进命令参数、JSON、运动记录或临时文件。退出码 3 表示冲突，其他非零表示操作失败。

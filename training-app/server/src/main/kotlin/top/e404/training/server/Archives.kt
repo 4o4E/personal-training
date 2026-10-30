@@ -1,6 +1,8 @@
 package top.e404.training.server
 
 import top.e404.training.shared.*
+import kotlinx.serialization.decodeFromString
+import kotlinx.serialization.encodeToString
 import java.io.InputStream
 import java.io.OutputStream
 import java.nio.file.Files
@@ -29,14 +31,25 @@ class Archives(private val directory: Path, private val store: Store) {
         } finally { Files.deleteIfExists(temporary) }
     }
 
-    fun export(output: OutputStream) = writeBackup(store.backup(), output, ::openMedia)
+    fun export(output: OutputStream) = store.exportBackup(output, ::openMedia)
 
     fun import(input: InputStream, replace: Boolean): List<Document> {
         val temporary = Files.createTempDirectory(directory, ".import-")
         val created = mutableListOf<Path>()
         var committed = false
         try {
-            val backup = readBackup(input, temporary)
+            val healthFile = temporary.resolve("health.jsonl")
+            val backup = Files.newBufferedWriter(healthFile).use { writer ->
+                readBackup(input, temporary) { entry ->
+                    writer.write(wireJson.encodeToString(entry))
+                    writer.newLine()
+                }
+            }
+            if (backup.formatVersion == 6) {
+                val manifest = requireNotNull(backup.healthManifest) { "版本6数据包缺少健康清单" }
+                require(manifest.scope == "complete") { "服务器只接受完整健康备份；本机缓存包不能恢复到服务器" }
+                require(manifest.recordCount == 0L || Files.exists(healthFile)) { "完整健康备份缺少健康记录" }
+            }
             val prepared = backup.documents.map { doc ->
                 if (doc.kind != Kind.media || doc.deleted) doc else {
                     val item = doc.value<Media>()
@@ -54,12 +67,21 @@ class Archives(private val directory: Path, private val store: Store) {
                     }
                 }
             }
-            val result = store.import(backup.copy(documents = prepared), replace)
+            val healthRows = if (backup.formatVersion == 6) healthEntries(healthFile) else null
+            val result = store.import(backup.copy(documents = prepared), replace, healthRows)
             committed = true
             return result
         } finally {
             if (!committed) created.forEach { Files.deleteIfExists(it) }
             Files.walk(temporary).use { paths -> paths.sorted(Comparator.reverseOrder()).forEach { Files.delete(it) } }
+        }
+    }
+    private fun healthEntries(file: Path): Sequence<HealthBackupEntry> = sequence {
+        Files.newBufferedReader(file).use { reader ->
+            while (true) {
+                val line = reader.readLine() ?: break
+                if (line.isNotBlank()) yield(wireJson.decodeFromString<HealthBackupEntry>(line))
+            }
         }
     }
 

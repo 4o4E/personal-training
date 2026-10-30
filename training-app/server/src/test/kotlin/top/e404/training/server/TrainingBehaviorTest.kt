@@ -28,8 +28,10 @@ class TrainingBehaviorTest {
     private fun plan(id: String = "plan", slot: String = "push") = Plan(id, "训练计划", program.id, slot, date = "2026-10-22", items = listOf(PlanItem("item", dumbbell.id, sets = List(4) { SetTarget(reps = 10, load = Load(20.0, "kg", "per_hand")) })))
     private fun session(id: String, slot: String, status: String, time: Long): Session {
         val p = plan("plan-$id", slot)
-        return Session(id, "实际训练", p, listOf(dumbbell), time, if (status == "active") null else time + 10000, status,
-            results = listOf(SetResult("item", 0, reps = 10, load = Load(20.0, "kg", "per_hand"), completedAt = time + 1000)))
+        val date = java.time.Instant.ofEpochMilli(time).atZone(ZoneId.of("Asia/Shanghai")).toLocalDate()
+        return Session(dailySessionId(date), "实际训练", p, listOf(dumbbell), time, if (status == "active") null else time + 10000, status,
+            results = listOf(SetResult("item", 0, reps = 10, load = Load(20.0, "kg", "per_hand"), completedAt = time + 1000)),
+            localDate = date.toString())
     }
     private fun Store.put(doc: Document, base: Long = 0): Document = sync(SyncRequest(mutations = listOf(Mutation(doc, base)))).accepted.single()
     private val historicalProgram = Program(
@@ -41,10 +43,12 @@ class TrainingBehaviorTest {
         )
     )
     private fun imported(id: String, date: String, label: String?) = Session(
-        id, "导入训练", null, listOf(dumbbell), null, status = "completed",
+        dailySessionId(LocalDate.parse(date)), "导入训练", null, listOf(dumbbell), null, status = "completed",
         results = listOf(SetResult("item", 0, reps = 10)),
         items = listOf(PlanItem("item", dumbbell.id, sets = listOf(SetTarget(reps = 10)))),
-        historicalSource = HistoricalSource("source-$id", date), splitSlotName = label
+        splitSlotName = label, localDate = date,
+        sourceRecords = listOf(SessionSource(id, "导入训练", date,
+            historicalSource = HistoricalSource("source-$id", date), splitSlotName = label, itemIds = listOf("item")))
     )
 
     @Test fun `导入历史分类按既有别名接续当前分化`() {
@@ -67,7 +71,6 @@ class TrainingBehaviorTest {
         assertEquals("push", nextSlot(historicalProgram, listOf(free, otherProgramSession)).id)
         assertEquals("push", nextSlot(historicalProgram, listOf(imported("unmatched", "2026-10-27", "腹部"))).id)
         assertEquals("push", nextSlot(ambiguousProgram, listOf(imported("ambiguous", "2026-10-27", "拉"))).id)
-        assertEquals("自由锻炼", sessionTrainingLabel(free))
     }
 
     @Test fun `真实日期排序及较早记录重量修订不影响轮换位置`() {
@@ -100,14 +103,24 @@ class TrainingBehaviorTest {
         assertEquals("push", nextSlot(program, listOf(completed), override).id)
     }
 
-    @Test fun `取消和进行中训练不推进轮换`() {
+    @Test fun `取消及进行中真实组都推进轮换而零组不推进`() {
         val completed = session("completed", "push", "completed", start)
         val cancelled = session("cancelled", "legs", "cancelled", start + 20000)
         val active = session("active", "pull", "active", start + 40000)
         assertEquals("push", nextSlot(program, emptyList()).id)
-        assertEquals("pull", nextSlot(program, listOf(active, cancelled, completed)).id)
+        assertEquals("legs", nextSlot(program, listOf(active, cancelled, completed)).id)
+        assertEquals("pull", nextSlot(program, listOf(completed, cancelled.copy(results = emptyList()))).id)
         val finishedPull = active.copy(status = "completed", endedAt = start + 50000)
         assertEquals("legs", nextSlot(program, listOf(completed, finishedPull)).id)
+    }
+    @Test fun `只有实际组关联的计划快照才算已执行`() {
+        val actual = session("actual-plan", "push", "completed", start)
+        assertEquals(setOf(actual.snapshot!!.id), recordedPlanIds(listOf(actual)))
+        val sourced = actual.copy(sourceRecords = listOf(SessionSource(
+            "old-source", "旧训练", actual.localDate, snapshot = actual.snapshot, itemIds = listOf("item")
+        )))
+        assertEquals(setOf(actual.snapshot!!.id), recordedPlanIds(listOf(sourced)))
+        assertTrue(recordedPlanIds(listOf(sourced.copy(results = emptyList()))).isEmpty())
     }
 
     @Test fun `实际组与拉伸分开统计并保留混合单位和助力`() {
@@ -123,7 +136,8 @@ class TrainingBehaviorTest {
             SetResult("hold", 0, seconds = 25, side = "left", completedAt = start + 3000),
             SetResult("move", 0, reps = 7, completedAt = start + 4000))
         val p = Plan("mixed", "混合训练", items = items)
-        val s = Session("session", p.name, p, listOf(dumbbell, assisted, stretch, dynamic), start, start + 5000, "cancelled", results)
+        val s = Session("session", p.name, p, listOf(dumbbell, assisted, stretch, dynamic), start, start + 5000, "cancelled", results,
+            localDate = java.time.Instant.ofEpochMilli(start).atZone(ZoneId.of("Asia/Shanghai")).toLocalDate().toString())
         val summary = summarizeHistory(listOf(s))
         assertEquals(2, summary.strengthSets)
         assertEquals(2, summary.stretchSets)
@@ -133,6 +147,40 @@ class TrainingBehaviorTest {
         assertEquals(Load(20.0, "kg", "per_hand"), summary.sessions.single().results[0].load)
         assertEquals(Load(60.0, "lb", mode = "assistance"), summary.sessions.single().results[1].load)
         assertEquals(11, s.snapshot!!.items.sumOf { it.sets.size })
+    }
+    @Test fun `历史动作缺少教学说明仍可保存计划并记录真实训练`() {
+        val historicalExercise = dumbbell.copy(
+            id = "historical-machine-flat-press",
+            name = "历史器械胸推",
+            instructions = emptyList(),
+            notes = "未记录具体形式"
+        )
+        val historicalPlan = Plan(
+            "historical-machine-plan", "历史器械计划",
+            items = listOf(PlanItem(
+                "historical-machine-item", historicalExercise.id,
+                sets = listOf(SetTarget(reps = 10, load = Load(20.0, "kg", "per_hand")))
+            ))
+        )
+        val date = java.time.Instant.ofEpochMilli(start).atZone(ZoneId.of("Asia/Shanghai")).toLocalDate()
+        val recorded = Session(
+            id = dailySessionId(date), name = historicalPlan.name, snapshot = historicalPlan,
+            exercises = listOf(historicalExercise), startedAt = start, endedAt = start + 20_000,
+            status = "completed",
+            results = listOf(SetResult("historical-machine-item", 0, reps = 10,
+                load = Load(20.0, "kg", "per_hand"), completedAt = start + 1_000)),
+            items = historicalPlan.items, localDate = date.toString()
+        )
+        Store(directory.resolve("historical-exercise-without-instructions"), seed).use { store ->
+            store.put(document(Kind.exercise, historicalExercise.id, historicalExercise))
+            store.put(document(Kind.plan, historicalPlan.id, historicalPlan))
+            store.put(document(Kind.session, recorded.id, recorded))
+            assertEquals(emptyList(), store.get(Kind.exercise, historicalExercise.id)!!.value<Exercise>().instructions)
+            assertEquals(historicalPlan, store.get(Kind.plan, historicalPlan.id)!!.value<Plan>())
+            val saved = store.get(Kind.session, recorded.id)!!.value<Session>()
+            assertEquals(historicalExercise, saved.exercises.single())
+            assertEquals(10, saved.results.single().reps)
+        }
     }
     @Test fun `独立活动在SQLite和完整备份中保留且不计入力量组`() {
         val activity = ActivityRecord(
@@ -161,7 +209,7 @@ class TrainingBehaviorTest {
             val bytes = java.io.ByteArrayOutputStream()
             Archives(source, store).export(bytes)
             val backup = readBackup(bytes.toByteArray().inputStream(), directory.resolve("activity-backup-media"))
-            assertEquals(4, backup.formatVersion)
+            assertEquals(6, backup.formatVersion)
             assertEquals(setOf(activity, hike), backup.documents.filter { it.kind == Kind.activity }.map { it.value<ActivityRecord>() }.toSet())
 
             Store(directory.resolve("activity-restored"), seed).use { restored ->
@@ -187,14 +235,16 @@ class TrainingBehaviorTest {
 
     @Test fun `历史日期和组内降重在真实SQLite中保留且只计一组`() {
         val history = Session(
-            id = "historical", name = "历史训练", snapshot = null, exercises = listOf(dumbbell),
+            id = dailySessionId(LocalDate.parse("2026-10-13")), name = "历史训练", snapshot = null, exercises = listOf(dumbbell),
             startedAt = null, endedAt = null, status = "completed",
             results = listOf(SetResult("actual", 0, reps = 10, completedAt = null, segments = listOf(
                 SetSegment(4, Load(10.0, "kg", "unknown")),
                 SetSegment(6, Load(7.5, "kg", "per_hand"))
             ))),
             items = listOf(PlanItem("actual", dumbbell.id, sets = emptyList())),
-            historicalSource = HistoricalSource("source-2026-10-13", "2026-10-13")
+            localDate = "2026-10-13",
+            sourceRecords = listOf(SessionSource("historical", "历史训练", "2026-10-13",
+                historicalSource = HistoricalSource("source-2026-10-13", "2026-10-13"), itemIds = listOf("actual")))
         )
         Store(directory.resolve("history-date"), seed).use { store ->
             val saved = store.put(document(Kind.session, history.id, history))
@@ -206,7 +256,7 @@ class TrainingBehaviorTest {
             assertEquals(LocalDate.parse("2026-10-13"), sessionDate(restored))
             val olderTime = LocalDate.parse("2026-10-12").atStartOfDay(ZoneId.of("Asia/Shanghai")).toInstant().toEpochMilli()
             val realOlder = session("older-realtime", "push", "completed", olderTime)
-            assertEquals("historical", summarizeHistory(listOf(realOlder, restored)).sessions.first().id)
+            assertEquals(dailySessionId(LocalDate.parse("2026-10-13")), summarizeHistory(listOf(realOlder, restored)).sessions.first().id)
             assertEquals(1, restored.results.size)
             assertEquals(2, restored.results.single().segments.size)
             assertEquals(listOf(4, 6), restored.results.single().segments.map { it.reps })
@@ -214,95 +264,109 @@ class TrainingBehaviorTest {
             assertEquals(listOf("unknown", "per_hand"), restored.results.single().segments.map { it.load?.meaning })
         }
     }
-    @Test fun `历史多段备份迁移并导出时清理废弃来源字段`() {
+    @Test fun `旧备份合并到每日格式且v5完整往返`() {
+        val date = "2026-10-13"
         val history = Session(
-            id = "backup-history", name = "历史训练", snapshot = null, exercises = listOf(dumbbell),
+            id = dailySessionId(LocalDate.parse(date)), name = "历史训练", snapshot = null, exercises = listOf(dumbbell),
             startedAt = null, endedAt = null, status = "completed", notes = "原有反馈",
             results = listOf(SetResult("actual", 0, reps = 10, segments = listOf(
                 SetSegment(4, Load(10.0, "kg", "unknown")), SetSegment(6, Load(7.5, "kg", "per_hand"))
             ))),
-            items = listOf(PlanItem("actual", dumbbell.id, sets = emptyList())),
-            historicalSource = HistoricalSource("backup-source", "2026-10-13")
+            items = listOf(PlanItem("actual", dumbbell.id, sets = emptyList())), localDate = date,
+            sourceRecords = listOf(SessionSource("backup-history", "历史训练", date,
+                historicalSource = HistoricalSource("backup-source", date), itemIds = listOf("actual")))
         )
         val sourceWithLegacyText = JsonObject(
-            wireJson.encodeToJsonElement(history.historicalSource!!).jsonObject +
+            wireJson.encodeToJsonElement(HistoricalSource("backup-source", date)).jsonObject +
                 ("originalText" to JsonPrimitive("legacy source"))
         )
-        val oldDocument = document(Kind.session, history.id, history).let {
-            it.copy(data = JsonObject(it.data + ("historicalSource" to sourceWithLegacyText)))
-        }
-        val legacy = Backup(formatVersion = 2, documents = listOf(oldDocument), exportedAt = start)
-        val legacyBytes = java.io.ByteArrayOutputStream()
-        java.util.zip.ZipOutputStream(legacyBytes).use { zip ->
-            zip.putNextEntry(java.util.zip.ZipEntry("data.json"))
-            zip.write(wireJson.encodeToString(legacy).toByteArray())
-            zip.closeEntry()
-        }
-        val migrated = readBackup(legacyBytes.toByteArray().inputStream(), directory.resolve("backup-media-v2"))
-        val migratedDoc = migrated.documents.single()
-        val versionOne = legacy.copy(formatVersion = 1)
-        val versionOneBytes = java.io.ByteArrayOutputStream()
-        java.util.zip.ZipOutputStream(versionOneBytes).use { zip ->
-            zip.putNextEntry(java.util.zip.ZipEntry("data.json"))
-            zip.write(wireJson.encodeToString(versionOne).toByteArray())
-            zip.closeEntry()
-        }
-        val migratedV1 = readBackup(versionOneBytes.toByteArray().inputStream(), directory.resolve("backup-media-v1"))
-        assertEquals(1, migratedV1.formatVersion)
-        assertEquals(history, migratedV1.documents.single().value<Session>())
+        val legacyData = JsonObject(
+            wireJson.encodeToJsonElement(history).jsonObject - setOf("localDate", "sourceRecords") +
+                mapOf("id" to JsonPrimitive("backup-history"), "historicalSource" to sourceWithLegacyText)
+        )
+        val oldDocument = Document(Kind.session, "backup-history", legacyData)
+        fun zipped(backup: Backup): ByteArray = java.io.ByteArrayOutputStream().also { bytes ->
+            java.util.zip.ZipOutputStream(bytes).use { zip ->
+                zip.putNextEntry(java.util.zip.ZipEntry("data.json"))
+                zip.write(wireJson.encodeToString(backup).toByteArray())
+                zip.closeEntry()
+            }
+        }.toByteArray()
 
-        val versionThree = Backup(formatVersion = 3, documents = listOf(document(Kind.session, history.id, history)), exportedAt = start)
-        val versionThreeBytes = java.io.ByteArrayOutputStream()
-        java.util.zip.ZipOutputStream(versionThreeBytes).use { zip ->
-            zip.putNextEntry(java.util.zip.ZipEntry("data.json"))
-            zip.write(wireJson.encodeToString(versionThree).toByteArray())
-            zip.closeEntry()
+        for (version in 1..2) {
+            val backup = readBackup(
+                zipped(Backup(formatVersion = version, documents = listOf(oldDocument), exportedAt = start)).inputStream(),
+                directory.resolve("backup-media-v$version")
+            )
+            assertEquals(version, backup.formatVersion)
+            assertEquals(listOf("backup-history"), backup.documents.filter { it.kind == Kind.session && !it.deleted }.map { it.id })
+            val migrated = mergeImportedSessions(emptyList(), backup.documents, replace = false)
+            val restored = migrated.single { it.kind == Kind.session && !it.deleted }.value<Session>()
+            assertEquals(history.results.single().copy(itemId = restored.items.single().id), restored.results.single())
         }
-        val restoredV3 = readBackup(versionThreeBytes.toByteArray().inputStream(), directory.resolve("backup-media-v3"))
-        assertEquals(3, restoredV3.formatVersion)
-        assertEquals(history, restoredV3.documents.single().value<Session>())
-        assertEquals(history, migratedDoc.value<Session>())
-        assertFalse(migratedDoc.data["historicalSource"].toString().contains("originalText"))
+        for (version in 3..5) {
+            val restored = readBackup(
+                zipped(Backup(formatVersion = version, documents = listOf(document(Kind.session, history.id, history)), exportedAt = start)).inputStream(),
+                directory.resolve("backup-media-v$version")
+            )
+            assertEquals(version, restored.formatVersion)
+            assertEquals(history.results, restored.documents.single { it.kind == Kind.session && !it.deleted }.value<Session>().results)
+        }
+        assertFails { readBackup(zipped(Backup(formatVersion = 3, documents = listOf(oldDocument), exportedAt = start)).inputStream(),
+            directory.resolve("backup-media-invalid-v3")) }
 
         Store(directory.resolve("legacy-store"), seed + oldDocument).use { store ->
-            val storedOld = store.get(Kind.session, history.id)!!
-            assertEquals(history, storedOld.value<Session>())
-            val updated = store.put(
-                document(Kind.session, history.id, storedOld.value<Session>().copy(notes = "修改后的反馈")),
-                storedOld.revision
-            )
+            val canonicalId = dailySessionId(LocalDate.parse(date))
+            val stored = store.get(Kind.session, canonicalId)!!
+            val restoredHistory = stored.value<Session>()
+            assertEquals(history.results.single().copy(itemId = restoredHistory.items.single().id), restoredHistory.results.single())
+            assertTrue(store.get(Kind.session, "backup-history")!!.deleted)
+            val updated = store.put(document(Kind.session, canonicalId, stored.value<Session>().copy(notes = "修改后的反馈")), stored.revision)
             assertEquals("修改后的反馈", updated.value<Session>().notes)
-            assertFalse(updated.data["historicalSource"].toString().contains("originalText"))
-            assertFails { store.put(oldDocument, updated.revision) }
+            store.import(Backup(formatVersion = 2, documents = listOf(oldDocument), exportedAt = start), false)
+            assertEquals("修改后的反馈", store.get(Kind.session, canonicalId)!!.value<Session>().notes)
 
             val exportedBytes = java.io.ByteArrayOutputStream()
             Archives(directory.resolve("legacy-store"), store).export(exportedBytes)
             val exported = readBackup(exportedBytes.toByteArray().inputStream(), directory.resolve("backup-media-export"))
-            assertEquals(4, exported.formatVersion)
-            val exportedSession = exported.documents.single { it.kind == Kind.session && it.id == history.id }
-            assertEquals("修改后的反馈", exportedSession.value<Session>().notes)
-            assertFalse(exportedSession.data["historicalSource"].toString().contains("originalText"))
+            assertEquals(6, exported.formatVersion)
+            assertEquals("修改后的反馈", exported.documents.single { it.kind == Kind.session && !it.deleted }.value<Session>().notes)
         }
-        val invalidV3 = legacy.copy(formatVersion = 3)
-        val invalidV3Bytes = java.io.ByteArrayOutputStream()
-        java.util.zip.ZipOutputStream(invalidV3Bytes).use { zip ->
-            zip.putNextEntry(java.util.zip.ZipEntry("data.json"))
-            zip.write(wireJson.encodeToString(invalidV3).toByteArray())
-            zip.closeEntry()
+        val invalid = history.copy(status = "active")
+        assertFails {
+            validateDocument(document(Kind.session, invalid.id, invalid), { emptyList() }, { _, _ -> null })
         }
-        assertFails { readBackup(invalidV3Bytes.toByteArray().inputStream(), directory.resolve("backup-media-invalid-v3")) }
-        val invalidV4 = legacy.copy(formatVersion = 4)
-        val invalidV4Bytes = java.io.ByteArrayOutputStream()
-        java.util.zip.ZipOutputStream(invalidV4Bytes).use { zip ->
-            zip.putNextEntry(java.util.zip.ZipEntry("data.json"))
-            zip.write(wireJson.encodeToString(invalidV4).toByteArray())
-            zip.closeEntry()
-        }
-        assertFails { readBackup(invalidV4Bytes.toByteArray().inputStream(), directory.resolve("backup-media-invalid-v4")) }
-        Store(directory.resolve("reject-legacy-write"), seed).use { store ->
-            assertFails { store.put(oldDocument) }
-            assertFails { store.put(document(Kind.session, "invalid-active-history", history.copy(id = "invalid-active-history", status = "active"))) }
-            assertFails { store.put(document(Kind.session, "invalid-planned-history", history.copy(id = "invalid-planned-history", snapshot = plan()))) }
+    }
+    @Test fun `同日旧记录幂等归并保留分类分段与原单位`() {
+        val date = "2026-10-30"
+        fun legacy(id: String, label: String, load: Load, feedback: String) = Session(
+            id, "${label}训练", null, listOf(dumbbell), null, status = "completed",
+            results = listOf(SetResult("same-item", 0, reps = 10, segments = listOf(SetSegment(4, load), SetSegment(6, load.copy(value = load.value / 2))))),
+            notes = feedback, items = listOf(PlanItem("same-item", dumbbell.id, sets = listOf(SetTarget(reps = 10)))),
+            splitSlotName = label, localDate = date
+        )
+        val sources = listOf(
+            document(Kind.session, "legacy-pull", legacy("legacy-pull", "拉", Load(85.0, "lb", "unknown"), "反馈甲")),
+            document(Kind.session, "legacy-legs", legacy("legacy-legs", "腿", Load(80.0, "kg", "per_side"), "反馈乙"))
+        )
+        val normalized = normalizeDailySessionDocuments(sources)
+        val merged = normalized.single { it.kind == Kind.session && !it.deleted }.value<Session>()
+        assertEquals(dailySessionId(LocalDate.parse(date)), merged.id)
+        assertEquals(2, merged.results.size)
+        assertEquals(listOf("腿", "拉"), sessionTrainingLabels(merged))
+        assertEquals(setOf("lb", "kg"), merged.results.flatMap { it.segments }.mapNotNull { it.load?.unit }.toSet())
+        assertEquals(setOf("unknown", "per_side"), merged.results.flatMap { it.segments }.mapNotNull { it.load?.meaning }.toSet())
+        assertEquals(merged, normalizeDailySessionDocuments(normalized).single { it.kind == Kind.session && !it.deleted }.value<Session>())
+        val reversed = normalizeDailySessionDocuments(sources.reversed())
+            .single { it.kind == Kind.session && !it.deleted }.value<Session>()
+        assertEquals(merged, reversed)
+
+        Store(directory.resolve("daily-merge"), seed + sources).use { store ->
+            val saved = store.list(Kind.session).filterNot { it.deleted }
+            assertEquals(1, saved.size)
+            assertEquals(2, saved.single().value<Session>().results.size)
+            assertTrue(store.get(Kind.session, "legacy-pull")!!.deleted)
+            assertTrue(store.get(Kind.session, "legacy-legs")!!.deleted)
         }
     }
 
@@ -327,14 +391,14 @@ class TrainingBehaviorTest {
             val savedArrangement = store.get(Kind.arrangement, "current")!!.value<Arrangement>()
             val sessionsAfterManual = store.list(Kind.session).map { it.value<Session>() }
             assertEquals("legs", nextSlot(program, sessionsAfterManual, savedArrangement.nextOverrides[program.id]).id)
-            val cancelled = session("cancelled-manual-next", "legs", "cancelled", start + 10000).copy(
+            val cancelled = session("cancelled-manual-next", "legs", "cancelled", start + 86_400_000).copy(
                 results = emptyList(), arrangementOverrideId = nextOverride.id
             )
             store.put(document(Kind.session, cancelled.id, cancelled))
             val sessionsAfterCancelled = store.list(Kind.session).map { it.value<Session>() }
             assertEquals("legs", nextSlot(program, sessionsAfterCancelled, savedArrangement.nextOverrides[program.id]).id)
             assertEquals("push", nextSlot(program, sessionsAfterManual, override).id)
-            val nextPush = session("after-manual-push", "push", "completed", start + 20000).copy(snapshot = plan("push-after", "push"))
+            val nextPush = session("after-manual-push", "push", "completed", start + 172_800_000).copy(snapshot = plan("push-after", "push"))
             store.put(document(Kind.session, nextPush.id, nextPush))
             val sessionsAfterPush = store.list(Kind.session).map { it.value<Session>() }
             assertEquals("pull", nextSlot(program, sessionsAfterPush, override).id)
@@ -423,16 +487,290 @@ class TrainingBehaviorTest {
         }
     }
 
-    @Test fun `明确替换导入仍不能改写已开始训练的目标`() {
+    @Test fun `普通写入不能改写已开始训练的原计划而完整v5恢复可以`() {
         Store(directory, seed).use { store ->
             val started = session("immutable-import", "push", "active", start)
-            store.put(document(Kind.session, started.id, started))
+            val stored = store.put(document(Kind.session, started.id, started))
             val changed = started.copy(snapshot = started.snapshot!!.copy(items = started.snapshot!!.items.map { item ->
                 item.copy(sets = item.sets.map { it.copy(reps = 12) })
             }))
-            val backup = Backup(documents = listOf(document(Kind.session, changed.id, changed)), exportedAt = start + 2000)
-            assertFailsWith<IllegalArgumentException> { store.import(backup, true) }
-            assertEquals(started, store.get(Kind.session, started.id)!!.value<Session>())
+            assertFailsWith<IllegalArgumentException> {
+                store.put(document(Kind.session, changed.id, changed), stored.revision)
+            }
+            val backup = Backup(formatVersion = 5, documents = listOf(document(Kind.session, changed.id, changed)), exportedAt = start + 2000)
+            store.import(backup, replace = true)
+            assertEquals(changed, store.get(Kind.session, started.id)!!.value<Session>())
+        }
+    }
+
+    @Test fun `Mutation完整日恢复允许撤销追加且过期修订仍冲突`() {
+        Store(directory, seed).use { store ->
+            val baseline = session("mutation-restore", "push", "completed", start)
+            val baselineDoc = store.put(document(Kind.session, baseline.id, baseline))
+            val extra = PlanItem("post-backup-item", assisted.id, sets = listOf(SetTarget(reps = 6)))
+            val extended = baseline.copy(
+                exercises = baseline.exercises + assisted,
+                items = listOf(baseline.items.single().copy(sets = baseline.items.single().sets + SetTarget(reps = 8))) + extra,
+                results = baseline.results + SetResult(extra.id, 0, reps = 6, completedAt = start + 2000),
+                sourceRecords = listOf(SessionSource("post-backup-source", "新增来源", baseline.localDate, itemIds = listOf(extra.id)))
+            )
+            val extendedDoc = store.put(document(Kind.session, baseline.id, extended), baselineDoc.revision)
+
+            assertFailsWith<IllegalArgumentException> {
+                store.sync(SyncRequest(mutations = listOf(Mutation(baselineDoc, extendedDoc.revision))))
+            }
+            val restored = store.sync(SyncRequest(mutations = listOf(
+                Mutation(baselineDoc, extendedDoc.revision, restoreSession = true)
+            ))).accepted.single()
+            assertEquals(baseline, restored.value<Session>())
+            val staleRestore = document(Kind.session, baseline.id, baseline.copy(notes = "过期恢复内容"))
+            assertEquals(1, store.sync(SyncRequest(mutations = listOf(
+                Mutation(staleRestore, restored.revision - 1, restoreSession = true)
+            ))).conflicts.size)
+            assertEquals(baseline, store.get(Kind.session, baseline.id)!!.value<Session>())
+
+            assertFailsWith<IllegalArgumentException> {
+                store.sync(SyncRequest(mutations = listOf(
+                    Mutation(document(Kind.plan, "plan-invalid-restore", plan("plan-invalid-restore")), 0, restoreSession = true)
+                )))
+            }
+        }
+    }
+    @Test fun `canonical归一与v5备份保持原payload且旧省略items使用snapshot动作`() {
+        val canonical = session("payload", "push", "completed", start)
+        val canonicalDoc = document(Kind.session, canonical.id, canonical)
+        assertEquals(canonicalDoc, normalizeDailySessionDocuments(listOf(canonicalDoc)).single())
+        val bytes = java.io.ByteArrayOutputStream()
+        writeBackup(Backup(documents = listOf(canonicalDoc), exportedAt = start), bytes) { null }
+        val restored = readBackup(bytes.toByteArray().inputStream(), directory.resolve("canonical-media"))
+        assertEquals(canonicalDoc.data, restored.documents.single().data)
+
+        val date = canonical.localDate
+        val historical = Session(
+            id = "legacy-items", name = "旧训练", snapshot = canonical.snapshot, exercises = canonical.exercises,
+            startedAt = start, endedAt = start + 10000, status = "completed",
+            results = listOf(canonical.results.single().copy(itemId = "item")),
+            skippedItems = listOf("item"), localDate = date
+        )
+        val oldData = JsonObject(
+            wireJson.encodeToJsonElement(historical).jsonObject - setOf("items", "localDate", "sourceRecords") +
+                mapOf("historicalSource" to wireJson.encodeToJsonElement(HistoricalSource("legacy-items", date)))
+        )
+        val oldDoc = Document(Kind.session, "legacy-items", oldData)
+        assertFails { oldDoc.value<Session>() }
+        val migrated = normalizeDailySessionDocuments(listOf(oldDoc)).single { it.kind == Kind.session && !it.deleted }.value<Session>()
+        assertEquals(1, migrated.results.size)
+        assertEquals(migrated.items.single().id, migrated.results.single().itemId)
+        assertEquals(migrated.items.single().id, migrated.skippedItems.single())
+
+        val v5Bytes = java.io.ByteArrayOutputStream()
+        java.util.zip.ZipOutputStream(v5Bytes).use { zip ->
+            zip.putNextEntry(java.util.zip.ZipEntry("data.json"))
+            zip.write(wireJson.encodeToString(Backup(formatVersion = 5, documents = listOf(oldDoc), exportedAt = start)).toByteArray())
+            zip.closeEntry()
+        }
+        assertFailsWith<IllegalArgumentException> {
+            readBackup(v5Bytes.toByteArray().inputStream(), directory.resolve("noncanonical-v5"))
+        }
+    }
+
+    @Test fun `独立旧来源可增量导入幂等冲突替换并保留其他来源`() {
+        val date = "2026-10-29"
+        fun legacy(id: String, value: Double, feedback: String, label: String) = Session(
+            id = id, name = "${label}训练", snapshot = null, exercises = listOf(dumbbell),
+            startedAt = null, endedAt = null, status = "completed",
+            results = listOf(SetResult("item", 0, reps = 10, load = Load(value, "kg", "per_hand"))),
+            notes = feedback, items = listOf(PlanItem("item", dumbbell.id, sets = listOf(SetTarget(reps = 10)))),
+            splitSlotName = label, localDate = date
+        )
+        val a = document(Kind.session, "source-a", legacy("source-a", 20.0, "来源A反馈", "推"))
+        val b = document(Kind.session, "source-b", legacy("source-b", 30.0, "来源B反馈", "拉"))
+        Store(directory.resolve("incremental-import"), seed).use { store ->
+            store.import(Backup(formatVersion = 4, documents = listOf(a), exportedAt = start), replace = false)
+            store.import(Backup(formatVersion = 4, documents = listOf(b), exportedAt = start), replace = false)
+            val canonicalId = dailySessionId(LocalDate.parse(date))
+            val first = store.get(Kind.session, canonicalId)!!.value<Session>()
+            assertEquals(2, first.results.size)
+            assertEquals(setOf("推", "拉"), sessionTrainingLabels(first).toSet())
+            assertTrue(first.notes.contains("来源A反馈") && first.notes.contains("来源B反馈"))
+            store.import(Backup(formatVersion = 4, documents = listOf(b), exportedAt = start), replace = false)
+            assertEquals(first, store.get(Kind.session, canonicalId)!!.value<Session>())
+
+            val correctedB = document(Kind.session, "source-b", legacy("source-b", 35.0, "修正来源B", "拉"))
+            assertFailsWith<ImportConflict> {
+                store.import(Backup(formatVersion = 4, documents = listOf(correctedB), exportedAt = start), replace = false)
+            }
+            store.import(Backup(formatVersion = 4, documents = listOf(correctedB), exportedAt = start), replace = true)
+            val replaced = store.get(Kind.session, canonicalId)!!.value<Session>()
+            assertEquals(2, replaced.results.size)
+            assertEquals(20.0, replaced.results.first { it.load?.value == 20.0 }.load?.value)
+            assertTrue(replaced.results.any { it.load?.value == 35.0 })
+            assertTrue(replaced.notes.contains("来源A反馈") && replaced.notes.contains("修正来源B"))
+            assertFalse(replaced.notes.contains("来源B反馈"))
+        }
+    }
+
+    @Test fun `追加待执行目标保留已有目标前缀与实际组事实`() {
+        val started = session("append-target", "push", "completed", start)
+        val oldDoc = document(Kind.session, started.id, started)
+        val appendedItem = started.items.single().copy(sets = started.items.single().sets + started.items.single().sets.last())
+        val appended = document(Kind.session, started.id, started.copy(items = listOf(appendedItem)))
+        validateDocument(
+            appended,
+            list = { kind -> if (kind == Kind.session) listOf(oldDoc) else emptyList() },
+            lookup = { kind, id -> if (kind == Kind.session && id == oldDoc.id) oldDoc else null }
+        )
+        val changedPrefix = started.items.single().copy(sets = listOf(started.items.single().sets.first().copy(reps = 11)) + started.items.single().sets.drop(1))
+        assertFailsWith<IllegalArgumentException> {
+            validateDocument(
+                document(Kind.session, started.id, started.copy(items = listOf(changedPrefix))),
+                list = { kind -> if (kind == Kind.session) listOf(oldDoc) else emptyList() },
+                lookup = { kind, id -> if (kind == Kind.session && id == oldDoc.id) oldDoc else null }
+            )
+        }
+    }
+    @Test fun `既有完成组可纠正撤销且历史记录可不伪造开始时间继续`() {
+        val date = "2026-10-18"
+        val history = Session(
+            id = dailySessionId(LocalDate.parse(date)), name = "旧训练", snapshot = null,
+            exercises = listOf(dumbbell), startedAt = null, endedAt = null, status = "completed",
+            results = listOf(SetResult("actual", 0, reps = 10)),
+            items = listOf(PlanItem("actual", dumbbell.id, sets = emptyList())),
+            localDate = date,
+            sourceRecords = listOf(SessionSource(
+                "source-history", "旧训练", date,
+                historicalSource = HistoricalSource("source-history", date), itemIds = listOf("actual")
+            ))
+        )
+        Store(directory.resolve("history-resume"), seed).use { store ->
+            var saved = store.put(document(Kind.session, history.id, history))
+            val corrected = history.copy(results = listOf(history.results.single().copy(reps = 12, load = Load(18.0, "lb", "unknown"))))
+            saved = store.put(document(Kind.session, history.id, corrected), saved.revision)
+            assertEquals(12, saved.value<Session>().results.single().reps)
+            assertEquals("lb", saved.value<Session>().results.single().load?.unit)
+
+            val revoked = corrected.copy(status = "cancelled", results = emptyList())
+            saved = store.put(document(Kind.session, history.id, revoked), saved.revision)
+            assertTrue(saved.value<Session>().results.isEmpty())
+            val active = revoked.copy(status = "active")
+            saved = store.put(document(Kind.session, history.id, active), saved.revision)
+            assertNull(saved.value<Session>().snapshot)
+            assertNull(saved.value<Session>().startedAt)
+
+            val appended = active.copy(results = listOf(SetResult(
+                "actual", 0, reps = 8, completedAt = start + 3000
+            )))
+            saved = store.put(document(Kind.session, history.id, appended), saved.revision)
+            assertEquals(start + 3000, saved.value<Session>().results.single().completedAt)
+            val ended = appended.copy(status = "cancelled", endedAt = start + 5000)
+            saved = store.put(document(Kind.session, history.id, ended), saved.revision)
+            assertEquals(start + 5000, saved.value<Session>().endedAt)
+        }
+    }
+
+    @Test fun `过去已选计划复制为稳定模板优先于历史且不使用未来计划`() {
+        val date = LocalDate.parse("2026-10-28")
+        val pushProgram = program.copy(slots = program.slots.map { if (it.id == "push") it.copy(name = "推") else it })
+        val adjusted = plan("manually-adjusted", "push").copy(
+            date = "2026-10-22", notes = "计划备注",
+            items = listOf(PlanItem(
+                "adjusted-item", dumbbell.id, sets = listOf(SetTarget(reps = 7, load = Load(24.0, "lb", "unknown"))),
+                notes = "动作备注"
+            ))
+        )
+        val fromPast = resolveTrainingPlan(
+            pushProgram, pushProgram.slots.first(), listOf(adjusted), listOf(imported("history-push", "2026-10-27", "推")),
+            mapOf("push" to adjusted.id), date
+        )!!
+        assertNotEquals(adjusted.id, fromPast.id)
+        assertNull(fromPast.date)
+        assertEquals(adjusted.items, fromPast.items)
+        assertEquals(adjusted.notes, fromPast.notes)
+        val copiedItem = fromPast.items.single()
+        assertEquals(7, copiedItem.sets.single().reps)
+        assertEquals(Load(24.0, "lb", "unknown"), copiedItem.sets.single().load)
+        assertEquals("动作备注", copiedItem.notes)
+        assertEquals(fromPast, resolveTrainingPlan(
+            pushProgram, pushProgram.slots.first(), listOf(adjusted), listOf(imported("history-push", "2026-10-27", "推")),
+            mapOf("push" to adjusted.id), date
+        ))
+
+        val future = adjusted.copy(id = "future-plan", date = "2026-10-29")
+        val fromHistory = resolveTrainingPlan(
+            pushProgram, pushProgram.slots.first(), listOf(future),
+            listOf(imported("history-push-fallback", "2026-10-27", "推")), emptyMap(), date
+        )!!
+        assertNotEquals(future.id, fromHistory.id)
+        assertNull(fromHistory.date)
+        assertEquals(10, fromHistory.items.single().sets.first().reps)
+    }
+
+    @Test fun `v5完整日恢复撤销备份后追加且删除日不能静默复活`() {
+        val date = "2026-10-29"
+        val legacy = Session(
+            "source-v5", "旧训练", null, listOf(dumbbell), null, status = "completed",
+            results = listOf(SetResult("old-item", 0, reps = 10)),
+            notes = "来源反馈", items = listOf(PlanItem("old-item", dumbbell.id, sets = listOf(SetTarget(reps = 10)))),
+            splitSlotName = "推", localDate = date
+        )
+        Store(directory.resolve("v5-restore"), seed).use { store ->
+            store.import(Backup(formatVersion = 4, documents = listOf(document(Kind.session, "source-v5", legacy)), exportedAt = start), false)
+            val dayId = dailySessionId(LocalDate.parse(date))
+            val currentDoc = store.get(Kind.session, dayId)!!
+            val current = currentDoc.value<Session>()
+            val extra = PlanItem("restored-native", assisted.id, sets = listOf(SetTarget(reps = 8)), notes = "原生动作")
+            val canonical = current.copy(
+                notes = "v5根级反馈",
+                exercises = current.exercises + assisted,
+                items = current.items + extra,
+                skippedItems = listOf(extra.id)
+            )
+            val bytes = java.io.ByteArrayOutputStream()
+            writeBackup(
+                Backup(formatVersion = 5, documents = listOf(document(Kind.session, dayId, canonical)), exportedAt = start),
+                bytes
+            ) { null }
+            val backup = readBackup(bytes.toByteArray().inputStream(), directory.resolve("v5-restore-media"))
+                .copy(formatVersion = 5, healthManifest = null)
+            assertFailsWith<ImportConflict> { store.import(backup, replace = false) }
+            store.import(backup, replace = true)
+            val initialRestore = store.get(Kind.session, dayId)!!.value<Session>()
+            assertEquals("v5根级反馈", initialRestore.notes)
+            assertTrue(initialRestore.items.any { it.id == extra.id })
+            assertEquals(listOf(extra.id), initialRestore.skippedItems)
+            assertTrue(initialRestore.exercises.any { it.id == assisted.id })
+            val second = Session(
+                "source-v5-second", "另一来源", null, listOf(dumbbell), null, status = "completed",
+                results = listOf(SetResult("second-item", 0, reps = 8)),
+                items = listOf(PlanItem("second-item", dumbbell.id, sets = listOf(SetTarget(reps = 8)))),
+                splitSlotName = "拉", localDate = date
+            )
+            store.import(
+                Backup(formatVersion = 4, documents = listOf(document(Kind.session, second.id, second)), exportedAt = start + 1000),
+                replace = false
+            )
+            val afterSourceDoc = store.get(Kind.session, dayId)!!
+            val afterSource = afterSourceDoc.value<Session>()
+            val laterItem = PlanItem("post-backup-native", dynamic.id, sets = listOf(SetTarget(reps = 5)))
+            val afterBackupChanges = afterSource.copy(
+                exercises = afterSource.exercises + dynamic,
+                items = afterSource.items.map { item ->
+                    if (item.id == extra.id) item.copy(sets = item.sets + SetTarget(reps = 9)) else item
+                } + laterItem,
+                results = afterSource.results + SetResult(laterItem.id, 0, reps = 5, completedAt = start + 4000)
+            )
+            store.put(document(Kind.session, dayId, afterBackupChanges), afterSourceDoc.revision)
+            assertTrue(store.get(Kind.session, dayId)!!.value<Session>().sourceRecords.any { it.sourceId == second.id })
+
+            store.import(backup, replace = true)
+            val restored = store.get(Kind.session, dayId)!!.value<Session>()
+            assertEquals(canonical, restored)
+            assertFalse(restored.items.any { it.id == "second-item" || it.id == laterItem.id })
+            assertFalse(restored.sourceRecords.any { it.sourceId == second.id })
+
+            val restoredDoc = store.get(Kind.session, dayId)!!
+            store.sync(SyncRequest(mutations = listOf(Mutation(restoredDoc.copy(deleted = true), restoredDoc.revision))))
+            assertFailsWith<ImportConflict> { store.import(backup, replace = false) }
         }
     }
 }

@@ -42,6 +42,7 @@ import top.e404.training.shared.*
     var stretchPosition by rememberSaveable { mutableIntStateOf(0) }
     var saving by remember { mutableStateOf(false) }
     var details by remember { mutableStateOf<Exercise?>(null) }
+    var selectedExercise by remember { mutableStateOf<Exercise?>(null) }
     val exercises = remember(state.documents[Kind.exercise]) { state.records(Kind.exercise).associate { it.id to it.value<Exercise>() } }
     val equipment = remember(state.documents[Kind.equipment]) { state.records(Kind.equipment).map { it.value<Equipment>() } }
     val muscles = remember(state.documents[Kind.muscle]) { state.records(Kind.muscle).associate { it.id to it.displayName() } }
@@ -91,7 +92,7 @@ import top.e404.training.shared.*
                         Text(candidate.style.description)
                         Text("${candidate.days.size} 项训练 · 每项 $actions 个动作、${actions * groups} 组")
                         candidate.days.forEach { section -> Text("${section.name}：${section.exercises.joinToString("、") { it.name }}", style = MaterialTheme.typography.bodySmall) }
-                        Text("器械条件：" + candidate.days.flatMap { it.exercises }.flatMap { it.equipmentTags }.distinct().joinToString("、") { tags[it] ?: it }, style = MaterialTheme.typography.bodySmall)
+                        Text("器械条件：" + equipmentRequirementText(candidate.days.flatMap { it.exercises }.flatMap { it.equipmentTags }.distinct(), tags), style = MaterialTheme.typography.bodySmall)
                         candidate.unavailable.forEach { Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall) }
                     }
                 }
@@ -145,13 +146,20 @@ import top.e404.training.shared.*
         val plan = draftPlans[index]
         if (stretchDraft == null) ExercisePicker(state, viewModel.repository, plan.gymId,
             plan.items.mapNotNull { exercises[it.exerciseId] }.filter { it.type == "strength" }.flatMap { it.muscles + it.secondaryMuscles }.toSet(),
-            "stretch", { stretchIndex = null }) { exercise -> stretchDraft = newPlanItem(exercise, plan.gymId, state); stretchPosition = plan.items.size }
+            "stretch", { stretchIndex = null }) { exercise ->
+                selectedExercise = exercise
+                stretchDraft = newPlanItem(exercise, plan.gymId, state)
+                stretchPosition = plan.items.size
+            }
         stretchDraft?.let { item ->
-            PlanItemEditor(item, exercises.getValue(item.exerciseId), plan.gymId, state, viewModel,
+            val exercise = exercises[item.exerciseId] ?: selectedExercise?.takeIf { it.id == item.exerciseId } ?: return@let
+            PlanItemEditor(item, exercise, plan.gymId, state, viewModel,
                 (0..plan.items.size).map { position -> position to if (position == 0) "放在最前面" else "放在${exercises[plan.items[position - 1].exerciseId]?.name}之后" },
-                stretchPosition, { stretchDraft = null; stretchIndex = null }) { updated, position ->
+                stretchPosition, { stretchDraft = null; selectedExercise = null; stretchIndex = null },
+                allowMeasurementChange = exercise.id.startsWith("smartworkout_")
+            ) { updated, position ->
                 draftPlans = draftPlans.mapIndexed { i, old -> if (i == index) old.copy(items = old.items.toMutableList().apply { add(position, updated) }) else old }
-                stretchDraft = null; stretchIndex = null
+                stretchDraft = null; selectedExercise = null; stretchIndex = null
             }
         }
     }
@@ -172,7 +180,7 @@ import top.e404.training.shared.*
         Text("${index + 1}. ${exercise?.name ?: "动作资料尚未取得"} · ${item.sets.size} 组", style = MaterialTheme.typography.titleSmall)
         item.sets.distinct().forEach { Text(targetText(it), style = MaterialTheme.typography.bodySmall) }
         exercise?.let { value ->
-            Text("器械：" + value.equipmentTags.joinToString("、") { tags[it] ?: it }.ifEmpty { "无需专用器械" }, style = MaterialTheme.typography.bodySmall)
+            Text("器械：" + equipmentRequirementText(value.equipmentTags, tags), style = MaterialTheme.typography.bodySmall)
             TextButton(onClick = { details(value) }) { Text("查看${value.name}教学") }
         }
     }

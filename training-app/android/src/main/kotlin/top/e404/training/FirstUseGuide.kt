@@ -1,17 +1,33 @@
 package top.e404.training
 
+import android.Manifest
+import android.content.Intent
+import android.os.Build
+import android.provider.Settings
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
+import androidx.core.content.ContextCompat
+import android.content.pm.PackageManager
 
-@Composable fun FirstUseGuide(state: AppData, viewModel: TrainingViewModel, onSkip: () -> Unit, onFinish: (Boolean) -> Unit) {
+@Composable fun FirstUseGuide(viewModel: TrainingViewModel, permissionRevision: Int, onSkip: () -> Unit, onFinish: (Boolean) -> Unit) {
     var step by rememberSaveable { mutableIntStateOf(0) }
+    val context = LocalContext.current
+    var permissionChanged by remember { mutableIntStateOf(0) }
+    val notificationsReady = remember(permissionRevision, permissionChanged) { TimerEngine.canNotify(context) }
+    val exactReady = remember(permissionRevision, permissionChanged) { TimerEngine.canSchedule(context) }
+    val requestNotifications = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { permissionChanged++ }
+    val openNotificationSettings = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { permissionChanged++ }
+    val openExactSettings = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { permissionChanged++ }
     val connection = remember { viewModel.repository.vault.load() }
     var url by rememberSaveable { mutableStateOf(connection.url) }
     // 与设置页一致：token 仅留内存草稿，确认后交由系统保护的凭据存储管理。
@@ -21,7 +37,7 @@ import androidx.compose.ui.unit.dp
         when (step) {
             0 -> {
                 Text("按照列表训练，完成一组后进入组间休息", style = MaterialTheme.typography.headlineSmall)
-                InfoCard("开始训练") { Text("查看这一轮的部位和动作，开始后逐组记录。完成一组即可按该组要求计时休息；实际训练和拉伸分别统计。") }
+                InfoCard("开始训练") { Text("进入当日训练页面即可逐组记录。完成一组后按该组要求计时休息；实际训练和拉伸分别统计。") }
                 InfoCard("调整计划") { Text("先从三、四、五分化中选择整轮候选，再按日替换动作、修改组数及加入对应拉伸。健身房和器械登记不是必填。") }
                 InfoCard("运动记录") { Text("查看实际完成的组、原始 kg/lb 读数和训练反馈；计划组不会自动算作完成组。") }
                 Text("左上角菜单包含设置、可选健身房和本教程。动作与拉伸教学就在选择动作、计划预览及训练过程中。")
@@ -34,14 +50,13 @@ import androidx.compose.ui.unit.dp
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password, autoCorrectEnabled = false), modifier = Modifier.fillMaxWidth())
                 Text("填写完整服务地址，例如 https://training.example.com:3443。token 使用部署后端时配置的同一份，输入后以掩码显示。")
                 Text("可以稍后连接：离线也能选择方案、训练、计时和查看本机记录；以后从菜单中的设置连接并同步。")
-                Text(state.syncMessage, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 Button(enabled = !saving, onClick = {
                     saving = true
                     viewModel.action {
                         try { viewModel.repository.saveConnection(BackendConnection(url, token.trim())); step = 2 }
                         finally { saving = false }
                     }
-                }, modifier = Modifier.fillMaxWidth()) { Text("保存连接并同步") }
+                }, modifier = Modifier.fillMaxWidth()) { Text("保存连接") }
                 TextButton(onClick = { step = 2 }) { Text(if (connection.token.isBlank()) "稍后连接" else "保留现有连接并继续") }
             }
             2 -> {
@@ -53,7 +68,33 @@ import androidx.compose.ui.unit.dp
             3 -> {
                 Text("休息结束，发送普通通知", style = MaterialTheme.typography.headlineSmall)
                 Text("应用到时唤醒自身并发布通知，不调用系统闹钟响铃。通知声音和振动遵循系统及该通知渠道的设置。")
-                Text("开始训练时按需请求通知权限。菜单 → 设置可查看通知、定时唤醒和应用后台条件；不需要现在一次性申请全部权限。")
+                if (Build.VERSION.SDK_INT < 33) {
+                    Text("通知权限：此 Android 版本无需单独运行时授权（已具备）。")
+                    Text(if (notificationsReady) "通知显示：已具备。" else "通知显示：系统通知或提醒渠道未开启；到时可能看不到应用通知。")
+                } else {
+                    Text(if (notificationsReady) "通知权限与显示：已具备。" else "通知权限或提醒渠道未具备；到时可能看不到应用通知。")
+                    if (ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+                        Button(onClick = { requestNotifications.launch(Manifest.permission.POST_NOTIFICATIONS) }) { Text("请求通知权限") }
+                    }
+                }
+                OutlinedButton(onClick = {
+                    openNotificationSettings.launch(Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS)
+                        .putExtra(Settings.EXTRA_APP_PACKAGE, context.packageName))
+                }) { Text("打开应用通知设置") }
+                Text(if (Build.VERSION.SDK_INT < 31) "精确定时唤醒：此 Android 版本不需要单独授权。" else
+                    if (exactReady) "精确定时唤醒：已具备。" else "精确定时唤醒：未具备；系统省电时提醒可能延迟。")
+                if (Build.VERSION.SDK_INT >= 31 && !exactReady) {
+                    Button(onClick = {
+                        openExactSettings.launch(Intent(Settings.ACTION_REQUEST_SCHEDULE_EXACT_ALARM,
+                            android.net.Uri.parse("package:${context.packageName}")))
+                    }) { Text("允许精确定时唤醒") }
+                }
+                Text("后台与电池限制由设备系统管理，可能影响应用在后台时的提醒。")
+                OutlinedButton(onClick = {
+                    openNotificationSettings.launch(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                        android.net.Uri.parse("package:${context.packageName}")))
+                }) { Text("打开应用后台与电池设置") }
+                Text("不必现在授权，也可跳过并离线训练；以后可在菜单 → 设置中查看或修改权限。")
                 Text("深浅外观默认跟随系统，也可以从设置固定为浅色或深色。连接配置、教程和外观都可以以后修改。")
                 Button(onClick = { onFinish(true) }, modifier = Modifier.fillMaxWidth()) { Text("完成教程，选择训练方案") }
                 TextButton(onClick = { onFinish(false) }) { Text("完成教程，进入应用") }

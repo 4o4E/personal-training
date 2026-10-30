@@ -8,6 +8,8 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.ui.unit.dp
 import coil.compose.AsyncImage
 import top.e404.training.shared.*
@@ -96,12 +98,16 @@ import top.e404.training.shared.*
     var mode by rememberSaveable { mutableStateOf(original.load?.mode ?: if (exercise.loadMode == "assistance") "assistance" else "external") }
     var side by rememberSaveable { mutableStateOf(original.side) }
     var applyAll by rememberSaveable { mutableStateOf(false) }
+    val measurement = targetMeasurement(original, exercise.measurement)
+    val context = LocalContext.current
+    val preferences = remember { (context.applicationContext as TrainingApplication).preferences }
+    val choices by preferences.data.collectAsStateWithLifecycle()
     FormDialog(if (actual) "实际完成情况" else "计划组要求", onDismiss, {
         viewModel.action {
             val target = SetTarget(
-                reps = if (exercise.measurement == "reps") intInput(reps, "次数") else null,
-                repsMax = if (!actual && maximum.isNotBlank() && exercise.measurement == "reps") intInput(maximum, "次数上限") else null,
-                seconds = if (exercise.measurement == "seconds") intInput(seconds, "时长") else null,
+                reps = if (measurement == "reps") intInput(reps, "次数") else null,
+                repsMax = if (!actual && maximum.isNotBlank() && measurement == "reps") intInput(maximum, "次数上限") else null,
+                seconds = if (measurement == "seconds") intInput(seconds, "时长") else null,
                 load = if (hasLoad) Load(doubleInput(weight, "重量"), unit, meaning, mode) else null,
                 side = side, restSeconds = intInput(rest, "休息秒数")
             )
@@ -110,14 +116,19 @@ import top.e404.training.shared.*
     }, confirmLabel = if (actual) "完成并记录" else "保存") {
         if (actual) Text("新组确认后保存实际结果并按该组休息时长计时；修改已完成组不会重启计时。", style = MaterialTheme.typography.bodySmall)
         Text(exercise.name, style = MaterialTheme.typography.titleMedium)
-        if (exercise.measurement == "reps") {
-            TextInput(if (actual) "实际次数" else "目标次数或范围下限", reps, { reps = it }, numeric = true)
+        if (measurement == "reps") {
+            if (actual) WorkoutCountInput(reps, { reps = it })
+            else TextInput("目标次数或范围下限", reps, { reps = it }, numeric = true)
             if (!actual) TextInput("次数范围上限（可不填写）", maximum, { maximum = it }, numeric = true)
         } else TextInput(if (actual) "实际时长（秒）" else "目标时长（秒）", seconds, { seconds = it }, numeric = true)
         Choice("左右侧", side, listOf("both" to "双侧 / 不分侧", "left" to "左侧", "right" to "右侧"), { side = it })
         Row { Checkbox(hasLoad, { hasLoad = it }); Text("填写外部负重或助力读数", Modifier.padding(top = 12.dp)) }
         if (hasLoad) {
-            TextInput("器械原始重量", weight, { weight = it }, numeric = true)
+            if (actual) {
+                val key = weightStepKey(exercise.id, equipment?.id, unit)
+                WorkoutWeightInput(weight, { weight = it }, unit, choices.weightSteps[key] ?: 1.0,
+                    { value -> preferences.weightStep(key, value) })
+            } else TextInput("器械原始重量", weight, { weight = it }, numeric = true)
             Choice("原始单位", unit, listOf("kg" to "公斤 kg", "lb" to "磅 lb"), { unit = it })
             Choice("重量含义", meaning, listOf("total" to "总重量", "per_hand" to "单只重量", "per_side" to "单侧配重"), { meaning = it })
             Choice("负重或助力", mode, listOf("external" to "外部负重", "assistance" to "助力重量"), { mode = it })

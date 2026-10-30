@@ -69,7 +69,9 @@ import top.e404.training.shared.*
         val positions = if (originalPosition != null) listOf(originalPosition to "原动作位置，仅替换未完成部分")
             else (0..session.items.size).map { position -> position to if (position == 0) "放在最前面" else "放在 ${session.exercises.single { it.id == session.items[position - 1].exerciseId }.name} 之后" }
         PlanItemEditor(item, exercise, session.snapshot?.gymId, state, viewModel, positions,
-            originalPosition ?: session.items.size, { pendingItem = null; selectedExercise = null; replacing = null }) { revised, position ->
+            originalPosition ?: session.items.size, { pendingItem = null; selectedExercise = null; replacing = null },
+            allowMeasurementChange = exercise.id.startsWith("smartworkout_")
+        ) { revised, position ->
             val replacingId = replacing
             if (replacingId != null) viewModel.replaceSessionExercise(session.id, replacingId, revised, exercise)
             else viewModel.addSessionExercise(session.id, revised, exercise, position)

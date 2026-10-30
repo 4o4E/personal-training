@@ -48,17 +48,18 @@ class PresetBehaviorTest {
         items = listOf(PlanItem("item-$id", "exercise_3601968b", sets = List(4) { SetTarget(reps = 10) })))
     private fun completed(plan: Plan, order: Int, status: String = "completed"): Session {
         val time = 1_792_500_000_000L + order * 100_000L
+        val date = java.time.Instant.ofEpochMilli(time).atZone(java.time.ZoneId.of("Asia/Shanghai")).toLocalDate()
         return Session("session-$order", plan.name, plan, listOf(exercises.getValue("exercise_3601968b")), time, time + 20_000, status,
-            listOf(SetResult(plan.items.first().id, 0, reps = 10, completedAt = time + 10_000)))
+            listOf(SetResult(plan.items.first().id, 0, reps = 10, completedAt = time + 10_000)), localDate = date.toString())
     }
 
-    @Test fun `完成一轮后原模板重新可练而取消不会跳过`() {
+    @Test fun `取消保留实际组也推进轮换且模板循环可复用`() {
         val plans = program.slots.map { plan(it.id) }
         val history = mutableListOf<Session>()
         assertEquals(plans.first(), rotationPlans(program, plans, history, emptyMap()).first().plan)
         history += completed(plans[0], 1)
         history += completed(plans[1], 2, "cancelled")
-        assertEquals(plans[1], rotationPlans(program, plans, history, emptyMap()).first().plan)
+        assertEquals(plans[2], rotationPlans(program, plans, history, emptyMap()).first().plan)
         history += completed(plans[1], 3)
         history += completed(plans[2], 4)
         assertEquals(plans[0], rotationPlans(program, plans, history, emptyMap()).first().plan)
@@ -72,9 +73,11 @@ class PresetBehaviorTest {
         val dated = plan("push", "dated", "2026-10-25")
         assertNull(rotationPlans(program, listOf(first, preferred), emptyList(), emptyMap()).first().plan)
         assertEquals(preferred, rotationPlans(program, listOf(first, preferred), emptyList(), mapOf("push" to preferred.id)).first().plan)
-        assertEquals(dated, rotationPlans(program, listOf(first, preferred, dated), emptyList(), mapOf("push" to preferred.id)).first().plan)
+        assertEquals(dated, rotationPlans(program, listOf(first, preferred, dated), emptyList(), mapOf("push" to preferred.id), date = java.time.LocalDate.parse("2026-10-25")).first().plan)
         val history = listOf(completed(dated, 1), completed(plan("legs"), 2))
-        assertEquals(preferred, rotationPlans(program, listOf(first, preferred, dated), history, mapOf("push" to preferred.id)).first().plan)
-        assertNull(rotationPlans(program, listOf(first, preferred), history, mapOf("push" to "deleted")).first().plan)
+        assertEquals(preferred, rotationPlans(program, listOf(first, preferred, dated), history, mapOf("push" to preferred.id), date = java.time.LocalDate.parse("2026-10-25")).first().plan)
+        assertFailsWith<IllegalArgumentException> {
+            rotationPlans(program, listOf(first, preferred), history, mapOf("push" to "deleted")).first()
+        }
     }
 }
