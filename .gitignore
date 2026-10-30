@@ -16,3 +16,5 @@ AGENTS.md
 .env
 .omp/skills/*
 !.omp/skills/openspec-*/
+__pycache__/
+*.pyc

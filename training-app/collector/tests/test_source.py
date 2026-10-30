@@ -116,7 +116,7 @@ class SourceNormalizationTest(unittest.TestCase):
             try:
                 self.assertEqual(reopened.pending_count("steps"), 0)
                 self.assertEqual(
-                    [reopened.pending_count(dataset) for dataset in DATASETS[1:]],
+                    [reopened.pending_count(dataset) for dataset in DATASETS if dataset != "steps"],
                     [1] * 6,
                 )
                 self.assertEqual(
