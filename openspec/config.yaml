@@ -4,24 +4,25 @@ context: |
   Language: Chinese
   All artifacts must be written in Chinese.
   Keep OpenSpec structural headings and SHALL/MUST keywords in English.
-  This workspace contains personal sports records and a new personal training application.
-  Existing record/ and misports/ are independent data sources, not the application implementation.
+  Keep OpenSpec, glossary, development notes, .agents/, .omp/commands/, skills-lock.json, and .github/ within this project root.
+  Existing record/ and private Xiaomi data under data/xiaomi/ are independent personal data sources. Do not modify training records or private health data. Server persistence remains at /data.
+  Xiaomi collection uses the Kotlin JVM Gradle module :collector, built from this project root with :collector:distZip and packaged as personal-training-collector-<version>.zip.
   The application is for one person's private use on Android.
   The confirmed client choice is native Kotlin with Jetpack Compose; iOS is out of scope.
   A future browser client is for data browsing, not a second training implementation.
   Native Android timed reminders are a highest-priority requirement.
   Confirmed requirements and architecture decisions belong to the official OpenSpec workflow.
-  Project engineering skills come from 4o4E/skills, ref feat/openspec-decisions.
-  Domain terms are maintained in GLOSSARY.md.
+  Domain terms are maintained in GLOSSARY.md; OpenSpec is under openspec/, and development notes under .workspace/, all relative to this project root.
+  The user confirmed this directory organization; it is a location change only and does not change application business rules.
   The confirmed backend is Kotlin Ktor with SQLite. The Android client uses Room for complete offline training and later synchronization.
   Rotation follows actual recorded sets by UTC+8 training date: any recorded set counts as trained; a day with no recorded sets does not advance. Each date has one training record. Stretches are recommended automatically but inserted manually.
-  The user approved an independent application database; existing sports records and misports.db must remain unchanged.
+  The user approved an independent application database; existing sports records and Xiaomi private data must remain unchanged.
   Concrete notification APIs and final media selections are implementation details to verify, not additional user architecture choices.
 
 rules:
   proposal:
     - 只记录用户已确认的需求和明确的变更范围；助手建议不得写成用户决定。
-    - 记录需求不代表功能已经实现；不得修改既有个人训练记录或小米同步脚本。
+    - 记录需求不代表功能已经实现；不得修改既有个人训练记录或小米私有资料及凭据。
   specs:
     - 每项要求至少提供一个具体的 WHEN/THEN 场景，并保留英文结构标题。
     - 不将具体素材供应方、后端框架或数据库产品写成已确认要求。

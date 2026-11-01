@@ -39,7 +39,7 @@
 
 ### Requirement: 启动图标与应用名称清晰区分
 
-启动器图标 MUST 使用简洁、居中的斜向哑铃图形，SVG是图形来源，Android自适应前景图形与SVG保持相同几何和配色；正式版名称 MUST 为“个人训练”，验证版名称 MUST 为“个人训练·验证”，均通过 `string/app_name` 提供。
+启动器图标 MUST 使用简洁、居中的斜向哑铃图形，源 SVG 图稿位于 `android/artwork/app-icon.svg`，此图稿在 Android 模块 `src/main` 之外且不打包进 APK；实际 `res` 启动器图标保持不变。Android 自适应前景图形与 SVG 保持相同几何和配色；正式版名称 MUST 为“个人训练”，验证版名称 MUST 为“个人训练·验证”，均通过 `string/app_name` 提供。
 
 #### Scenario: 查看安装后的应用标识
 - **WHEN** 用户在启动器查看正式版或验证版应用

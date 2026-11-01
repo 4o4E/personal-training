@@ -34,13 +34,17 @@
 - **WHEN** 对应标签的后端运行包已经作为 Release 附件发布
 - **THEN** 镜像构建取得该附件并封装到运行环境，实际启动及鉴权检查通过后发布版本标签和 latest
 
-### Requirement: 发布产物公开且训练资料隔离
+### Requirement: 私有 Release、公开 GHCR 镜像且训练资料隔离
 
-现有源码仓库、Release 和 GHCR 镜像 MUST 公开，手机和部署端 SHALL 无需 GitHub 登录即可取得发布产物。个人训练记录、小米资料、业务 token、签名私钥及临时验证数据 MUST 不进入源码或公开产物。
+源码仓库及其 GitHub Release MUST 保持私有，Release 附件仅可由有仓库访问权限的用户取得。GHCR 镜像 MUST 为公开，并可匿名拉取。个人训练记录、小米资料、业务 token、签名私钥及临时验证数据 MUST 不进入源码或公开镜像。
 
-#### Scenario: 匿名取得正式产物
-- **WHEN** 未登录 GitHub 的客户端下载已发布 APK、后端包或拉取镜像
+#### Scenario: 授权用户取得正式 Release 产物
+- **WHEN** 有仓库访问权限的用户取得已发布 APK、后端包或更新资料
 - **THEN** 请求成功且产物不包含个人训练资料或凭据
+
+#### Scenario: 匿名拉取公开镜像
+- **WHEN** 未登录 GitHub 的部署端拉取 GHCR 镜像
+- **THEN** 请求成功且镜像不包含个人训练资料或凭据
 
 ### Requirement: 交付使用已经检查的构建结果
 

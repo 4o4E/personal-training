@@ -6,7 +6,7 @@
 
 - [x] 1.1 初始化官方 OpenSpec 的项目级工作流程；验证官方 CLI 能在当前项目识别变更及项目根目录。
 - [x] 1.2 将指定分支的工程技能安装到本项目，保存来源信息并接入当前助手；验证安装器列为 Project Skills，`skills-lock.json` 记录正确分支，助手可读取项目内对应技能。
-- [x] 1.3 更新开发入口和领域术语，建立被忽略的开发工作目录；交付 `AGENTS.md` 的软件开发规则、`GLOSSARY.md`、`.gitignore` 与 `.workspace/WORKLOG.md`，架构及术语导航不复制正文。
+- [x] 1.3 更新开发入口和领域术语，建立被忽略的开发工作目录；交付根目录 `AGENTS.md`、`training-app/GLOSSARY.md`、`.gitignore` 与 `training-app/.workspace/WORKLOG.md`，架构及术语导航不复制正文。
 
 ## 2. 已确认需求与决定记录
 

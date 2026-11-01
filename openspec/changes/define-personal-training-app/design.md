@@ -17,8 +17,7 @@
 **Non-Goals:**
 
 - 本次不实现安卓应用、后端、数据迁移、通知原型或操作 skill，不声明这些功能已可使用。
-- 不代替用户决定未确认的后端、数据库和同步策略，不未经确认执行数据库 schema 变更。
-- 不创建第二套架构决定记录；`.workspace/ADR.md` 仅作为本文入口。
+- 不创建第二套架构决定记录；仓库级导航为 `training-app/.workspace/ADR.md`，本文仅作入口。
 
 ## Decisions
 
@@ -111,8 +110,9 @@
 - 状态：已确认，项目接入已经执行。
 - 决定：使用官方 OpenSpec；相关工程技能来自 `4o4E/skills` 的 `feat/openspec-decisions` 分支，安装在项目中，不全局安装 skill。
 - 确认依据：用户指定 OpenSpec 与该分支，并进一步明确“我说的skill是安装到项目中而不是全局”。
-- 实际接入：官方工作流程位于 `.omp/skills/openspec-*`；15 个工程技能的正文位于 `.agents/skills/`，分支来源记录在 `skills-lock.json`，`.omp/skills/` 的同名目录连接供当前助手读取。目录连接不是另一份技能正文。
-- 工具范围：OpenSpec 命令行程序为全局工具；规范、官方项目技能及分支工程技能均在当前项目中。CLI 安装范围不等于 skill 安装范围。
+- 实际接入：官方 OpenSpec 工作流程及 22 个项目技能正文位于 `.agents/skills/`，来源和版本记录在 `skills-lock.json`；`.omp/commands/` 保留当前助手的命令入口。目录连接不是另一份技能正文。
+- 工具范围：OpenSpec 命令行程序为全局工具；应用规范和变更位于 `training-app/openspec/`，工作区助手配置留在仓库根目录。CLI 安装范围不等于 skill 安装范围。
+- 目录组织：用户确认应用规范和开发记录位于 `training-app/openspec/`、`training-app/.workspace/`，小米私有数据位于 `training-app/data/xiaomi/`，采集源码位于 `training-app/collector/`；根目录 `.agents/`、`.omp/` 和 `skills-lock.json` 继续作为工作区助手配置。此项仅记录目录位置，不改变业务规则。
 - 用户未指定问题跟踪平台，不因接入工程技能而自动创建 GitHub 仓库、Issue 或其他平台配置。
 - 适用规范：`project-workflow`。
 
