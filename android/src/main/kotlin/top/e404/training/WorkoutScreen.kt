@@ -87,10 +87,12 @@ private fun willStartRestTimer(session: Session, itemId: String, setIndex: Int, 
         InfoCard(if (current.type == "rest") "组间休息" else "动作计时") {
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                 Text(current.displayText(now), style = MaterialTheme.typography.headlineMedium)
-                if (current.notified && !current.alertDismissed) {
+                if (current.type != "rest" && current.notified && !current.alertDismissed) {
                     TextButton(onClick = { viewModel.action { viewModel.repository.dismissTimerAlert(current) } }) { Text("停止提醒") }
                 }
-                TextButton(onClick = viewModel::stopTimer) { Text(if (current.type == "rest") "结束休息" else "结束计时") }
+                TextButton(onClick = {
+                    if (current.type == "rest") viewModel.endRestTimer(current) else viewModel.stopTimer()
+                }) { Text(if (current.type == "rest") "结束休息" else "结束计时") }
             }
         }
     }
@@ -110,6 +112,11 @@ private fun willStartRestTimer(session: Session, itemId: String, setIndex: Int, 
     var editingNotes by rememberSaveable { mutableStateOf(false) }
     var notes by rememberSaveable { mutableStateOf(session.notes) }
     var selectedItemId by rememberSaveable(session.id) { mutableStateOf<String?>(null) }
+    var editingItemNotes by rememberSaveable(session.id) { mutableStateOf<String?>(null) }
+    var itemNotesDraft by rememberSaveable(session.id) { mutableStateOf("") }
+    var selectingType by rememberSaveable(session.id) { mutableStateOf<String?>(null) }
+    var pendingItem by rememberSaveable(session.id, stateSaver = jsonSaver(PlanItem.serializer().nullable)) { mutableStateOf<PlanItem?>(null) }
+    var selectedExercise by rememberSaveable(session.id, stateSaver = jsonSaver(Exercise.serializer().nullable)) { mutableStateOf<Exercise?>(null) }
     val expandedState = rememberSaveableStateHolder()
     var permissionRefresh by remember { mutableIntStateOf(0) }
     var showTimerPermissionDialog by remember { mutableStateOf(false) }
@@ -242,6 +249,9 @@ private fun willStartRestTimer(session: Session, itemId: String, setIndex: Int, 
                         modifier = Modifier.fillMaxWidth()
                     )
                     if (item.notes.isNotBlank() && item.notes != exercise.name) Text(item.notes, style = MaterialTheme.typography.bodySmall)
+                    TextButton(onClick = { editingItemNotes = item.id; itemNotesDraft = item.notes }) {
+                        Text(if (item.notes.isBlank()) "添加动作备注" else "修改动作备注")
+                    }
                     if (nextIndex != null && !isCurrent) TextButton(onClick = { selectedItemId = item.id }) { Text("切换到此动作") }
                     if (completed > 0) {
                         var showCompleted by rememberSaveable(session.id, item.id) { mutableStateOf(false) }
@@ -293,6 +303,11 @@ private fun willStartRestTimer(session: Session, itemId: String, setIndex: Int, 
                     }
             }
             item {
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Button(onClick = { selectingType = "strength" }) { Text("添加训练动作") }
+                    OutlinedButton(onClick = { selectingType = "stretch" }) { Text("添加拉伸") }
+                }
+                Text("只添加到当天训练，不会修改训练计划。", style = MaterialTheme.typography.bodySmall)
                 TextButton(onClick = { notes = session.notes; editingNotes = true }) { Text("记录训练反馈") }
                 Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                     Button(onClick = { finishMode = "complete" }, enabled = session.results.isNotEmpty()) { Text("完成本次训练") }
@@ -374,6 +389,43 @@ private fun willStartRestTimer(session: Session, itemId: String, setIndex: Int, 
     }
     if (editingNotes) FormDialog("训练反馈", { editingNotes = false }, { viewModel.updateSessionNotes(session.id, notes); editingNotes = false }) {
         TextInput("实际感受与需要调整的内容", notes, { notes = it }, singleLine = false)
+    }
+    editingItemNotes?.let { itemId ->
+        FormDialog("动作备注", { editingItemNotes = null }, {
+            viewModel.updateSessionItemNotes(session.id, itemId, itemNotesDraft)
+            editingItemNotes = null
+        }) {
+            TextInput("仅属于本次训练此动作", itemNotesDraft, { itemNotesDraft = it }, singleLine = false)
+        }
+    }
+    selectingType?.let { type ->
+        val targets = session.items
+            .filter { it.id !in session.skippedItems || session.results.any { result -> result.itemId == it.id } }
+            .flatMap { item ->
+                session.exercises.single { it.id == item.exerciseId }.let {
+                    if (it.type == "strength") it.muscles + it.secondaryMuscles else emptyList()
+                }
+            }.toSet()
+        ExercisePicker(state, viewModel.repository, session.snapshot?.gymId, targets, type,
+            { selectingType = null }) { exercise ->
+            selectedExercise = exercise
+            pendingItem = newPlanItem(exercise, session.snapshot?.gymId, state)
+            selectingType = null
+        }
+    }
+    pendingItem?.let { item ->
+        val exercise = selectedExercise ?: return@let
+        val positions = (0..session.items.size).map { position ->
+            position to if (position == 0) "放在最前面" else "放在 ${session.exercises.single { it.id == session.items[position - 1].exerciseId }.name} 之后"
+        }
+        PlanItemEditor(item, exercise, session.snapshot?.gymId, state, viewModel, positions,
+            session.items.size, { pendingItem = null; selectedExercise = null },
+            allowMeasurementChange = exercise.id.startsWith("smartworkout_")
+        ) { revised, position ->
+            viewModel.addSessionExercise(session.id, revised, exercise, position)
+            pendingItem = null
+            selectedExercise = null
+        }
     }
 }
 

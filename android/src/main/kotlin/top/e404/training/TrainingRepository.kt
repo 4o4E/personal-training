@@ -42,6 +42,66 @@ import java.nio.file.StandardCopyOption
 import java.util.UUID
 import java.util.concurrent.TimeUnit
 
+private fun sessionDraftKey(sessionId: String) = "session-draft/$sessionId"
+private fun mergePreparedSessionDraft(prepared: Session, draft: Session): Session {
+    if (draft.snapshot == prepared.snapshot) return prepared.copy(
+        items = draft.items,
+        exercises = draft.exercises,
+        notes = draft.notes,
+        skippedItems = draft.skippedItems
+    )
+
+    val originalById = draft.snapshot?.items.orEmpty().associateBy { it.id }
+    val preparedById = prepared.items.associateBy { it.id }
+    val draftById = draft.items.associateBy { it.id }
+    val items = prepared.items.map { planned ->
+        val changed = draftById[planned.id]
+        if (changed != null && changed.exerciseId == planned.exerciseId &&
+            changed.notes != originalById[planned.id]?.notes
+        ) planned.copy(notes = changed.notes) else planned
+    }
+    val carriedItems = draft.items.mapIndexedNotNull { index, item ->
+        val original = originalById[item.id]
+        val planned = preparedById[item.id]
+        val carry = item.id !in originalById ||
+            (item.notes != original?.notes && (planned == null || planned.exerciseId != item.exerciseId))
+        if (!carry) null
+        else index to if (planned != null && planned.exerciseId != item.exerciseId)
+            item.copy(id = UUID.randomUUID().toString()) else item
+    }
+    val before = linkedMapOf<String, MutableList<PlanItem>>()
+    val after = linkedMapOf<String, MutableList<PlanItem>>()
+    val unanchored = mutableListOf<PlanItem>()
+    for ((index, item) in carriedItems) {
+        val nextAnchor = draft.items.drop(index + 1).firstOrNull { candidate ->
+            preparedById[candidate.id]?.exerciseId == candidate.exerciseId
+        }?.id
+        val previousAnchor = draft.items.take(index).lastOrNull { candidate ->
+            preparedById[candidate.id]?.exerciseId == candidate.exerciseId
+        }?.id
+        when {
+            nextAnchor != null -> before.getOrPut(nextAnchor) { mutableListOf() }.add(item)
+            previousAnchor != null -> after.getOrPut(previousAnchor) { mutableListOf() }.add(item)
+            else -> unanchored += item
+        }
+    }
+    val sessionItems = buildList {
+        for (item in items) {
+            addAll(before[item.id].orEmpty())
+            add(item)
+            addAll(after[item.id].orEmpty())
+        }
+        addAll(unanchored)
+    }
+    val finalItemIds = sessionItems.mapTo(hashSetOf()) { it.id }
+    val carriedExerciseIds = carriedItems.mapTo(hashSetOf()) { it.second.exerciseId }
+    return prepared.copy(
+        items = sessionItems,
+        exercises = (prepared.exercises + draft.exercises.filter { it.id in carriedExerciseIds }).distinctBy { it.id },
+        notes = draft.notes,
+        skippedItems = prepared.skippedItems + draft.skippedItems.filter { it in finalItemIds }
+    )
+}
 private fun Document.key() = "${kind.name}/$id"
 private data class Cached(val document: Document, val dirty: Boolean, val remote: Document? = null)
 @kotlinx.serialization.Serializable
@@ -540,11 +600,25 @@ class TrainingRepository(
         val entry = Cached(doc.copy(revision = old?.document?.revision ?: 0), true, old?.remote)
         database.withTransaction {
             if (changed) dao.put(entry.row())
+            dao.removeValue(sessionDraftKey(session.id))
             if (timerChanged) {
                 if (timer == null) dao.removeValue("timer") else dao.putValue(LocalValue("timer", wireJson.encodeToString(timer)))
             }
         }
         if (changed) install(listOf(entry))
+        if (timerChanged) {
+            _timer.value = timer
+            if (timer == null) TimerEngine.cancel(context) else TimerEngine.schedule(context, timer)
+        }
+    }
+    private suspend fun persistSessionDraft(session: Session, timer: TimerState?) {
+        val timerChanged = _timer.value != timer
+        database.withTransaction {
+            dao.putValue(LocalValue(sessionDraftKey(session.id), wireJson.encodeToString(session)))
+            if (timerChanged) {
+                if (timer == null) dao.removeValue("timer") else dao.putValue(LocalValue("timer", wireJson.encodeToString(timer)))
+            }
+        }
         if (timerChanged) {
             _timer.value = timer
             if (timer == null) TimerEngine.cancel(context) else TimerEngine.schedule(context, timer)
@@ -571,12 +645,13 @@ class TrainingRepository(
                 changedData = true
             }
             val dailyId = dailySessionId(date)
-            lookup(Kind.session, dailyId)?.takeUnless { it.deleted }?.let { existing ->
+            val existing = lookup(Kind.session, dailyId)?.takeUnless { it.deleted }
+            if (existing != null) {
                 val session = existing.value<Session>()
-                _preparedTraining.value = if (session.results.isEmpty() && session.status != "active")
-                    session.copy(status = "active", endedAt = null)
-                else session
-                return@withLock
+                if (session.status == "active" || session.results.isNotEmpty()) {
+                    _preparedTraining.value = session
+                    return@withLock
+                }
             }
             val sessions = list(Kind.session).map { it.value<Session>() }
             val plans = list(Kind.plan).map { it.value<Plan>() }
@@ -690,11 +765,14 @@ class TrainingRepository(
             val overrideId = program?.id?.let { programId ->
                 arrangement?.nextOverrides?.get(programId)?.takeIf { it.slotId == resolved.slotId }?.id
             }
-            _preparedTraining.value = Session(
+            val prepared = Session(
                 id = dailyId, name = resolved.name, snapshot = resolved, exercises = exercises,
                 startedAt = null, endedAt = null, status = "active", items = resolved.items,
                 arrangementOverrideId = overrideId, splitSlotName = slot?.name, localDate = date.toString()
             )
+            val draft = dao.value(sessionDraftKey(dailyId))?.let { wireJson.decodeFromString<Session>(it) }
+            _preparedTraining.value = draft?.takeIf { it.results.isEmpty() && it.localDate == date.toString() }
+                ?.let { mergePreparedSessionDraft(prepared, it) } ?: prepared
         }
         if (changedData) enqueueSync()
     }
@@ -707,7 +785,8 @@ class TrainingRepository(
             val savedDocument = lookup(Kind.session, id)?.takeUnless { it.deleted }
             val saved = savedDocument?.value<Session>()
             val prepared = _preparedTraining.value?.takeIf { it.id == id }
-            val session = saved ?: requireNotNull(prepared) { "当天训练尚未准备好" }
+            val session = if (saved != null && (saved.status == "active" || saved.results.isNotEmpty()))
+                saved else prepared ?: saved ?: throw IllegalArgumentException("当天训练尚未准备好")
             if (session.results.isEmpty()) {
                 _preparedTraining.value = if (session.status == "active") session else
                     session.copy(status = "active", endedAt = null)
@@ -759,7 +838,8 @@ class TrainingRepository(
                 persisted = true
                 next
             } else {
-                next.copy(status = "active", endedAt = null)
+                persistSessionDraft(next, timer)
+                next
             }
             _preparedTraining.value = session
             val programId = session.snapshot?.programId
@@ -828,6 +908,22 @@ class TrainingRepository(
         database.withTransaction { dao.put(entry.row()) }
         install(listOf(entry))
     }
+    suspend fun updateCompletedItemNotes(sessionId: String, itemId: String, notes: String) = withContext(Dispatchers.IO) {
+        initialize()
+        gate.withLock {
+            val original = requireNotNull(lookup(Kind.session, sessionId)) { "训练不存在" }
+            require(!original.deleted) { "训练记录不存在" }
+            val current = original.value<Session>()
+            require(current.status == "completed") { "仅可修改已完成的训练" }
+            require(current.localDate == java.time.LocalDate.now(java.time.ZoneId.of("Asia/Shanghai")).toString()) { "仅可修改当天训练" }
+            val revisedItems = current.items.map { item ->
+                if (item.id == itemId) item.copy(notes = notes) else item
+            }
+            require(revisedItems.any { it.id == itemId }) { "训练动作不存在" }
+            saveCompletedSession(original, current.copy(items = revisedItems))
+        }
+        enqueueSync()
+    }
     suspend fun appendSessionSet(sessionId: String, itemId: String) = withContext(Dispatchers.IO) {
         updateSession(sessionId) { session, timer ->
             require(session.status == "active") { "只有进行中的训练可以追加目标组" }
@@ -869,6 +965,19 @@ class TrainingRepository(
             if (timer == null) dao.removeValue("timer") else dao.putValue(LocalValue("timer", wireJson.encodeToString(timer)))
             _timer.value = timer
             if (timer == null) TimerEngine.cancel(context) else TimerEngine.schedule(context, timer)
+        }
+    }
+    suspend fun endTimerFromNotification(expected: TimerState): Boolean = withContext(Dispatchers.IO) {
+        initialize(triggerStartupSync = false)
+        gate.withLock {
+            val current = _timer.value ?: return@withLock false
+            val sameTimer = current.sessionId == expected.sessionId && current.itemId == expected.itemId &&
+                current.setIndex == expected.setIndex && current.deadline == expected.deadline && current.type == expected.type
+            if (!sameTimer || current.type != "rest") return@withLock false
+            dao.removeValue("timer")
+            _timer.value = null
+            TimerEngine.cancel(context)
+            true
         }
     }
     suspend fun restoreTimer() {

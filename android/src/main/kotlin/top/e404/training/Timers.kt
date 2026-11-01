@@ -153,7 +153,7 @@ object TimerEngine {
             .setContentText(timer.label).setContentIntent(showIntent(context))
             .setOngoing(true).setOnlyAlertOnce(true).setCategory(Notification.CATEGORY_REMINDER)
             .setVisibility(Notification.VISIBILITY_PUBLIC)
-            .addAction(android.R.drawable.ic_lock_idle_alarm, "停止提醒", stopAlertIntent(context, timer)).build())
+            .addAction(android.R.drawable.ic_lock_idle_alarm, if (timer.type == "rest") "结束休息" else "停止提醒", stopAlertIntent(context, timer)).build())
     }
 }
 
@@ -177,7 +177,9 @@ class TimerAlertReceiver : BroadcastReceiver() {
         val pending = goAsync()
         CoroutineScope(Dispatchers.IO).launch {
             try {
-                (context.applicationContext as TrainingApplication).repository.dismissTimerAlert(expected)
+                val repository = (context.applicationContext as TrainingApplication).repository
+                if (expected.type == "rest") repository.endTimerFromNotification(expected)
+                else repository.dismissTimerAlert(expected)
             } finally { pending.finish() }
         }
     }

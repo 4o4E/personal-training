@@ -87,6 +87,7 @@ private fun initialDayDrafts(documents: List<Document>): Map<String, String> = b
             Kind.session -> {
                 val session = doc.value<Session>()
                 put(dayField(doc, "notes"), session.notes)
+                session.items.forEach { item -> put(dayField(doc, "item-${item.id}/notes"), item.notes) }
                 session.results.forEach { result ->
                     val base = "result-${result.itemId}-${result.setIndex}"
                     put(dayField(doc, "$base/reps"), nullableText(result.reps))
@@ -220,7 +221,9 @@ internal fun DayHistoryDialog(date: String, today: LocalDate, state: AppData, vi
 private fun docChanged(doc: Document, fields: Map<String, String>) = when (doc.kind) {
     Kind.session -> {
         val session = doc.value<Session>()
-        fields[dayField(doc, "notes")] != session.notes || session.results.any { result ->
+        fields[dayField(doc, "notes")] != session.notes ||
+            session.items.any { item -> fields[dayField(doc, "item-${item.id}/notes")] != item.notes } ||
+            session.results.any { result ->
             val base = "result-${result.itemId}-${result.setIndex}"
             if (result.segments.isEmpty()) {
                 fields[dayField(doc, "$base/reps")] != nullableText(result.reps) ||
@@ -267,7 +270,10 @@ private fun buildChangedDocument(doc: Document, fields: Map<String, String>): Do
                 result.copy(segments = segments, reps = totalReps.toInt())
             }
         }
-        val updated = original.copy(results = results, notes = fields[dayField(doc, "notes")] ?: original.notes)
+        val items = original.items.map { item ->
+            item.copy(notes = fields[dayField(doc, "item-${item.id}/notes")] ?: item.notes)
+        }
+        val updated = original.copy(items = items, results = results, notes = fields[dayField(doc, "notes")] ?: original.notes)
         doc.takeIf { updated != original }?.copy(data = document(Kind.session, doc.id, updated).data)
     }
     Kind.activity -> {
@@ -335,6 +341,12 @@ private fun SessionDraftCard(doc: Document, fields: Map<String, String>, health:
                     } else Text(historyResultText(result), style = MaterialTheme.typography.bodySmall)
                 }
             }
+            if (canEdit) TextInput(
+                "${exercise?.name ?: "动作"}备注（本次训练）",
+                fields[dayField(doc, "item-${item.id}/notes")].orEmpty(),
+                { update(doc, "item-${item.id}/notes", it) },
+                singleLine = false
+            ) else if (item.notes.isNotBlank()) Text("${exercise?.name ?: "动作"}备注：${item.notes}")
         }
         if (canEdit) TextInput("训练反馈（可空）", fields[dayField(doc, "notes")].orEmpty(), { update(doc, "notes", it) }, singleLine = false)
         else if (session.notes.isNotBlank()) Text("反馈：${session.notes}")

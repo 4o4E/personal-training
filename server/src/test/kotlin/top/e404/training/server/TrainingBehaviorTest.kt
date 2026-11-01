@@ -665,6 +665,26 @@ class TrainingBehaviorTest {
             )
         }
     }
+    @Test fun `完成训练追加动作备注分别保存并重启保留组与计划快照`() {
+        val database = directory.resolve("completed-action-notes")
+        val original = session("completed-action-notes", "push", "completed", start)
+        val added = PlanItem("added-action", assisted.id, sets = listOf(SetTarget(reps = 8)))
+        val changed = original.copy(
+            exercises = original.exercises + assisted,
+            items = original.items.map { it.copy(notes = "原动作独立备注") } + added.copy(notes = "新增动作独立备注")
+        )
+        Store(database, seed).use { store ->
+            val savedOriginal = store.put(document(Kind.session, original.id, original))
+            store.put(document(Kind.session, changed.id, changed), savedOriginal.revision)
+        }
+        Store(database, seed).use { store ->
+            val restored = store.get(Kind.session, original.id)!!.value<Session>()
+            assertEquals(original.results, restored.results)
+            assertEquals(original.snapshot, restored.snapshot)
+            assertEquals(listOf("原动作独立备注", "新增动作独立备注"), restored.items.map { it.notes })
+            assertEquals(setOf(original.items.single().id, added.id), restored.items.map { it.id }.toSet())
+        }
+    }
     @Test fun `既有完成组可纠正撤销且历史记录可不伪造开始时间继续`() {
         val date = "2026-10-18"
         val history = Session(

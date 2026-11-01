@@ -11,6 +11,8 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Check
+import androidx.compose.material3.Button
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Icon
@@ -41,14 +43,27 @@ private data class SegmentInput(val reps: String, val load: String, val unit: St
 fun CompletedTrainingScreen(session: Session, today: java.time.LocalDate, viewModel: TrainingViewModel) {
     val context = androidx.compose.ui.platform.LocalContext.current
     val preferences = remember { (context.applicationContext as TrainingApplication).preferences }
+    val state by viewModel.repository.data.collectAsStateWithLifecycle()
     val choices by preferences.data.collectAsStateWithLifecycle()
     var editingResult by rememberSaveable(stateSaver = jsonSaver(ResultTarget.serializer().nullable)) { mutableStateOf<ResultTarget?>(null) }
+    var editingItemNotes by rememberSaveable { mutableStateOf<String?>(null) }
+    var itemNotesDraft by rememberSaveable { mutableStateOf("") }
+    var selectingType by rememberSaveable { mutableStateOf<String?>(null) }
+    var pendingItem by rememberSaveable(stateSaver = jsonSaver(PlanItem.serializer().nullable)) { mutableStateOf<PlanItem?>(null) }
+    var selectedExercise by rememberSaveable(stateSaver = jsonSaver(Exercise.serializer().nullable)) { mutableStateOf<Exercise?>(null) }
     LazyColumn(Modifier.fillMaxSize().padding(horizontal = 12.dp), verticalArrangement = Arrangement.spacedBy(10.dp), contentPadding = PaddingValues(bottom = 24.dp)) {
         item {
             Text("今日训练记录", style = MaterialTheme.typography.titleMedium)
             Text(session.name, style = MaterialTheme.typography.headlineSmall)
             Text("${if (session.status == "cancelled") "已取消" else "已完成"} · ${session.startedAt?.let(::localDateTime) ?: session.localDate}")
             TextButton(onClick = { viewModel.resumeToday(today) }) { Text("继续当天训练") }
+            if (session.status == "completed") {
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Button(onClick = { selectingType = "strength" }) { Text("添加训练动作") }
+                    OutlinedButton(onClick = { selectingType = "stretch" }) { Text("添加拉伸") }
+                }
+                Text("仅添加到当天训练，不会修改未来计划。", style = MaterialTheme.typography.bodySmall)
+            }
         }
         items(session.items, key = { it.id }) { item ->
             val exercise = session.exercises.singleOrNull { it.id == item.exerciseId } ?: return@items
@@ -97,7 +112,12 @@ fun CompletedTrainingScreen(session: Session, today: java.time.LocalDate, viewMo
                             TextButton(onClick = { editingResult = ResultTarget(item.id, result.setIndex) }) { Text("修改实际结果") }
                         }
                     }
-                    if (skipped) Text("该动作剩余目标已由替代动作安排；这不代表该动作已完成。", style = MaterialTheme.typography.bodySmall)
+                    if (session.status == "completed") {
+                        if (item.notes.isNotBlank()) Text(item.notes, style = MaterialTheme.typography.bodySmall)
+                        TextButton(onClick = { editingItemNotes = item.id; itemNotesDraft = item.notes }) {
+                            Text(if (item.notes.isBlank()) "添加动作备注" else "修改动作备注")
+                        }
+                    } else if (item.notes.isNotBlank()) Text(item.notes, style = MaterialTheme.typography.bodySmall)
                 }
             }
         }
@@ -156,6 +176,40 @@ fun CompletedTrainingScreen(session: Session, today: java.time.LocalDate, viewMo
                     }
                 }
             }
+        }
+    }
+    editingItemNotes?.let { itemId ->
+        FormDialog("动作备注", { editingItemNotes = null }, {
+            viewModel.updateCompletedItemNotes(session.id, itemId, itemNotesDraft)
+            editingItemNotes = null
+        }) {
+            TextInput("仅属于本次训练此动作", itemNotesDraft, { itemNotesDraft = it }, singleLine = false)
+        }
+    }
+    selectingType?.let { type ->
+        val targets = session.items.flatMap { item ->
+            session.exercises.singleOrNull { it.id == item.exerciseId }?.let {
+                if (it.type == "strength") it.muscles + it.secondaryMuscles else emptyList()
+            }.orEmpty()
+        }.toSet()
+        ExercisePicker(state, viewModel.repository, session.snapshot?.gymId, targets, type,
+            { selectingType = null }) { exercise ->
+            selectedExercise = exercise
+            pendingItem = newPlanItem(exercise, session.snapshot?.gymId, state)
+        }
+    }
+    pendingItem?.let { item ->
+        val exercise = selectedExercise ?: return@let
+        val positions = (0..session.items.size).map { position ->
+            position to if (position == 0) "放在最前面" else "放在 ${session.exercises.single { it.id == session.items[position - 1].exerciseId }.name} 之后"
+        }
+        PlanItemEditor(item, exercise, session.snapshot?.gymId, state, viewModel,
+            positions, session.items.size, { pendingItem = null; selectedExercise = null },
+            allowMeasurementChange = exercise.id.startsWith("smartworkout_")
+        ) { revised, position ->
+            viewModel.addSessionExercise(session.id, revised, exercise, position)
+            pendingItem = null
+            selectedExercise = null
         }
     }
 }

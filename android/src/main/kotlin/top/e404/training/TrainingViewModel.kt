@@ -236,15 +236,31 @@ class TrainingViewModel(application: Application) : AndroidViewModel(application
                 "${session.exercises.single { it.id == item.exerciseId }.name} · ${sideText(item.sets[index].side)}", sessionId, itemId, index, "exercise")
         }
     }
+    fun endRestTimer(expected: TimerState) = action { repository.endTimerFromNotification(expected) }
     fun stopTimer() = action { repository.setTimer(null) }
     fun updateSessionNotes(sessionId: String, notes: String) = action {
         repository.updateSession(sessionId) { session, timer -> session.copy(notes = notes) to timer }
     }
+    fun updateSessionItemNotes(sessionId: String, itemId: String, notes: String) = action {
+        repository.updateSession(sessionId) { session, timer ->
+            val updatedItems = session.items.map { item -> if (item.id == itemId) item.copy(notes = notes) else item }
+            require(updatedItems.any { it.id == itemId }) { "训练动作不存在" }
+            session.copy(items = updatedItems) to timer
+        }
+    }
+    fun updateCompletedItemNotes(sessionId: String, itemId: String, notes: String) = action {
+        repository.updateCompletedItemNotes(sessionId, itemId, notes)
+    }
     fun addSessionExercise(sessionId: String, item: PlanItem, exercise: Exercise, position: Int) = action {
         repository.updateSession(sessionId) { session, timer ->
+            require(session.status == "active" || session.status == "completed") { "仅可在当天训练中添加动作" }
+            require(session.localDate == java.time.LocalDate.now(java.time.ZoneId.of("Asia/Shanghai")).toString()) { "仅可添加到当天训练" }
             val items = session.items.toMutableList().apply { add(position.coerceIn(0, size), item) }
             val exercises = if (session.exercises.any { it.id == exercise.id }) session.exercises else session.exercises + exercise
-            session.copy(items = items, exercises = exercises) to timer
+            val continuing = session.status == "completed"
+            session.copy(items = items, exercises = exercises,
+                status = if (continuing) "active" else session.status,
+                endedAt = if (continuing) null else session.endedAt) to timer
         }
     }
     /** 已完成组保留原动作，剩余训练通过新条目执行；不改写开始时计划。 */
