@@ -6,10 +6,11 @@ data/
 data/xiaomi/
 .venv/
 **/.venv/
+.workspace/
+record/
 .env
 *.jks
 *.keystore
 release/
-.workspace/
 __pycache__/
 *.pyc
