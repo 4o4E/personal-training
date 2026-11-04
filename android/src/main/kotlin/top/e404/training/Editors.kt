@@ -95,7 +95,7 @@ import top.e404.training.shared.*
     var weight by rememberSaveable { mutableStateOf(original.load?.let { numericText(it.value) } ?: "") }
     var unit by rememberSaveable { mutableStateOf(original.load?.unit ?: equipment?.unit ?: "kg") }
     var meaning by rememberSaveable { mutableStateOf(original.load?.meaning ?: equipment?.meaning ?: "total") }
-    var mode by rememberSaveable { mutableStateOf(original.load?.mode ?: if (exercise.loadMode == "assistance") "assistance" else "external") }
+    val mode = original.load?.mode ?: "external"
     var side by rememberSaveable { mutableStateOf(original.side) }
     var applyAll by rememberSaveable { mutableStateOf(false) }
     val measurement = targetMeasurement(original, exercise.measurement)
@@ -122,7 +122,7 @@ import top.e404.training.shared.*
             if (!actual) TextInput("次数范围上限（可不填写）", maximum, { maximum = it }, numeric = true)
         } else TextInput(if (actual) "实际时长（秒）" else "目标时长（秒）", seconds, { seconds = it }, numeric = true)
         Choice("左右侧", side, listOf("both" to "双侧 / 不分侧", "left" to "左侧", "right" to "右侧"), { side = it })
-        Row { Checkbox(hasLoad, { hasLoad = it }); Text("填写外部负重或助力读数", Modifier.padding(top = 12.dp)) }
+        Row { Checkbox(hasLoad, { hasLoad = it }); Text("填写实际重量读数", Modifier.padding(top = 12.dp)) }
         if (hasLoad) {
             if (actual) {
                 val key = weightStepKey(exercise.id, equipment?.id, unit)
@@ -131,7 +131,6 @@ import top.e404.training.shared.*
             } else TextInput("器械原始重量", weight, { weight = it }, numeric = true)
             Choice("原始单位", unit, listOf("kg" to "公斤 kg", "lb" to "磅 lb"), { unit = it })
             Choice("重量含义", meaning, listOf("total" to "总重量", "per_hand" to "单只重量", "per_side" to "单侧配重"), { meaning = it })
-            Choice("负重或助力", mode, listOf("external" to "外部负重", "assistance" to "助力重量"), { mode = it })
         } else Text(if (exercise.bodyweight) "自重练习，不填写外部读数。" else "未填写重量不会被记录为零重量。", style = MaterialTheme.typography.bodySmall)
         TextInput("该组之后休息（秒，零表示不自动计时）", rest, { rest = it }, numeric = true)
         if (!actual) Row { Checkbox(applyAll, { applyAll = it }); Text("应用到该动作所有组", Modifier.padding(top = 12.dp)) }

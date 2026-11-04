@@ -51,6 +51,9 @@ fun CompletedTrainingScreen(session: Session, today: java.time.LocalDate, viewMo
     var selectingType by rememberSaveable { mutableStateOf<String?>(null) }
     var pendingItem by rememberSaveable(stateSaver = jsonSaver(PlanItem.serializer().nullable)) { mutableStateOf<PlanItem?>(null) }
     var selectedExercise by rememberSaveable(stateSaver = jsonSaver(Exercise.serializer().nullable)) { mutableStateOf<Exercise?>(null) }
+    var correctingItemId by rememberSaveable { mutableStateOf<String?>(null) }
+    var correctingExercise by rememberSaveable(stateSaver = jsonSaver(Exercise.serializer().nullable)) { mutableStateOf<Exercise?>(null) }
+    var correctingEquipmentId by rememberSaveable { mutableStateOf<String?>(null) }
     LazyColumn(Modifier.fillMaxSize().padding(horizontal = 12.dp), verticalArrangement = Arrangement.spacedBy(10.dp), contentPadding = PaddingValues(bottom = 24.dp)) {
         item {
             Text("今日训练记录", style = MaterialTheme.typography.titleMedium)
@@ -118,6 +121,10 @@ fun CompletedTrainingScreen(session: Session, today: java.time.LocalDate, viewMo
                             Text(if (item.notes.isBlank()) "添加动作备注" else "修改动作备注")
                         }
                     } else if (item.notes.isNotBlank()) Text(item.notes, style = MaterialTheme.typography.bodySmall)
+                    if (session.status == "completed") TextButton(onClick = {
+                        correctingItemId = item.id
+                        selectingType = exercise.type
+                    }) { Text("订正实际动作 / 器械") }
                 }
             }
         }
@@ -144,7 +151,7 @@ fun CompletedTrainingScreen(session: Session, today: java.time.LocalDate, viewMo
                         val input = segments[index]
                         val repetitions = input.reps.toIntOrNull() ?: throw IllegalArgumentException("每段次数须为正整数")
                         require(repetitions > 0) { "每段次数须为正整数" }
-                        val load = completedLoad(input.load, input.unit, original.load, exercise)
+                        val load = completedLoad(input.load, input.unit, original.load)
                         SetSegment(repetitions, load)
                     }
                     val reps = if (revisedSegments != null) revisedSegments.sumOf { it.reps }
@@ -152,7 +159,7 @@ fun CompletedTrainingScreen(session: Session, today: java.time.LocalDate, viewMo
                     val seconds = if (measurement == "seconds") secondsText.toIntOrNull() ?: throw IllegalArgumentException("时长须为正整数秒") else result.seconds
                     require(reps == null || reps > 0) { "次数须为正整数" }
                     require(seconds == null || seconds > 0) { "时长须为正整数秒" }
-                    val load = if (result.segments.isNotEmpty()) null else completedLoad(weightText, unit, result.load, exercise)
+                    val load = if (result.segments.isNotEmpty()) null else completedLoad(weightText, unit, result.load)
                     viewModel.repository.updateCompletedResult(session.id, target.itemId, target.setIndex, reps, seconds, load, revisedSegments)
                     editingResult = null
                 }
@@ -192,10 +199,41 @@ fun CompletedTrainingScreen(session: Session, today: java.time.LocalDate, viewMo
                 if (it.type == "strength") it.muscles + it.secondaryMuscles else emptyList()
             }.orEmpty()
         }.toSet()
-        ExercisePicker(state, viewModel.repository, session.snapshot?.gymId, targets, type,
-            { selectingType = null }) { exercise ->
-            selectedExercise = exercise
-            pendingItem = newPlanItem(exercise, session.snapshot?.gymId, state)
+        ExercisePicker(state, viewModel.repository, session.snapshot?.gymId, targets,
+            if (correctingItemId != null) null else type,
+            { selectingType = null; correctingItemId = null }) { exercise ->
+            selectingType = null
+            val correctingId = correctingItemId
+            if (correctingId != null) {
+                val oldItem = session.items.single { it.id == correctingId }
+                val equipment = state.records(Kind.equipment).map { it.value<Equipment>() }
+                    .filter { it.gymId == session.snapshot?.gymId && exercise.equipmentTags.firstOrNull() in it.tags }
+                correctingExercise = exercise
+                correctingEquipmentId = oldItem.equipmentId.takeIf { id -> equipment.any { it.id == id } }
+            } else {
+                selectedExercise = exercise
+                pendingItem = newPlanItem(exercise, session.snapshot?.gymId, state)
+            }
+        }
+    }
+    correctingItemId?.let { itemId ->
+        val exercise = correctingExercise
+        if (exercise != null) {
+            val equipment = state.records(Kind.equipment).map { it.value<Equipment>() }
+                .filter { it.gymId == session.snapshot?.gymId && exercise.equipmentTags.firstOrNull() in it.tags }
+            val equipmentChoices = listOf(null to "不指定器械") + equipment.map { it.id to it.name }
+            val unknown = SOURCE_UNKNOWN_EQUIPMENT_TAG in exercise.equipmentTags
+            FormDialog("订正实际动作", {
+                correctingExercise = null; correctingItemId = null
+            }, {
+                viewModel.correctCompletedExercise(session.id, itemId, exercise, if (unknown) null else correctingEquipmentId)
+                correctingExercise = null; correctingItemId = null
+            }) {
+                Text("仅更正实际动作和器械身份；组数、实际读数、时间及开始时计划保持不变。", style = MaterialTheme.typography.bodySmall)
+                if (!unknown && exercise.equipmentTags.isNotEmpty())
+                    Choice("实际器械", correctingEquipmentId, equipmentChoices, { correctingEquipmentId = it })
+                if (unknown) Text("器械条件未知；不关联具体器械。", style = MaterialTheme.typography.bodySmall)
+            }
         }
     }
     pendingItem?.let { item ->
@@ -214,9 +252,9 @@ fun CompletedTrainingScreen(session: Session, today: java.time.LocalDate, viewMo
     }
 }
 
-private fun completedLoad(value: String, unit: String, original: Load?, exercise: Exercise): Load? {
+private fun completedLoad(value: String, unit: String, original: Load?): Load? {
     if (value.isBlank()) return null
     val amount = doubleInput(value, "重量")
     require(amount.isFinite() && amount >= 0.0) { "重量必须为非负有限数值" }
-    return Load(amount, unit, original?.meaning ?: "unknown", original?.mode ?: exercise.loadMode)
+    return Load(amount, unit, original?.meaning ?: "unknown", original?.mode ?: "external")
 }

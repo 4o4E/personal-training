@@ -248,6 +248,16 @@ class TrainingViewModel(application: Application) : AndroidViewModel(application
             session.copy(items = updatedItems) to timer
         }
     }
+    fun correctSessionExercise(sessionId: String, itemId: String, exercise: Exercise, equipmentId: String?) = action {
+        repository.updateSession(sessionId) { session, timer ->
+            require(session.status == "active") { "仅可订正进行中的训练动作" }
+            top.e404.training.shared.correctSessionExercise(session, itemId, exercise, equipmentId) to timer
+        }
+    }
+    fun correctCompletedExercise(sessionId: String, itemId: String, exercise: Exercise, equipmentId: String?) = action {
+        repository.updateCompletedExercise(sessionId, itemId, exercise, equipmentId)
+    }
+
     fun updateCompletedItemNotes(sessionId: String, itemId: String, notes: String) = action {
         repository.updateCompletedItemNotes(sessionId, itemId, notes)
     }
@@ -263,18 +273,11 @@ class TrainingViewModel(application: Application) : AndroidViewModel(application
                 endedAt = if (continuing) null else session.endedAt) to timer
         }
     }
-    /** 已完成组保留原动作，剩余训练通过新条目执行；不改写开始时计划。 */
+    /** 已完成组保留原动作；仅未完成组交给新动作，开始时计划不变。 */
     fun replaceSessionExercise(sessionId: String, originalId: String, replacement: PlanItem, exercise: Exercise) = action {
         repository.updateSession(sessionId) { session, timer ->
-            val original = session.items.single { it.id == originalId }
-            val complete = session.results.count { it.itemId == originalId }
-            require(complete < original.sets.size) { "该动作已完成，请使用添加动作继续训练" }
-            val position = session.items.indexOf(original)
-            val items = session.items.toMutableList()
-            val skipped = session.skippedItems.toMutableList()
-            if (complete == 0) items[position] = replacement else { skipped += originalId; items.add(position + 1, replacement) }
-            val exercises = if (session.exercises.any { it.id == exercise.id }) session.exercises else session.exercises + exercise
-            session.copy(items = items, skippedItems = skipped, exercises = exercises) to timer
+            require(session.status == "active") { "仅可调整进行中的训练" }
+            top.e404.training.shared.replaceRemainingSessionExercise(session, originalId, replacement, exercise) to timer
         }
     }
 }

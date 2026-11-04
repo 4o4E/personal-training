@@ -452,6 +452,41 @@ private fun checkLoad(load: Load?) {
     require(load.meaning in setOf("total", "per_hand", "per_side", "unknown")) { "重量含义不正确" }
     require(load.mode in setOf("external", "assistance")) { "重量须区分负重或助力" }
 }
+
+/** 更正实际动作身份，不改开始时快照、组目标、结果或真实完成时间。 */
+fun correctSessionExercise(session: Session, itemId: String, exercise: Exercise, equipmentId: String?): Session {
+    val itemIndex = session.items.indexOfFirst { it.id == itemId }
+    require(itemIndex >= 0) { "训练动作不存在" }
+    val item = session.items[itemIndex]
+    val exercises = if (session.exercises.any { it.id == exercise.id }) session.exercises
+        else session.exercises + exercise
+    return session.copy(
+        items = session.items.toMutableList().apply {
+            set(itemIndex, item.copy(exerciseId = exercise.id, equipmentId = equipmentId))
+        },
+        exercises = exercises
+    )
+}
+/** 只转移未完成目标；已完成动作及其结果留在原位置，开始时计划保持不变。 */
+fun replaceRemainingSessionExercise(session: Session, itemId: String, replacement: PlanItem, exercise: Exercise): Session {
+    val itemIndex = session.items.indexOfFirst { it.id == itemId }
+    require(itemIndex >= 0) { "训练动作不存在" }
+    val original = session.items[itemIndex]
+    val originalResults = session.results.filter { it.itemId == itemId }
+    val remainingCount = original.sets.indices.count { index -> originalResults.none { it.setIndex == index } }
+    require(remainingCount > 0) { "该动作已完成，请使用添加动作继续训练" }
+    val items = session.items.toMutableList()
+    val skipped = session.skippedItems.toMutableList()
+    // 来源条目即使尚无完成组也必须保留，避免换练后留下失效的来源引用。
+    val referencedBySource = session.sourceRecords.any { itemId in it.itemIds }
+    if (originalResults.isEmpty() && !referencedBySource) items[itemIndex] = replacement
+    else {
+        if (itemId !in skipped) skipped += itemId
+        items.add(itemIndex + 1, replacement)
+    }
+    val exercises = if (session.exercises.any { it.id == exercise.id }) session.exercises else session.exercises + exercise
+    return session.copy(items = items, skippedItems = skipped, exercises = exercises)
+}
 fun checkTarget(target: SetTarget) {
     checkLoad(target.load)
     require(target.reps == null || target.reps > 0) { "次数必须大于零" }
@@ -660,7 +695,11 @@ fun validateDocument(
                 val replacedItemIds = old.sourceRecords.filter { it.sourceId in replaceSourceIds }.flatMapTo(hashSetOf()) { it.itemIds }
                 val replacedExerciseIds = old.items.filter { it.id in replacedItemIds }.mapTo(hashSetOf()) { it.exerciseId }
                 old.exercises.filterNot { it.id in replacedExerciseIds }.forEach { exercise ->
-                    require(exercise in session.exercises) { "已经记录的动作说明不能改写" }
+                    val normalized = repairHistoricalEquipmentDocument(document(Kind.exercise, exercise.id, exercise)).value<Exercise>()
+                    val updated = session.exercises.singleOrNull { it.id == exercise.id }?.let { candidate ->
+                        repairHistoricalEquipmentDocument(document(Kind.exercise, candidate.id, candidate)).value<Exercise>()
+                    }
+                    require(updated == normalized) { "已经记录的动作说明不能改写" }
                 }
                 old.sourceRecords.forEach { source ->
                     val nextSource = session.sourceRecords.singleOrNull { it.sourceId == source.sourceId }
@@ -675,11 +714,15 @@ fun validateDocument(
                 }
                 old.items.forEach { oldItem ->
                     val nextItem = session.items.singleOrNull { it.id == oldItem.id }
-                    require(nextItem != null && oldItem.exerciseId == nextItem.exerciseId &&
-                        oldItem.equipmentId == nextItem.equipmentId &&
-                        nextItem.sets.size >= oldItem.sets.size &&
-                        nextItem.sets.take(oldItem.sets.size) == oldItem.sets) {
-                        "已有动作、器械及目标不能改写；仅可在末尾追加目标"
+                    if (nextItem == null) {
+                        require(old.results.none { it.itemId == oldItem.id }) {
+                            "已有实际组关联的动作不能删除"
+                        }
+                    } else {
+                        require(nextItem.sets.size >= oldItem.sets.size &&
+                            nextItem.sets.take(oldItem.sets.size) == oldItem.sets) {
+                            "已有动作目标不能改写；仅可在末尾追加目标"
+                        }
                     }
                 }
                 val oldResultKeys = old.results.mapTo(hashSetOf()) { it.itemId to it.setIndex }

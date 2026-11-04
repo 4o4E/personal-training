@@ -21,6 +21,7 @@ class TrainingBehaviorTest {
     private val exercises by lazy { seed.filter { it.kind == Kind.exercise }.map { it.value<Exercise>() } }
     private val dumbbell by lazy { exercises.first { it.type == "strength" && "chest" in it.muscles && it.equipmentTags.any { tag -> tag.contains("dumbbell") } } }
     private val assisted by lazy { exercises.first { it.loadMode == "assistance" && "lats" in it.muscles } }
+    private val bodyweight by lazy { exercises.first { it.loadMode == "bodyweight" } }
     private val stretch by lazy { exercises.first { it.type == "stretch" && it.measurement == "seconds" && it.unilateral } }
     private val dynamic by lazy { exercises.first { it.type == "stretch" && it.measurement == "reps" } }
     private val program = Program("program", "分化方案", listOf(SplitSlot("push", "推日", listOf("chest")), SplitSlot("pull", "拉日", listOf("lats")), SplitSlot("legs", "腿日", listOf("quadriceps"))))
@@ -122,7 +123,91 @@ class TrainingBehaviorTest {
         assertEquals(setOf(actual.snapshot!!.id), recordedPlanIds(listOf(sourced)))
         assertTrue(recordedPlanIds(listOf(sourced.copy(results = emptyList()))).isEmpty())
     }
+    @Test fun `实际动作订正保留开始快照组目标读数和完成时间并可保存`() {
+        Store(directory, seed).use { store ->
+            val original = session("correct-actual", "push", "completed", start)
+            val stored = store.put(document(Kind.session, original.id, original))
+            val correctedExercise = assisted.copy(id = "actual-corrected-exercise")
+            val corrected = correctSessionExercise(original, "item", correctedExercise, "actual-equipment")
+            assertEquals(original.snapshot, corrected.snapshot)
+            assertEquals(original.items.single().sets, corrected.items.single().sets)
+            assertEquals(original.results, corrected.results)
+            assertEquals("actual-corrected-exercise", corrected.items.single().exerciseId)
+            assertEquals("actual-equipment", corrected.items.single().equipmentId)
+            val saved = store.put(document(Kind.session, corrected.id, corrected), stored.revision).value<Session>()
+            assertEquals(original.snapshot, saved.snapshot)
+            assertEquals(original.results.single().completedAt, saved.results.single().completedAt)
+            assertEquals(original.results.single().load, saved.results.single().load)
+            val summary = summarizeHistory(listOf(saved))
+            assertEquals(1, summary.strengthSetsByMuscle["lats"])
+            assertEquals(0, summary.strengthSetsByMuscle["chest"] ?: 0)
+        }
+    }
+    @Test fun `零完成组更换剩余动作可删除旧实际条目且不改计划快照`() {
+        Store(directory, seed).use { store ->
+            val original = session("zero-replace", "push", "active", start)
+                .copy(results = emptyList(), endedAt = null)
+            val stored = store.put(document(Kind.session, original.id, original))
+            val replacement = PlanItem("replacement-item", assisted.id, sets = List(4) { SetTarget(reps = 10) })
+            val changed = replaceRemainingSessionExercise(original, "item", replacement, assisted)
+            val saved = store.put(document(Kind.session, changed.id, changed), stored.revision).value<Session>()
+            assertEquals(original.snapshot, saved.snapshot)
+            assertEquals(listOf(replacement), saved.items)
+            assertTrue(saved.results.isEmpty())
+            assertEquals(original.localDate, saved.localDate)
+            assertEquals(original.startedAt, saved.startedAt)
+        }
+    }
 
+    @Test fun `来源关联零完成动作换练保留来源并可保存`() {
+        Store(directory, seed).use { store ->
+            val initial = session("source-replacement", "push", "active", start)
+            val kept = initial.items.single().copy(id = "kept")
+            val original = initial.copy(
+                items = initial.items + kept,
+                results = initial.results.map { it.copy(itemId = kept.id) },
+                sourceRecords = listOf(SessionSource(
+                    "source", "已有来源", initial.localDate,
+                    snapshot = initial.snapshot, itemIds = listOf("item")
+                ))
+            )
+            val stored = store.put(document(Kind.session, original.id, original))
+            val replacement = PlanItem("replacement", assisted.id, sets = List(4) { SetTarget(reps = 10) })
+            val changed = replaceRemainingSessionExercise(original, "item", replacement, assisted)
+            val saved = store.put(document(Kind.session, changed.id, changed), stored.revision).value<Session>()
+            assertEquals(original.sourceRecords, saved.sourceRecords)
+            assertEquals(original.results, saved.results)
+            assertEquals(original.snapshot, saved.snapshot)
+            assertEquals(listOf("item"), saved.skippedItems)
+            assertEquals(listOf("item", replacement.id, kept.id), saved.items.map { it.id })
+            assertEquals(1, summarizeHistory(listOf(saved)).strengthSets)
+        }
+    }
+
+    @Test fun `自重分类实际动作可以按原始单位记录器械重量`() {
+        Store(directory, seed).use { store ->
+            val original = session("bodyweight-load", "push", "completed", start)
+            val item = original.items.single().copy(exerciseId = bodyweight.id)
+            val snapshot = original.snapshot!!.copy(items = listOf(item))
+            val recorded = original.copy(
+                snapshot = snapshot,
+                exercises = listOf(bodyweight),
+                items = listOf(item),
+                results = listOf(
+                    original.results.single().copy(load = Load(10.0, "kg", mode = "external")),
+                    SetResult("item", 1, reps = 6, completedAt = start + 2000, segments = listOf(SetSegment(6, Load(5.0, "lb", mode = "external"))))
+                )
+            )
+            val saved = store.put(document(Kind.session, recorded.id, recorded)).value<Session>()
+            assertEquals(10.0, saved.results[0].load?.value)
+            assertEquals("kg", saved.results[0].load?.unit)
+            assertEquals("external", saved.results[0].load?.mode)
+            assertEquals(5.0, saved.results[1].segments.single().load?.value)
+            assertEquals("lb", saved.results[1].segments.single().load?.unit)
+            assertEquals("external", saved.results[1].segments.single().load?.mode)
+            assertEquals(bodyweight.id, saved.items.single().exerciseId)
+        }
+    }
     @Test fun `实际组与拉伸分开统计并保留混合单位和助力`() {
         val items = listOf(
             PlanItem("db", dumbbell.id, sets = List(4) { SetTarget(reps = 12, load = Load(22.5, "kg", "per_hand")) }),
@@ -829,4 +914,57 @@ class TrainingBehaviorTest {
             assertFailsWith<ImportConflict> { store.import(backup, replace = false) }
         }
     }
+
+    @Test fun `历史器械资料重复导入稳定归一且不新增训练结果`() {
+        val exercise = dumbbell.copy(id = "historical-cable-pushdown", name = "历史绳索三头下压", equipmentTags = emptyList())
+        val item = PlanItem("historical-item", exercise.id, sets = listOf(SetTarget(reps = 10)))
+        val result = SetResult(item.id, 0, reps = 10, completedAt = start + 1000)
+        val plan = Plan("historical-plan", "历史计划", items = listOf(item))
+        val session = Session("day-2026-10-22", "历史训练", plan, listOf(exercise), start, start + 5000, "completed",
+            results = listOf(result), items = listOf(item), localDate = "2026-10-22")
+        val backup = Backup(formatVersion = 4,
+            documents = listOf(document(Kind.exercise, exercise.id, exercise), document(Kind.session, session.id, session)),
+            exportedAt = start)
+        Store(directory.resolve("historical-repeat-import"), seed).use { store ->
+            val first = store.import(backup, replace = false)
+            val second = store.import(backup, replace = false)
+            assertEquals(first, second)
+            assertEquals(listOf("cable"), store.get(Kind.exercise, exercise.id)!!.value<Exercise>().equipmentTags)
+            val saved = store.get(Kind.session, session.id)!!.value<Session>()
+            assertEquals(session.results, saved.results)
+            assertEquals(session.items, saved.items)
+            assertEquals(session.startedAt, saved.startedAt)
+            assertEquals(session.endedAt, saved.endedAt)
+        }
+    }
+
+    @Test fun `历史器械修复仅补明确类别并保留身份快照与实际读数`() {
+        val cable = dumbbell.copy(id = "historical-cable-pushdown", name = "历史绳索三头下压", equipmentTags = emptyList())
+        val dumbbellExercise = dumbbell.copy(id = "historical-dumbbell-curl", name = "历史哑铃弯举", equipmentTags = emptyList())
+        val ambiguous = dumbbell.copy(id = "historical-row", name = "历史划船", equipmentTags = emptyList())
+        val exerciseDocument = repairHistoricalEquipmentDocument(document(Kind.exercise, cable.id, cable).copy(revision = 8))
+        assertEquals(listOf("cable"), exerciseDocument.value<Exercise>().equipmentTags)
+        assertEquals(listOf("dumbbell"), repairHistoricalEquipmentDocument(document(Kind.exercise, dumbbellExercise.id, dumbbellExercise)).value<Exercise>().equipmentTags)
+        assertEquals(cable.id, exerciseDocument.id)
+        assertEquals(8, exerciseDocument.revision)
+        val plan = Plan("historical-plan", "原计划副本", items = listOf(PlanItem("item", cable.id, sets = listOf(SetTarget(reps = 12)))))
+        val result = SetResult("item", 0, reps = 12, load = Load(10.0, "kg"), completedAt = start + 1000)
+        val session = Session(
+            "historical-session", "历史训练", plan, listOf(cable, ambiguous), start, start + 5000, "completed",
+            results = listOf(result), items = plan.items, localDate = "2026-10-22"
+        )
+        val original = document(Kind.session, session.id, session).copy(revision = 7)
+        val repairedDocument = repairHistoricalEquipmentDocument(original)
+        val repaired = repairedDocument.value<Session>()
+        assertEquals(7, repairedDocument.revision)
+        assertEquals(listOf("cable"), repaired.exercises.first { it.id == cable.id }.equipmentTags)
+        assertEquals(listOf(SOURCE_UNKNOWN_EQUIPMENT_TAG), repaired.exercises.first { it.id == ambiguous.id }.equipmentTags)
+        assertEquals(session.snapshot, repaired.snapshot)
+        assertEquals(session.items, repaired.items)
+        assertEquals(session.results, repaired.results)
+        assertEquals(session.startedAt, repaired.startedAt)
+        assertEquals(session.endedAt, repaired.endedAt)
+        assertEquals(repairedDocument, repairHistoricalEquipmentDocument(repairedDocument))
+    }
+
 }

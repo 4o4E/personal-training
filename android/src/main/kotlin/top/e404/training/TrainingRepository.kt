@@ -43,6 +43,13 @@ import java.util.UUID
 import java.util.concurrent.TimeUnit
 
 private fun sessionDraftKey(sessionId: String) = "session-draft/$sessionId"
+internal fun arrangementOverrideToConsume(previous: Session, next: Session): Pair<String, String>? {
+    if (next.results.size <= previous.results.size) return null
+    val programId = next.snapshot?.programId ?: return null
+    val overrideId = next.arrangementOverrideId ?: return null
+    return programId to overrideId
+}
+
 private fun mergePreparedSessionDraft(prepared: Session, draft: Session): Session {
     if (draft.snapshot == prepared.snapshot) return prepared.copy(
         items = draft.items,
@@ -102,6 +109,60 @@ private fun mergePreparedSessionDraft(prepared: Session, draft: Session): Sessio
         skippedItems = prepared.skippedItems + draft.skippedItems.filter { it in finalItemIds }
     )
 }
+internal fun validateDayHistorySessionEdit(original: Document, changed: Document) {
+    val before = original.value<Session>()
+    val after = changed.value<Session>()
+    require(before.status != "active" && after.status == before.status) { "正在进行的训练请在训练页面修改" }
+    require(after.copy(items = before.items, exercises = before.exercises, notes = before.notes, results = before.results) == before) {
+        "历史编辑不能改写训练计划或会话信息"
+    }
+    require(after.results.size == before.results.size) { "历史编辑不能增删完成组" }
+    require(after.items.size == before.items.size && after.items.map { it.id } == before.items.map { it.id }) {
+        "历史编辑不能增删或重排训练动作"
+    }
+    before.items.zip(after.items).forEach { (old, next) ->
+        require(next.copy(exerciseId = old.exerciseId, equipmentId = old.equipmentId, notes = old.notes) == old) {
+            "历史编辑不能改写原始组目标"
+        }
+    }
+    require(after.exercises.size >= before.exercises.size &&
+        after.exercises.take(before.exercises.size).map { it.id } == before.exercises.map { it.id }) {
+        "历史编辑不能删除或重排动作说明"
+    }
+    fun normalized(exercise: Exercise) =
+        repairHistoricalEquipmentDocument(document(Kind.exercise, exercise.id, exercise)).value<Exercise>()
+    before.exercises.forEachIndexed { index, exercise ->
+        require(normalized(after.exercises[index]) == normalized(exercise)) { "历史编辑不能改写已有动作说明" }
+    }
+    val changedExerciseIds = before.items.zip(after.items)
+        .filter { (old, next) -> old.exerciseId != next.exerciseId }
+        .mapTo(hashSetOf()) { it.second.exerciseId }
+    require(after.exercises.drop(before.exercises.size).all { it.id in changedExerciseIds }) {
+        "历史编辑不能添加无关动作说明"
+    }
+    val itemById = before.items.associateBy { it.id }
+    val exerciseById = before.exercises.associateBy { it.id }
+    before.results.zip(after.results).forEach { (old, next) ->
+        require(old.itemId == next.itemId && old.setIndex == next.setIndex &&
+            old.side == next.side && old.completedAt == next.completedAt &&
+            old.segments.size == next.segments.size) { "历史编辑不能改变组身份、时间或分段数量" }
+        val item = requireNotNull(itemById[old.itemId]) { "完成组动作不存在" }
+        val exercise = requireNotNull(exerciseById[item.exerciseId]) { "完成组动作说明不存在" }
+        val measurement = targetMeasurement(item.sets.getOrNull(old.setIndex), exercise.measurement)
+        if (measurement == "seconds") {
+            require(old.reps == next.reps && old.segments.isEmpty() && next.segments.isEmpty()) { "该动作按时长记录" }
+        } else require(old.seconds == next.seconds) { "该动作按次数记录" }
+        old.segments.zip(next.segments).forEach { (oldSegment, nextSegment) ->
+            require(oldSegment.copy(reps = nextSegment.reps, load = nextSegment.load) == nextSegment) {
+                "历史编辑只能修改分段重量和次数"
+            }
+        }
+        require(old.copy(reps = next.reps, seconds = next.seconds, load = next.load, segments = next.segments) == next) {
+            "历史编辑只能修改实际读数"
+        }
+    }
+}
+
 private fun Document.key() = "${kind.name}/$id"
 private data class Cached(val document: Document, val dirty: Boolean, val remote: Document? = null)
 @kotlinx.serialization.Serializable
@@ -113,6 +174,13 @@ data class ExerciseGuide(
     val tips: List<String>,
     val mistakes: List<String>,
     val instructions: List<String> = emptyList()
+)
+enum class ExerciseGuideStatus { available, unconfigured, notAssociated, requestFailed }
+data class ExerciseGuideResult(
+    val guide: ExerciseGuide?,
+    val status: ExerciseGuideStatus,
+    val cached: Boolean = false,
+    val requestFailure: String? = null
 )
 @kotlinx.serialization.Serializable
 data class SmartWorkoutExerciseSource(val sourceId: String, val name: String)
@@ -314,7 +382,8 @@ class TrainingRepository(
             val byId = grouped.getValue(kind).toMutableMap()
             updates.forEach { value ->
                 val key = value.document.key()
-                cache[key] = value; byId[value.document.id] = value.document
+                val repairedDocument = repairHistoricalEquipmentDocument(value.document)
+                cache[key] = value; byId[value.document.id] = repairedDocument
                 if (value.dirty) pending.add(key) else pending.remove(key)
                 if (value.remote != null) conflicting.add(key) else conflicting.remove(key)
             }
@@ -404,34 +473,8 @@ class TrainingRepository(
         }
         if (entries.isNotEmpty()) enqueueSync()
     }
-    private fun validateDayHistorySession(original: Document, changed: Document) {
-        val before = original.value<Session>()
-        val after = changed.value<Session>()
-        require(before.status != "active" && after.status != "active") { "正在进行的训练请在训练页面修改" }
-        require(after.copy(notes = before.notes, results = before.results) == before) { "历史编辑不能改写训练计划或会话信息" }
-        require(after.results.size == before.results.size) { "历史编辑不能增删完成组" }
-        val itemById = before.items.associateBy { it.id }
-        val exerciseById = before.exercises.associateBy { it.id }
-        before.results.zip(after.results).forEach { (old, next) ->
-            require(old.itemId == next.itemId && old.setIndex == next.setIndex &&
-                old.side == next.side && old.completedAt == next.completedAt &&
-                old.segments.size == next.segments.size) { "历史编辑不能改变组身份、时间或分段数量" }
-            val item = requireNotNull(itemById[old.itemId]) { "完成组动作不存在" }
-            val exercise = requireNotNull(exerciseById[item.exerciseId]) { "完成组动作说明不存在" }
-            val measurement = targetMeasurement(item.sets.getOrNull(old.setIndex), exercise.measurement)
-            if (measurement == "seconds") {
-                require(old.reps == next.reps && old.segments.isEmpty() && next.segments.isEmpty()) { "该动作按时长记录" }
-            } else require(old.seconds == next.seconds) { "该动作按次数记录" }
-            old.segments.zip(next.segments).forEach { (oldSegment, nextSegment) ->
-                require(oldSegment.copy(reps = nextSegment.reps, load = nextSegment.load) == nextSegment) {
-                    "历史编辑只能修改分段重量和次数"
-                }
-            }
-            require(old.copy(reps = next.reps, seconds = next.seconds, load = next.load, segments = next.segments) == next) {
-                "历史编辑只能修改实际读数"
-            }
-        }
-    }
+    private fun validateDayHistorySession(original: Document, changed: Document) =
+        validateDayHistorySessionEdit(original, changed)
     private fun validateDayHistoryActivity(original: ActivityRecord, changed: ActivityRecord) {
         require(original.copy(
             name = changed.name, localDate = changed.localDate, durationSeconds = changed.durationSeconds,
@@ -842,10 +885,7 @@ class TrainingRepository(
                 next
             }
             _preparedTraining.value = session
-            val programId = session.snapshot?.programId
-            val overrideId = session.arrangementOverrideId
-            if (session.results.isNotEmpty() && programId != null && overrideId != null)
-                completedOverride = programId to overrideId
+            completedOverride = arrangementOverrideToConsume(current, session)
         }
         completedOverride?.let { (programId, id) ->
             saveArrangement { arrangement ->
@@ -921,6 +961,19 @@ class TrainingRepository(
             }
             require(revisedItems.any { it.id == itemId }) { "训练动作不存在" }
             saveCompletedSession(original, current.copy(items = revisedItems))
+        }
+        enqueueSync()
+    }
+    suspend fun updateCompletedExercise(
+        sessionId: String, itemId: String, exercise: Exercise, equipmentId: String?
+    ) = withContext(Dispatchers.IO) {
+        initialize()
+        gate.withLock {
+            val original = requireNotNull(lookup(Kind.session, sessionId)) { "训练不存在" }
+            require(!original.deleted) { "训练记录不存在" }
+            val current = original.value<Session>()
+            require(current.status == "completed") { "仅可修改已完成的训练" }
+            saveCompletedSession(original, correctSessionExercise(current, itemId, exercise, equipmentId))
         }
         enqueueSync()
     }
@@ -1342,44 +1395,37 @@ class TrainingRepository(
         }
     }
 
-    suspend fun loadExerciseGuide(exerciseId: String): ExerciseGuide? = withContext(Dispatchers.IO) {
-        val key = "exercise-guide/$exerciseId"
-        val cached = dao.value(key)?.let { wireJson.decodeFromString<ExerciseGuide>(it) }
-        val connection = vault.load()
-        if (!connection.configured) return@withContext cached
-        try {
-            val response = client.get("${connection.url}/v1/exercise-guide/${exerciseId.encodeURLPathPart()}") {
-                bearerAuth(connection.token)
-            }
-            if (response.status.value == 404) return@withContext cached
-            requireSuccess(response)
-            response.body<ExerciseGuide>().also { guide ->
-                dao.putValue(LocalValue(key, wireJson.encodeToString(guide)))
-            }
-        } catch (error: CancellationException) {
-            throw error
-        } catch (error: Exception) {
-            cached ?: throw error
-        }
+    suspend fun loadExerciseGuide(exerciseId: String): ExerciseGuideResult =
+        loadGuide("exercise-guide/$exerciseId", "/v1/exercise-guide/${exerciseId.encodeURLPathPart()}")
+
+    suspend fun loadSmartWorkoutExerciseGuide(sourceId: String): ExerciseGuideResult =
+        loadGuide("smartworkout-guide/$sourceId", "/v1/smartworkout/exercises/${sourceId.encodeURLPathPart()}/guide")
+
+    suspend fun selectedExerciseTeaching(exerciseId: String): SmartWorkoutExerciseSource? = withContext(Dispatchers.IO) {
+        dao.value("exercise-teaching-selection/$exerciseId")?.let { wireJson.decodeFromString<SmartWorkoutExerciseSource>(it) }
     }
-    suspend fun loadSmartWorkoutExerciseGuide(sourceId: String): ExerciseGuide? = withContext(Dispatchers.IO) {
-        val key = "smartworkout-guide/$sourceId"
+
+    suspend fun selectExerciseTeaching(exerciseId: String, source: SmartWorkoutExerciseSource?) = withContext(Dispatchers.IO) {
+        val key = "exercise-teaching-selection/$exerciseId"
+        if (source == null) dao.removeValue(key)
+        else dao.putValue(LocalValue(key, wireJson.encodeToString(source)))
+    }
+
+    private suspend fun loadGuide(key: String, path: String): ExerciseGuideResult = withContext(Dispatchers.IO) {
         val cached = dao.value(key)?.let { wireJson.decodeFromString<ExerciseGuide>(it) }
         val connection = vault.load()
-        if (!connection.configured) return@withContext cached
+        if (!connection.configured) return@withContext ExerciseGuideResult(cached, ExerciseGuideStatus.unconfigured, cached != null)
         try {
-            val response = client.get("${connection.url}/v1/smartworkout/exercises/${sourceId.encodeURLPathPart()}/guide") {
-                bearerAuth(connection.token)
-            }
-            if (response.status.value == 404) return@withContext cached
+            val response = client.get("${connection.url}$path") { bearerAuth(connection.token) }
+            if (response.status.value == 404) return@withContext ExerciseGuideResult(cached, ExerciseGuideStatus.notAssociated, cached != null)
             requireSuccess(response)
-            response.body<ExerciseGuide>().also { guide ->
-                dao.putValue(LocalValue(key, wireJson.encodeToString(guide)))
-            }
+            val guide = response.body<ExerciseGuide>()
+            dao.putValue(LocalValue(key, wireJson.encodeToString(guide)))
+            ExerciseGuideResult(guide, ExerciseGuideStatus.available)
         } catch (error: CancellationException) {
             throw error
         } catch (error: Exception) {
-            cached ?: throw error
+            ExerciseGuideResult(cached, ExerciseGuideStatus.requestFailed, cached != null, error.message)
         }
     }
 
@@ -1814,13 +1860,14 @@ class TrainingRepository(
                 "完整健康备份必须连接配套后端并在线恢复；本机训练资料尚未修改"
             }
             gate.withLock {
-                val incomingSessions = backup.documents.filter { it.kind == Kind.session }
+                val incomingSessions = backup.documents.filter { it.kind == Kind.session }.map(::repairHistoricalEquipmentDocument)
                 val mergedSessions = mergeImportedSessions(
-                    existing = cache.values.map { it.document }.filter { it.kind == Kind.session },
+                    existing = cache.values.map { repairHistoricalEquipmentDocument(it.document) }.filter { it.kind == Kind.session },
                     incoming = incomingSessions,
                     replace = replace
                 )
-                val docsToImport = backup.documents.filterNot { it.kind == Kind.session } + mergedSessions
+                val docsToImport = (backup.documents.filterNot { it.kind == Kind.session } + mergedSessions)
+                    .map(::repairHistoricalEquipmentDocument)
                 val replacementSessionIds = if (replace && backup.formatVersion >= 5)
                     incomingSessions.filterNot { it.deleted }.mapTo(hashSetOf()) { it.id }
                 else emptySet()
@@ -1830,10 +1877,10 @@ class TrainingRepository(
                     .mapValues { (_, sessions) -> sessions.flatMapTo(linkedSetOf()) { it.sourceRecords.map(SessionSource::sourceId) } }
                 else emptyMap()
                 val incoming = docsToImport.associateBy { it.key() }
-                val combined = (cache.values.map { it.document } + docsToImport).associateBy { it.key() }
+                val combined = (cache.values.map { repairHistoricalEquipmentDocument(it.document) } + docsToImport).associateBy { it.key() }
                     .values.filterNot { it.deleted }.groupBy { it.kind }
                 docsToImport.filterNot { it.kind == Kind.session }.forEach { doc ->
-                    val old = cache[doc.key()]?.document
+                    val old = cache[doc.key()]?.document?.let(::repairHistoricalEquipmentDocument)
                     validateDocument(
                         doc,
                         list = { kind -> combined[kind] ?: emptyList() },
@@ -1847,7 +1894,7 @@ class TrainingRepository(
                     }
                 }
                 docsToImport.filter { it.kind == Kind.session }.forEach { doc ->
-                    val old = cache[doc.key()]?.document
+                    val old = cache[doc.key()]?.document?.let(::repairHistoricalEquipmentDocument)
                     val localDate = if (doc.deleted) null else doc.value<Session>().localDate
                     validateDocument(
                         doc,

@@ -117,6 +117,10 @@ private fun willStartRestTimer(session: Session, itemId: String, setIndex: Int, 
     var selectingType by rememberSaveable(session.id) { mutableStateOf<String?>(null) }
     var pendingItem by rememberSaveable(session.id, stateSaver = jsonSaver(PlanItem.serializer().nullable)) { mutableStateOf<PlanItem?>(null) }
     var selectedExercise by rememberSaveable(session.id, stateSaver = jsonSaver(Exercise.serializer().nullable)) { mutableStateOf<Exercise?>(null) }
+    var correctingItemId by rememberSaveable(session.id) { mutableStateOf<String?>(null) }
+    var correctingExercise by rememberSaveable(session.id, stateSaver = jsonSaver(Exercise.serializer().nullable)) { mutableStateOf<Exercise?>(null) }
+    var correctingEquipmentId by rememberSaveable(session.id) { mutableStateOf<String?>(null) }
+    var replacingItemId by rememberSaveable(session.id) { mutableStateOf<String?>(null) }
     val expandedState = rememberSaveableStateHolder()
     var permissionRefresh by remember { mutableIntStateOf(0) }
     var showTimerPermissionDialog by remember { mutableStateOf(false) }
@@ -248,6 +252,14 @@ private fun willStartRestTimer(session: Session, itemId: String, setIndex: Int, 
                         progress = { if (targetCount == 0) 0f else (completed.toFloat() / targetCount).coerceIn(0f, 1f) },
                         modifier = Modifier.fillMaxWidth()
                     )
+                    TextButton(onClick = {
+                        correctingItemId = item.id
+                        selectingType = exercise.type
+                    }) { Text("订正实际动作 / 器械") }
+                    if (nextIndex != null && !skipped) TextButton(onClick = {
+                        replacingItemId = item.id
+                        selectingType = exercise.type
+                    }) { Text("更换剩余动作") }
                     if (item.notes.isNotBlank() && item.notes != exercise.name) Text(item.notes, style = MaterialTheme.typography.bodySmall)
                     TextButton(onClick = { editingItemNotes = item.id; itemNotesDraft = item.notes }) {
                         Text(if (item.notes.isBlank()) "添加动作备注" else "修改动作备注")
@@ -406,25 +418,81 @@ private fun willStartRestTimer(session: Session, itemId: String, setIndex: Int, 
                     if (it.type == "strength") it.muscles + it.secondaryMuscles else emptyList()
                 }
             }.toSet()
-        ExercisePicker(state, viewModel.repository, session.snapshot?.gymId, targets, type,
-            { selectingType = null }) { exercise ->
-            selectedExercise = exercise
-            pendingItem = newPlanItem(exercise, session.snapshot?.gymId, state)
+        ExercisePicker(state, viewModel.repository, session.snapshot?.gymId, targets,
+            if (correctingItemId != null) null else type,
+            { selectingType = null; correctingItemId = null; replacingItemId = null }) { exercise ->
             selectingType = null
+            val correctingId = correctingItemId
+            val replacingId = replacingItemId
+            when {
+                correctingId != null -> {
+                    val oldItem = session.items.single { it.id == correctingId }
+                    val equipment = state.records(Kind.equipment).map { it.value<Equipment>() }
+                        .filter { it.gymId == session.snapshot?.gymId && exercise.equipmentTags.firstOrNull() in it.tags }
+                    correctingExercise = exercise
+                    correctingEquipmentId = oldItem.equipmentId.takeIf { id -> equipment.any { it.id == id } }
+                }
+                replacingId != null -> {
+                    val original = session.items.single { it.id == replacingId }
+                    val remaining = original.sets.indices.count { index ->
+                        session.results.none { it.itemId == replacingId && it.setIndex == index }
+                    }
+                    selectedExercise = exercise
+                    pendingItem = newPlanItem(exercise, session.snapshot?.gymId, state, remaining)
+                }
+                else -> {
+                    selectedExercise = exercise
+                    pendingItem = newPlanItem(exercise, session.snapshot?.gymId, state)
+                }
+            }
+        }
+    }
+    correctingItemId?.let { itemId ->
+        val exercise = correctingExercise
+        if (exercise != null) {
+            val equipment = state.records(Kind.equipment).map { it.value<Equipment>() }
+                .filter { it.gymId == session.snapshot?.gymId && exercise.equipmentTags.firstOrNull() in it.tags }
+            val equipmentChoices = listOf(null to "不指定器械") + equipment.map { it.id to it.name }
+            if (SOURCE_UNKNOWN_EQUIPMENT_TAG !in exercise.equipmentTags) {
+                FormDialog("订正实际动作", {
+                    correctingExercise = null; correctingItemId = null
+                }, {
+                    viewModel.correctSessionExercise(session.id, itemId, exercise, correctingEquipmentId)
+                    correctingExercise = null; correctingItemId = null
+                }) {
+                    Text("只更正本次实际动作与器械；完成组读数、组数、时间和开始时计划保持不变。", style = MaterialTheme.typography.bodySmall)
+                    if (exercise.equipmentTags.isNotEmpty()) Choice("实际器械", correctingEquipmentId, equipmentChoices, { correctingEquipmentId = it })
+                }
+            } else FormDialog("订正实际动作", {
+                correctingExercise = null; correctingItemId = null
+            }, {
+                viewModel.correctSessionExercise(session.id, itemId, exercise, null)
+                correctingExercise = null; correctingItemId = null
+            }) {
+                Text("器械条件未知；本次记录不关联具体器械。", style = MaterialTheme.typography.bodySmall)
+            }
         }
     }
     pendingItem?.let { item ->
         val exercise = selectedExercise ?: return@let
-        val positions = (0..session.items.size).map { position ->
+        val replacingId = replacingItemId
+        val originalPosition = replacingId?.let { id -> session.items.indexOfFirst { it.id == id } }
+        val positions = if (originalPosition != null) listOf(
+            originalPosition to "原动作位置，仅替换未完成部分"
+        ) else (0..session.items.size).map { position ->
             position to if (position == 0) "放在最前面" else "放在 ${session.exercises.single { it.id == session.items[position - 1].exerciseId }.name} 之后"
         }
         PlanItemEditor(item, exercise, session.snapshot?.gymId, state, viewModel, positions,
-            session.items.size, { pendingItem = null; selectedExercise = null },
+            originalPosition ?: session.items.size, {
+                pendingItem = null; selectedExercise = null; replacingItemId = null
+            },
             allowMeasurementChange = exercise.id.startsWith("smartworkout_")
         ) { revised, position ->
-            viewModel.addSessionExercise(session.id, revised, exercise, position)
+            if (replacingId != null) viewModel.replaceSessionExercise(session.id, replacingId, revised, exercise)
+            else viewModel.addSessionExercise(session.id, revised, exercise, position)
             pendingItem = null
             selectedExercise = null
+            replacingItemId = null
         }
     }
 }
@@ -458,7 +526,7 @@ private data class WorkoutSegmentDraft(val reps: String, val load: String, val u
                     val value = doubleInput(input.load, "重量")
                     require(value.isFinite() && value >= 0.0) { "重量必须为非负有限数值" }
                     original.load?.copy(value = value, unit = input.unit)
-                        ?: Load(value, input.unit, "unknown", exercise.loadMode)
+                        ?: Load(value, input.unit, "unknown", "external")
                 }
                 SetSegment(repetitions, load)
             }

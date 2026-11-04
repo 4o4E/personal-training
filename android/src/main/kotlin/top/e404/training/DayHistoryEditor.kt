@@ -86,8 +86,11 @@ private fun initialDayDrafts(documents: List<Document>): Map<String, String> = b
         when (doc.kind) {
             Kind.session -> {
                 val session = doc.value<Session>()
-                put(dayField(doc, "notes"), session.notes)
-                session.items.forEach { item -> put(dayField(doc, "item-${item.id}/notes"), item.notes) }
+                session.items.forEach { item ->
+                    put(dayField(doc, "item-${item.id}/notes"), item.notes)
+                    put(dayField(doc, "item-${item.id}/exerciseId"), item.exerciseId)
+                    put(dayField(doc, "item-${item.id}/equipmentId"), item.equipmentId.orEmpty())
+                }
                 session.results.forEach { result ->
                     val base = "result-${result.itemId}-${result.setIndex}"
                     put(dayField(doc, "$base/reps"), nullableText(result.reps))
@@ -177,7 +180,7 @@ internal fun DayHistoryDialog(date: String, today: LocalDate, state: AppData, vi
                                 if (editing && !saving) TextButton(onClick = { removed = removed - dayDocumentKey(original) }) { Text("撤销删除") }
                             }
                         } else when (original.kind) {
-                            Kind.session -> SessionDraftCard(original, drafts, state.health, editing && !saving, ::update, onDelete = { removed = removed + dayDocumentKey(original) })
+                            Kind.session -> SessionDraftCard(original, drafts, state, state.health, viewModel, editing && !saving, ::update, onDelete = { removed = removed + dayDocumentKey(original) })
                             Kind.activity -> ActivityDraftCard(original, drafts, state.health, editing && !saving, ::update, onDelete = { removed = removed + dayDocumentKey(original) })
                             else -> Unit
                         }
@@ -191,7 +194,7 @@ internal fun DayHistoryDialog(date: String, today: LocalDate, state: AppData, vi
                             try {
                                 val changes = originals.mapNotNull { doc ->
                                     if (dayDocumentKey(doc) in removed) doc.copy(deleted = true)
-                                    else buildChangedDocument(doc, drafts)
+                                    else buildChangedDocument(doc, drafts, state)
                                 }
                                 saving = true
                                 viewModel.saveDayHistory(originals, changes, {
@@ -222,7 +225,11 @@ private fun docChanged(doc: Document, fields: Map<String, String>) = when (doc.k
     Kind.session -> {
         val session = doc.value<Session>()
         fields[dayField(doc, "notes")] != session.notes ||
-            session.items.any { item -> fields[dayField(doc, "item-${item.id}/notes")] != item.notes } ||
+            session.items.any { item ->
+                fields[dayField(doc, "item-${item.id}/notes")] != item.notes ||
+                    fields[dayField(doc, "item-${item.id}/exerciseId")] != item.exerciseId ||
+                    fields[dayField(doc, "item-${item.id}/equipmentId")] != item.equipmentId.orEmpty()
+            } ||
             session.results.any { result ->
             val base = "result-${result.itemId}-${result.setIndex}"
             if (result.segments.isEmpty()) {
@@ -248,21 +255,20 @@ private fun docChanged(doc: Document, fields: Map<String, String>) = when (doc.k
     else -> false
 }
 
-private fun buildChangedDocument(doc: Document, fields: Map<String, String>): Document? = when (doc.kind) {
+private fun buildChangedDocument(doc: Document, fields: Map<String, String>, state: AppData): Document? = when (doc.kind) {
     Kind.session -> {
         val original = doc.value<Session>()
         val results = original.results.map { result ->
             val base = "result-${result.itemId}-${result.setIndex}"
             val item = original.items.firstOrNull { it.id == result.itemId }
-            val exercise = item?.let { planItem -> original.exercises.firstOrNull { it.id == planItem.exerciseId } }
-            val measurement = targetMeasurement(item?.sets?.getOrNull(result.setIndex), exercise?.measurement.orEmpty())
+            val measurement = targetMeasurement(item?.sets?.getOrNull(result.setIndex), if (result.seconds != null) "seconds" else "reps")
             if (result.segments.isEmpty()) result.copy(
                 reps = if (measurement == "reps") draftOptionalInt(fields, doc, "$base/reps", "次数", result.reps) else result.reps,
                 seconds = if (measurement == "seconds") draftOptionalInt(fields, doc, "$base/seconds", "时长", result.seconds) else result.seconds,
-                load = loadFromDraft(fields[dayField(doc, "$base/0/load")], fields[dayField(doc, "$base/0/unit")], result.load, exercise)
+                load = loadFromDraft(fields[dayField(doc, "$base/0/load")], fields[dayField(doc, "$base/0/unit")], result.load)
             ) else {
                 val segments = result.segments.mapIndexed { index, segment ->
-                    val load = loadFromDraft(fields[dayField(doc, "$base/$index/load")], fields[dayField(doc, "$base/$index/unit")], segment.load, exercise)
+                    val load = loadFromDraft(fields[dayField(doc, "$base/$index/load")], fields[dayField(doc, "$base/$index/unit")], segment.load)
                     segment.copy(reps = fields[dayField(doc, "$base/$index/reps")]?.let { parseRequiredInt(it, "分段次数") } ?: segment.reps, load = load)
                 }
                 val totalReps = segments.sumOf { it.reps.toLong() }
@@ -271,9 +277,23 @@ private fun buildChangedDocument(doc: Document, fields: Map<String, String>): Do
             }
         }
         val items = original.items.map { item ->
-            item.copy(notes = fields[dayField(doc, "item-${item.id}/notes")] ?: item.notes)
+            val exerciseId = fields[dayField(doc, "item-${item.id}/exerciseId")] ?: item.exerciseId
+            val equipmentId = fields[dayField(doc, "item-${item.id}/equipmentId")].orEmpty().ifBlank { null }
+            item.copy(
+                exerciseId = exerciseId,
+                equipmentId = equipmentId,
+                notes = fields[dayField(doc, "item-${item.id}/notes")] ?: item.notes
+            )
         }
-        val updated = original.copy(items = items, results = results, notes = fields[dayField(doc, "notes")] ?: original.notes)
+        val addedExercises = items.map { it.exerciseId }.distinct()
+            .filterNot { id -> original.exercises.any { it.id == id } }
+            .map { id -> requireNotNull(state.record(Kind.exercise, id)?.value<Exercise>()) { "订正动作资料不存在" } }
+        val updated = original.copy(
+            items = items,
+            exercises = original.exercises + addedExercises,
+            results = results,
+            notes = fields[dayField(doc, "notes")] ?: original.notes
+        )
         doc.takeIf { updated != original }?.copy(data = document(Kind.session, doc.id, updated).data)
     }
     Kind.activity -> {
@@ -298,30 +318,40 @@ private fun buildChangedDocument(doc: Document, fields: Map<String, String>): Do
     else -> null
 }
 
-private fun loadFromDraft(value: String?, unit: String?, original: Load?, exercise: Exercise?): Load? {
+private fun loadFromDraft(value: String?, unit: String?, original: Load?): Load? {
     if (value.isNullOrBlank()) return null
     val amount = parseOptionalDouble(value, "实际重量")!!
     val rawUnit = requireNotNull(unit?.takeIf(String::isNotBlank)) { "请为新填写的重量选择原始单位" }
-    return Load(amount, rawUnit, original?.meaning ?: "unknown", original?.mode ?: exercise?.loadMode ?: "external")
+    return Load(amount, rawUnit, original?.meaning ?: "unknown", original?.mode ?: "external")
 }
 
 @Composable
-private fun SessionDraftCard(doc: Document, fields: Map<String, String>, health: HealthUiState, editing: Boolean, update: (Document, String, String) -> Unit, onDelete: () -> Unit) {
+private fun SessionDraftCard(
+    doc: Document, fields: Map<String, String>, state: AppData, health: HealthUiState,
+    viewModel: TrainingViewModel, editing: Boolean, update: (Document, String, String) -> Unit, onDelete: () -> Unit
+) {
     val session = doc.value<Session>()
     val canEdit = editing && session.status != "active"
+    var selectingCorrection by remember(doc.id) { mutableStateOf<String?>(null) }
+    var correctingExercise by remember(doc.id) { mutableStateOf<Exercise?>(null) }
+    var correctingEquipmentId by remember(doc.id) { mutableStateOf<String?>(null) }
+    var correctingItemId by remember(doc.id) { mutableStateOf<String?>(null) }
     Column(Modifier.fillMaxWidth().padding(4.dp), verticalArrangement = Arrangement.spacedBy(3.dp)) {
         Text(sessionTrainingLabels(session).joinToString("、"), style = MaterialTheme.typography.titleMedium)
         historyTimeRange(session.startedAt, session.endedAt)?.let { Text(it) }
         Text("状态：${sessionStatusText(session.status)}")
         Text("开始时计划：${session.snapshot?.name ?: "未记录"}", style = MaterialTheme.typography.bodySmall)
         session.items.forEach { item ->
-            val exercise = session.exercises.firstOrNull { it.id == item.exerciseId }
+            val exerciseId = fields[dayField(doc, "item-${item.id}/exerciseId")] ?: item.exerciseId
+            val exercise = state.record(Kind.exercise, exerciseId)?.value<Exercise>()
+                ?: session.exercises.firstOrNull { it.id == exerciseId }
             val results = session.results.filter { it.itemId == item.id }.sortedBy { it.setIndex }
+            val equipmentId = fields[dayField(doc, "item-${item.id}/equipmentId")].orEmpty().ifBlank { null }
             if (results.isNotEmpty()) {
                 Text(exercise?.name ?: "动作", style = MaterialTheme.typography.labelLarge)
                 results.forEach { result ->
                     val base = "result-${result.itemId}-${result.setIndex}"
-                    val measurement = targetMeasurement(item.sets.getOrNull(result.setIndex), exercise?.measurement.orEmpty())
+                    val measurement = targetMeasurement(item.sets.getOrNull(result.setIndex), if (result.seconds != null) "seconds" else "reps")
                     if (canEdit) Text(historyResultText(result), style = MaterialTheme.typography.bodySmall)
                     if (canEdit && result.segments.isEmpty()) {
                         Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
@@ -339,6 +369,41 @@ private fun SessionDraftCard(doc: Document, fields: Map<String, String>, health:
                             TextInput("次数", fields[dayField(doc, "$base/$index/reps")].orEmpty(), { update(doc, "$base/$index/reps", it) }, numeric = true, modifier = Modifier.weight(1f))
                         }
                     } else Text(historyResultText(result), style = MaterialTheme.typography.bodySmall)
+                }
+            }
+            if (canEdit) TextButton(onClick = { correctingItemId = item.id; selectingCorrection = item.id }) {
+                Text("订正实际动作 / 器械")
+            }
+            if (selectingCorrection == item.id) {
+                val targets = exercise?.let { if (it.type == "strength") it.muscles + it.secondaryMuscles else emptyList() }.orEmpty().toSet()
+                ExercisePicker(state, viewModel.repository, session.snapshot?.gymId, targets, null,
+                    { selectingCorrection = null; correctingItemId = null }) { selected ->
+                    correctingExercise = selected
+                    val matchingEquipment = state.records(Kind.equipment).map { it.value<Equipment>() }
+                        .filter { it.gymId == session.snapshot?.gymId && selected.equipmentTags.firstOrNull() in it.tags }
+                    correctingEquipmentId = equipmentId.takeIf { current -> matchingEquipment.any { it.id == current } }
+                    selectingCorrection = null
+                }
+            }
+            if (correctingItemId == item.id && correctingExercise != null && selectingCorrection == null) {
+                val selected = correctingExercise!!
+                val matchingEquipment = state.records(Kind.equipment).map { it.value<Equipment>() }
+                    .filter { it.gymId == session.snapshot?.gymId && selected.equipmentTags.firstOrNull() in it.tags }
+                val unknown = SOURCE_UNKNOWN_EQUIPMENT_TAG in selected.equipmentTags
+                FormDialog("订正实际动作", {
+                    correctingExercise = null; correctingItemId = null
+                }, {
+                    update(doc, "item-${item.id}/exerciseId", selected.id)
+                    update(doc, "item-${item.id}/equipmentId", if (unknown) "" else correctingEquipmentId.orEmpty())
+                    correctingExercise = null; correctingItemId = null
+                }) {
+                    Text("保留本次所有组数、读数和真实完成时间；不修改开始时计划。", style = MaterialTheme.typography.bodySmall)
+                    if (!unknown && selected.equipmentTags.isNotEmpty()) Choice(
+                        "实际器械", correctingEquipmentId,
+                        listOf(null to "不指定器械") + matchingEquipment.map { it.id to it.name },
+                        { correctingEquipmentId = it }
+                    )
+                    if (unknown) Text("器械条件未知；不关联具体器械。", style = MaterialTheme.typography.bodySmall)
                 }
             }
             if (canEdit) TextInput(

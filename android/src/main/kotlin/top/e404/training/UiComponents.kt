@@ -211,24 +211,16 @@ private fun distinctGuideSteps(steps: List<String>, excluding: List<String> = em
 @Composable private fun SmartWorkoutExercisePreview(
     source: SmartWorkoutExerciseSource, repository: TrainingRepository, onDismiss: () -> Unit
 ) {
-    var guide by remember(source.sourceId) { mutableStateOf<ExerciseGuide?>(null) }
-    var status by remember(source.sourceId) { mutableStateOf("正在读取只读教学预览…") }
-    LaunchedEffect(source.sourceId, repository) {
-        try {
-            val response = repository.loadSmartWorkoutExerciseGuide(source.sourceId)
-            if (response == null) status = "该来源动作暂无网站教学资料。"
-            else { guide = response; status = "" }
-        } catch (error: kotlinx.coroutines.CancellationException) {
-            throw error
-        } catch (_: Exception) {
-            status = "网站教学预览暂不可用；可以返回继续选择本地动作或来源动作。"
-        }
-    }
+    var result by remember(source.sourceId) { mutableStateOf<ExerciseGuideResult?>(null) }
+    LaunchedEffect(source.sourceId, repository) { result = repository.loadSmartWorkoutExerciseGuide(source.sourceId) }
     FormDialog(source.name, onDismiss) {
         Text("SmartWorkout 动作教学", style = MaterialTheme.typography.bodySmall)
-        val preview = guide
-        if (preview == null) Text(status, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        val response = result
+        val preview = response?.guide
+        if (preview == null) Text(guideStatusText(response?.status, response?.cached, response?.requestFailure, "只读预览"),
+            color = MaterialTheme.colorScheme.onSurfaceVariant)
         else {
+            if (response.cached) Text("显示已缓存教学；最新状态：${guideStatusText(response.status, true, response.requestFailure, "只读预览")}")
             val imageUrl = preview.imageUrl?.takeIf(String::isNotBlank)
             val videoUrl = preview.videoUrl?.takeIf(String::isNotBlank)
             if (videoUrl != null) CachedExerciseMedia(videoUrl, true, repository)
@@ -237,77 +229,135 @@ private fun distinctGuideSteps(steps: List<String>, excluding: List<String> = em
             Text("来源：${sourceHost ?: "SmartWorkout"}", style = MaterialTheme.typography.bodySmall)
             if (preview.description.isNotBlank()) Text(preview.description)
             val steps = distinctGuideSteps(preview.instructions)
-            if (steps.isNotEmpty()) {
-                Text("动作步骤", style = MaterialTheme.typography.titleSmall)
-                steps.forEachIndexed { index, step -> Text("${index + 1}. $step") }
-            }
-            if (preview.tips.isNotEmpty()) {
-                Text("动作提示", style = MaterialTheme.typography.titleSmall)
-                preview.tips.forEach { Text("• $it") }
-            }
-            if (preview.mistakes.isNotEmpty()) {
-                Text("常见错误", style = MaterialTheme.typography.titleSmall)
-                preview.mistakes.forEach { Text("• $it") }
-            }
+            if (steps.isNotEmpty()) { Text("动作步骤", style = MaterialTheme.typography.titleSmall); steps.forEachIndexed { index, step -> Text("${index + 1}. $step") } }
+            if (preview.tips.isNotEmpty()) { Text("动作提示", style = MaterialTheme.typography.titleSmall); preview.tips.forEach { Text("• $it") } }
+            if (preview.mistakes.isNotEmpty()) { Text("常见错误", style = MaterialTheme.typography.titleSmall); preview.mistakes.forEach { Text("• $it") } }
         }
     }
 }
 
 @Composable fun ExerciseDetail(exercise: Exercise, state: AppData, repository: TrainingRepository, onDismiss: () -> Unit) {
-    var onlineGuide by remember(exercise.id) { mutableStateOf<ExerciseGuide?>(null) }
-    var guideStatus by remember(exercise.id) { mutableStateOf("正在读取在线教学…") }
+    var guideResult by remember(exercise.id) { mutableStateOf<ExerciseGuideResult?>(null) }
+    var selectedGuideResult by remember(exercise.id) { mutableStateOf<ExerciseGuideResult?>(null) }
+    var candidates by remember(exercise.id) { mutableStateOf<List<SmartWorkoutExerciseSource>?>(null) }
+    var selectedSource by remember(exercise.id) { mutableStateOf<SmartWorkoutExerciseSource?>(null) }
+    var selectedSourceId by remember(exercise.id) { mutableStateOf<String?>(null) }
+    var sourceDialog by remember(exercise.id) { mutableStateOf(false) }
+    var sourceQuery by rememberSaveable(exercise.id) { mutableStateOf("") }
+    var candidatesLoading by remember(exercise.id) { mutableStateOf(false) }
+    var candidateFailure by remember(exercise.id) { mutableStateOf<String?>(null) }
+    var selectionFailure by remember(exercise.id) { mutableStateOf<String?>(null) }
+    val scope = rememberCoroutineScope()
     LaunchedEffect(exercise.id, repository) {
-        try {
-            val guide = repository.loadExerciseGuide(exercise.id)
-            if (guide == null) guideStatus = "后端暂无该动作的在线教学，当前显示本地教学。"
-            else { onlineGuide = guide; guideStatus = "" }
-        } catch (error: kotlinx.coroutines.CancellationException) {
-            throw error
-        } catch (_: Exception) {
-            guideStatus = "在线教学暂不可用（网络或服务器错误），当前显示本地教学。"
-        }
+        guideResult = repository.loadExerciseGuide(exercise.id)
+        selectedSource = repository.selectedExerciseTeaching(exercise.id)
+        selectedSourceId = selectedSource?.sourceId
+        selectedSourceId?.let { selectedGuideResult = repository.loadSmartWorkoutExerciseGuide(it) }
     }
     val muscles = remember(state.documents[Kind.muscle]) { state.records(Kind.muscle).associate { val m = it.value<Muscle>(); m.id to m } }
     val tagNames = equipmentNames()
-    val guide = onlineGuide
+    val current = selectedGuideResult ?: guideResult
+    val guide = current?.guide
     val imageUrl = guide?.imageUrl?.takeIf(String::isNotBlank)
     val videoUrl = guide?.videoUrl?.takeIf(String::isNotBlank)
+    fun loadCandidates() {
+        candidatesLoading = true
+        candidateFailure = null
+        scope.launch {
+            try { candidates = repository.loadSmartWorkoutExercises() }
+            catch (error: CancellationException) { throw error }
+            catch (error: Exception) { candidateFailure = error.message ?: "读取来源动作目录失败" }
+            finally { candidatesLoading = false }
+        }
+    }
     FormDialog(exercise.name, onDismiss) {
         Text(if (exercise.type == "stretch") "拉伸动作" else "力量训练", color = MaterialTheme.colorScheme.primary)
-        if (videoUrl != null) CachedExerciseMedia(videoUrl, true, repository)
-        else if (imageUrl != null) CachedExerciseImage(imageUrl, repository)
+        if (videoUrl != null) CachedExerciseMedia(videoUrl, true, repository) else if (imageUrl != null) CachedExerciseImage(imageUrl, repository)
         Text("主要部位：" + exercise.muscles.joinToString("、") { muscles[it]?.name ?: it })
         if (exercise.secondaryMuscles.isNotEmpty()) Text("辅助涉及：" + exercise.secondaryMuscles.joinToString("、") { muscles[it]?.name ?: it })
         Text("器械条件：" + equipmentRequirementText(exercise.equipmentTags, tagNames))
-        if (guide == null) {
-            exercise.mediaIds.forEach { id -> state.record(Kind.media, id)?.value<Media>()?.let { MediaImage(it, repository, Modifier.fillMaxWidth().height(260.dp)) } }
-        }
+        if (guide == null) exercise.mediaIds.forEach { id -> state.record(Kind.media, id)?.value<Media>()?.let { MediaImage(it, repository, Modifier.fillMaxWidth().height(260.dp)) } }
         Text("执行方式", style = MaterialTheme.typography.titleMedium)
         exercise.instructions.forEachIndexed { index, text -> Text("${index + 1}. $text") }
         if (exercise.unilateral) Text("需要区分左右侧时，请在计划组中分别选择左侧和右侧。")
         if (exercise.notes.isNotBlank()) Text(exercise.notes)
         Text("在线教学", style = MaterialTheme.typography.titleMedium)
-        if (guide == null) Text(guideStatus, color = if (guideStatus.startsWith("在线教学暂不可用")) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant)
+        if (guide == null) Text(guideStatusText(current?.status, current?.cached, current?.requestFailure, exercise.name), color = MaterialTheme.colorScheme.onSurfaceVariant)
         else {
-            val sourceHost = runCatching { Uri.parse(guide.sourceUrl).host }.getOrNull()
-            Text("来源：${sourceHost ?: "在线动作库"}", style = MaterialTheme.typography.bodySmall)
+            if (current?.cached == true) Text("显示已缓存教学；最新状态：${guideStatusText(current.status, true, current.requestFailure, exercise.name)}")
+            Text("来源：${runCatching { Uri.parse(guide.sourceUrl).host }.getOrNull() ?: "在线动作库"}", style = MaterialTheme.typography.bodySmall)
             if (guide.description.isNotBlank()) Text(guide.description)
-            val websiteSteps = distinctGuideSteps(guide.instructions, exercise.instructions)
-            if (websiteSteps.isNotEmpty()) {
-                Text("网站动作步骤", style = MaterialTheme.typography.titleSmall)
-                websiteSteps.forEachIndexed { index, step -> Text("${index + 1}. $step") }
-            }
-            if (guide.tips.isNotEmpty()) {
-                Text("动作提示", style = MaterialTheme.typography.titleSmall)
-                guide.tips.forEach { Text("• $it") }
-            }
-            if (guide.mistakes.isNotEmpty()) {
-                Text("常见错误", style = MaterialTheme.typography.titleSmall)
-                guide.mistakes.forEach { Text("• $it") }
-            }
+            distinctGuideSteps(guide.instructions, exercise.instructions).forEachIndexed { index, step -> Text("${index + 1}. $step") }
+            guide.tips.forEach { Text("提示：$it") }; guide.mistakes.forEach { Text("常见错误：$it") }
         }
+        if (selectedSourceId != null) Text("教学选择：${selectedSource?.name ?: selectedSourceId}（仅关联教学，不改变训练动作身份）")
+        selectionFailure?.let { Text("保存教学选择失败：$it", color = MaterialTheme.colorScheme.error) }
+        if (current?.status == ExerciseGuideStatus.requestFailed) TextButton(onClick = {
+            scope.launch {
+                val sourceId = selectedSourceId
+                if (sourceId == null) guideResult = repository.loadExerciseGuide(exercise.id)
+                else selectedGuideResult = repository.loadSmartWorkoutExerciseGuide(sourceId)
+            }
+        }) { Text("重试教学请求") }
+        TextButton(onClick = {
+            if (candidates == null && !candidatesLoading) loadCandidates()
+            sourceDialog = true
+        }) { Text(if (selectedSourceId == null) "为此动作选择教学" else "更改已选教学") }
+        if (sourceDialog) AlertDialog(onDismissRequest = { sourceDialog = false }, title = { Text("明确选择教学动作") },
+            text = {
+                Column {
+                    TextField(sourceQuery, { sourceQuery = it }, label = { Text("搜索来源动作") }, singleLine = true)
+                    if (candidatesLoading) CircularProgressIndicator()
+                    candidateFailure?.let { failure ->
+                        Text(failure, color = MaterialTheme.colorScheme.error)
+                        TextButton(onClick = ::loadCandidates) { Text("重试读取动作目录") }
+                    }
+                    val matching = candidates.orEmpty().filter { sourceQuery.isBlank() || it.name.contains(sourceQuery.trim(), ignoreCase = true) }
+                    if (!candidatesLoading && candidateFailure == null && candidates != null && matching.isEmpty())
+                        Text("没有匹配的来源动作。")
+                    androidx.compose.foundation.lazy.LazyColumn(Modifier.heightIn(max = 320.dp)) {
+                        if (selectedSourceId != null) item {
+                            TextButton(onClick = {
+                                scope.launch {
+                                    try {
+                                        repository.selectExerciseTeaching(exercise.id, null)
+                                        selectedSourceId = null; selectedSource = null; selectedGuideResult = null; selectionFailure = null
+                                        sourceDialog = false
+                                    } catch (error: CancellationException) { throw error }
+                                    catch (error: Exception) { selectionFailure = error.message ?: "保存失败" }
+                                }
+                            }) { Text("取消明确教学选择") }
+                        }
+                        items(matching.size) { index ->
+                            val item = matching[index]
+                            TextButton(onClick = {
+                                scope.launch {
+                                    try {
+                                        repository.selectExerciseTeaching(exercise.id, item)
+                                        selectedSourceId = item.sourceId; selectedSource = item
+                                        selectedGuideResult = repository.loadSmartWorkoutExerciseGuide(item.sourceId)
+                                        selectionFailure = null; sourceDialog = false
+                                    } catch (error: CancellationException) { throw error }
+                                    catch (error: Exception) { selectionFailure = error.message ?: "保存教学选择失败" }
+                                }
+                            }) { Text(item.name) }
+                        }
+                    }
+                }
+            },
+            confirmButton = { TextButton(onClick = { sourceDialog = false }) { Text("关闭") } })
     }
 }
+
+private fun guideStatusText(status: ExerciseGuideStatus?, cached: Boolean?, failure: String?, label: String): String =
+    when (status) {
+        ExerciseGuideStatus.unconfigured -> "尚未连接后端${if (cached == true) "；显示本地缓存教学" else ""}。"
+        ExerciseGuideStatus.notAssociated -> "后端未关联在线教学${if (cached == true) "；显示旧缓存" else ""}，可明确选择教学。"
+        ExerciseGuideStatus.requestFailed -> "教学请求失败${failure?.let { "：$it" } ?: ""}${if (cached == true) "；显示旧缓存" else ""}。"
+        ExerciseGuideStatus.available -> "在线教学已读取。"
+        null -> "正在读取${label}的在线教学…"
+    }
+
 @Composable fun equipmentNames(): Map<String, String> {
     val context = LocalContext.current
     return remember(context) { context.assets.open("equipment-tags.json").bufferedReader().use { wireJson.decodeFromString<Map<String, String>>(it.readText()) } }

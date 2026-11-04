@@ -110,11 +110,12 @@ class Store(dataDirectory: Path, seed: List<Document>) : AutoCloseable {
         if (backup.formatVersion >= 3) require(backup.documents.none { it.hasDeprecatedHistoricalText() }) {
             "版本${backup.formatVersion}数据包不能包含已废弃的 historicalSource.originalText"
         }
-        val imported = mergeImportedSessions(list(includeDeleted = true), backup.documents, replace)
-        val canonicalSessionIds = if (backup.formatVersion >= 5) backup.documents
+        val repairedBackupDocuments = backup.documents.map(::repairHistoricalEquipmentDocument)
+        val imported = mergeImportedSessions(list(includeDeleted = true).map(::repairHistoricalEquipmentDocument), repairedBackupDocuments, replace)
+        val canonicalSessionIds = if (backup.formatVersion >= 5) repairedBackupDocuments
             .filter { it.kind == Kind.session && !it.deleted && it.isCanonicalSessionDocument() }
             .mapTo(hashSetOf()) { it.id } else emptySet()
-        val replacedSourceIds = if (replace) backup.documents
+        val replacedSourceIds = if (replace) repairedBackupDocuments
             .filter { it.kind == Kind.session && !it.deleted }
             .flatMap { migrateSessionDocument(it).value<Session>().sourceRecords.map { source -> source.sourceId } }
             .toMutableSet()
@@ -124,7 +125,7 @@ class Store(dataDirectory: Path, seed: List<Document>) : AutoCloseable {
                         ?.mapTo(this) { source -> source.sourceId }
                 }
             } else emptySet()
-        val combined = (list(includeDeleted = true) + imported).associateBy { it.kind to it.id }
+        val combined = (list(includeDeleted = true).map(::repairHistoricalEquipmentDocument) + imported).associateBy { it.kind to it.id }
             .values.filterNot { it.deleted }.groupBy { it.kind }
         val byKey = imported.associateBy { it.kind to it.id }
         imported.forEach { doc ->
@@ -137,7 +138,7 @@ class Store(dataDirectory: Path, seed: List<Document>) : AutoCloseable {
                 requireNewResultTimes = false
             )
             if (doc.kind != Kind.session) {
-                val old = get(doc.kind, doc.id)
+                val old = get(doc.kind, doc.id)?.let(::repairHistoricalEquipmentDocument)
                 if (!replace && old != null && (old.data != doc.data || old.deleted != doc.deleted))
                     throw ImportConflict("已有不同内容：${doc.displayName()}；需明确选择替换")
             }
