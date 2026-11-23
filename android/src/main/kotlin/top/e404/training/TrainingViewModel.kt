@@ -6,6 +6,7 @@ import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -81,7 +82,17 @@ class TrainingViewModel(application: Application) : AndroidViewModel(application
     private val _message = MutableStateFlow<String?>(null)
     val message: StateFlow<String?> = _message
     private var healthLoadJob: Job? = null
-    init { action { repository.initialize() } }
+    init {
+        action { repository.initialize() }
+        viewModelScope.launch {
+            repository.workoutDeadline.collectLatest { deadline ->
+                if (deadline != null) {
+                    delay((deadline - System.currentTimeMillis()).coerceAtLeast(1))
+                    repository.reconcileWorkoutDeadline()
+                }
+            }
+        }
+    }
     fun dismissMessage() { _message.value = null }
     private fun healthAction(block: suspend () -> Unit) {
         viewModelScope.launch {
@@ -196,14 +207,12 @@ class TrainingViewModel(application: Application) : AndroidViewModel(application
     fun saveRound(program: Program, plans: List<Plan>) = action { repository.saveRound(program, plans) }
     fun removeTrainingDocument(document: Document) = action { repository.removeTrainingDocument(document) }
     fun finish(sessionId: String, cancelled: Boolean) = action {
-        repository.updateSession(sessionId) { session, _ ->
-            require(cancelled || session.results.isNotEmpty()) { "没有完成任何组，请选择取消训练" }
-            session.copy(status = if (cancelled) "cancelled" else "completed", endedAt = System.currentTimeMillis()) to null
-        }
+        repository.finishWorkout(sessionId, cancelled)
     }
     fun completeSet(sessionId: String, itemId: String, index: Int, target: SetTarget) = action {
         repository.updateSession(sessionId) { session, currentTimer ->
             val item = session.items.single { it.id == itemId }
+            require(itemId !in session.skippedItems && index in item.sets.indices) { "这一组已不在本次训练安排内" }
             val old = session.results.singleOrNull { it.itemId == itemId && it.setIndex == index }
             if (old != null) return@updateSession session to currentTimer
             val now = System.currentTimeMillis()
@@ -274,11 +283,16 @@ class TrainingViewModel(application: Application) : AndroidViewModel(application
         }
     }
     /** 已完成组保留原动作；仅未完成组交给新动作，开始时计划不变。 */
-    fun replaceSessionExercise(sessionId: String, originalId: String, replacement: PlanItem, exercise: Exercise) = action {
+    fun replaceSessionExercise(
+        sessionId: String, originalId: String, replacement: PlanItem, exercise: Exercise,
+        onSaved: (String) -> Unit = {}
+    ) = action {
         repository.updateSession(sessionId) { session, timer ->
             require(session.status == "active") { "仅可调整进行中的训练" }
-            top.e404.training.shared.replaceRemainingSessionExercise(session, originalId, replacement, exercise) to timer
+            val next = replaceRemainingSessionExercise(session, originalId, replacement, exercise)
+            next to timer?.takeUnless { it.itemId == originalId && it.type == "exercise" }
         }
+        onSaved(replacement.id)
     }
 }
 

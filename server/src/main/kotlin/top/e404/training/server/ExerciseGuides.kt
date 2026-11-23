@@ -1,20 +1,8 @@
 package top.e404.training.server
-
-import kotlinx.serialization.Serializable
 import kotlinx.serialization.decodeFromString
 import top.e404.training.shared.validId
 import java.net.URI
 
-@Serializable
-data class ExerciseGuide(
-    val sourceUrl: String,
-    val imageUrl: String?,
-    val videoUrl: String?,
-    val description: String,
-    val tips: List<String>,
-    val mistakes: List<String>,
-    val instructions: List<String>,
-)
 
 class ExerciseGuides private constructor(private val guides: Map<String, ExerciseGuide>) {
     operator fun get(exerciseId: String): ExerciseGuide? = guides[exerciseId]

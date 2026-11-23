@@ -22,9 +22,17 @@ import androidx.compose.runtime.saveable.rememberSaveableStateHolder
 import androidx.compose.ui.Alignment
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Check
+import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Info
+import androidx.compose.foundation.Canvas
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.semantics.ProgressBarRangeInfo
+import androidx.compose.ui.semantics.progressBarRangeInfo
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.compose.LocalLifecycleOwner
@@ -33,6 +41,45 @@ import androidx.lifecycle.repeatOnLifecycle
 import kotlinx.coroutines.delay
 import kotlinx.serialization.builtins.nullable
 import top.e404.training.shared.*
+
+internal fun workoutResultSummary(result: SetResult): String {
+    fun reading(load: Load?): String? = load?.let {
+        val modifier = when (it.meaning) {
+            "per_hand" -> " / 只"
+            "per_side" -> " / 侧"
+            else -> ""
+        }
+        "${numericText(it.value)} ${it.unit}$modifier${if (it.mode == "assistance") " 助力" else ""}"
+    }
+    val value = if (result.segments.isNotEmpty()) {
+        result.segments.joinToString("，") { listOfNotNull(reading(it.load), it.reps.toString()).joinToString(" × ") }
+    } else {
+        val reps = result.reps?.let { if (result.load == null) "$it 次" else it.toString() }
+        listOfNotNull(reading(result.load), reps, result.seconds?.let { "$it 秒" }).joinToString(" × ")
+    }
+    return if (result.side == "both") value else "$value · ${sideText(result.side)}"
+}
+
+@Composable
+internal fun WorkoutSetProgress(completed: Int, total: Int) {
+    if (total == 0) return
+    val colors = MaterialTheme.colorScheme
+    val fraction = (completed.toFloat() / total).coerceIn(0f, 1f)
+    Canvas(Modifier.fillMaxWidth().height(6.dp).semantics {
+        progressBarRangeInfo = ProgressBarRangeInfo(fraction, 0f..1f)
+    }) {
+        val radius = 2.dp.toPx()
+        val length = size.width - radius * 2
+        val start = Offset(radius, center.y)
+        fun position(fraction: Float) = Offset(radius + length * fraction, center.y)
+        drawLine(colors.surfaceContainerHighest, start, position(1f), strokeWidth = 4.dp.toPx(), cap = StrokeCap.Round)
+        if (completed > 0) drawLine(colors.primary, start, position(fraction), strokeWidth = 4.dp.toPx(), cap = StrokeCap.Round)
+        for (group in 1..total) {
+            val color = if (group <= completed) colors.onPrimary else colors.onSurfaceVariant
+            drawCircle(color, radius, position(group.toFloat() / total))
+        }
+    }
+}
 
 internal data class WorkoutItemProgress(
     val itemId: String,
@@ -201,7 +248,7 @@ private fun willStartRestTimer(session: Session, itemId: String, setIndex: Int, 
                 Text(session.name, style = MaterialTheme.typography.headlineSmall)
                 Text("已完成 $done / $total 组 · ${session.startedAt?.let(::localDateTime) ?: session.localDate}")
             }
-            items(session.items, key = { it.id }) { item ->
+            items(session.items.filter { it.id !in session.skippedItems || resultsByItem[it.id].orEmpty().isNotEmpty() }, key = { it.id }) { item ->
                 val exercise = session.exercises.single { it.id == item.exerciseId }
                 val results = resultsByItem[item.id].orEmpty()
                 val progress = progressByItem.getValue(item.id)
@@ -236,33 +283,28 @@ private fun willStartRestTimer(session: Session, itemId: String, setIndex: Int, 
                         Text(exercise.name, style = MaterialTheme.typography.titleMedium, modifier = Modifier.weight(1f))
                         if (isCurrent) Text("当前动作", style = MaterialTheme.typography.labelMedium, color = currentColor)
                         if (isComplete) Icon(Icons.Default.Check, contentDescription = "动作已完成", tint = completeColor)
+                        if (item.notes.isNotBlank()) IconButton(onClick = { editingItemNotes = item.id; itemNotesDraft = item.notes }) {
+                            Icon(Icons.Default.Edit, contentDescription = "修改动作备注")
+                        }
                         IconButton(onClick = { detail = exercise }) {
                             Icon(Icons.Default.Info, contentDescription = "查看${exercise.name}教学")
                         }
                     }
-                    val samePlan = item.sets.distinct().size <= 1
-                    Text("计划 · ${item.sets.size}组 · ${if (samePlan) item.sets.firstOrNull()?.let(::targetText) ?: "未设置目标" else "各组目标不同"}", style = MaterialTheme.typography.bodySmall)
-                    if (!samePlan) {
-                        var showPlan by rememberSaveable(session.id, item.id) { mutableStateOf(false) }
-                        TextButton(onClick = { showPlan = !showPlan }) { Text(if (showPlan) "收起各组计划" else "查看各组计划") }
-                        if (showPlan) item.sets.forEachIndexed { index, target -> Text("第 ${index + 1} 组 · ${targetText(target)}", style = MaterialTheme.typography.bodySmall) }
-                    }
+                    ExerciseCardImage(exercise, state, viewModel.repository)
+                    if (item.notes.isNotBlank()) Text(item.notes, style = MaterialTheme.typography.bodySmall)
                     Text("$completed/$targetCount 组", style = MaterialTheme.typography.labelMedium)
-                    LinearProgressIndicator(
-                        progress = { if (targetCount == 0) 0f else (completed.toFloat() / targetCount).coerceIn(0f, 1f) },
-                        modifier = Modifier.fillMaxWidth()
-                    )
-                    TextButton(onClick = {
-                        correctingItemId = item.id
-                        selectingType = exercise.type
-                    }) { Text("订正实际动作 / 器械") }
-                    if (nextIndex != null && !skipped) TextButton(onClick = {
-                        replacingItemId = item.id
-                        selectingType = exercise.type
-                    }) { Text("更换剩余动作") }
-                    if (item.notes.isNotBlank() && item.notes != exercise.name) Text(item.notes, style = MaterialTheme.typography.bodySmall)
-                    TextButton(onClick = { editingItemNotes = item.id; itemNotesDraft = item.notes }) {
-                        Text(if (item.notes.isBlank()) "添加动作备注" else "修改动作备注")
+                    WorkoutSetProgress(completed, targetCount)
+                    var showItemActions by rememberSaveable(session.id, item.id) { mutableStateOf(false) }
+                    Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                        if (nextIndex != null) TextButton(onClick = {
+                            replacingItemId = item.id
+                            selectingType = exercise.type
+                        }) { Text("更换动作") }
+                        TextButton(onClick = { showItemActions = !showItemActions }) { Text(if (showItemActions) "收起动作操作" else "更多动作操作") }
+                    }
+                    if (showItemActions) {
+                        TextButton(onClick = { correctingItemId = item.id; selectingType = exercise.type }) { Text("订正实际动作 / 器械") }
+                        if (item.notes.isBlank()) TextButton(onClick = { editingItemNotes = item.id; itemNotesDraft = "" }) { Text("添加动作备注") }
                     }
                     if (nextIndex != null && !isCurrent) TextButton(onClick = { selectedItemId = item.id }) { Text("切换到此动作") }
                     if (completed > 0) {
@@ -272,19 +314,21 @@ private fun willStartRestTimer(session: Session, itemId: String, setIndex: Int, 
                         }
                         if (showCompleted) results.sortedBy { it.setIndex }.forEach { result ->
                             HorizontalDivider()
-                            Text("第 ${result.setIndex + 1} 组实际 · ${resultText(result)}", style = MaterialTheme.typography.bodySmall)
-                            Row {
-                                TextButton(onClick = {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Text(workoutResultSummary(result), style = MaterialTheme.typography.bodySmall, modifier = Modifier.weight(1f))
+                                IconButton(onClick = {
                                     actualDraft = null
                                     editingResult = item.id
                                     editingIndex = result.setIndex
-                                }) { Text("修改实际记录") }
-                                TextButton(onClick = { viewModel.undoSet(session.id, item.id, result.setIndex) }) { Text("撤销完成") }
+                                }) { Icon(Icons.Default.Edit, contentDescription = "修改实际记录") }
+                                IconButton(onClick = { viewModel.undoSet(session.id, item.id, result.setIndex) }) {
+                                    Icon(painterResource(R.drawable.ic_workout_undo), contentDescription = "撤销完成")
+                                }
                             }
                         }
                     }
                     when {
-                        skipped -> Text("剩余目标已由替代动作安排；已完成组保留在上方记录中。", style = MaterialTheme.typography.bodySmall)
+                        skipped -> Unit
                         nextIndex != null && isCurrent -> {
                             val target = item.sets[nextIndex]
                             expandedState.SaveableStateProvider("${session.id}/${item.id}/$nextIndex") {
@@ -307,12 +351,11 @@ private fun willStartRestTimer(session: Session, itemId: String, setIndex: Int, 
                         }
                         nextIndex != null -> Text("下一组待执行 · 第 ${nextIndex + 1} 组", style = MaterialTheme.typography.bodySmall)
                         else -> {
-                            Text(if (isComplete) "该动作计划组已完成。" else "暂无待执行目标。", style = MaterialTheme.typography.bodySmall)
                             if (completed > 0) TextButton(onClick = { viewModel.appendSessionSet(session.id, item.id) }) { Text("追加一组待执行目标") }
                         }
                     }
-                }
                     }
+                }
             }
             item {
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -488,7 +531,9 @@ private fun willStartRestTimer(session: Session, itemId: String, setIndex: Int, 
             },
             allowMeasurementChange = exercise.id.startsWith("smartworkout_")
         ) { revised, position ->
-            if (replacingId != null) viewModel.replaceSessionExercise(session.id, replacingId, revised, exercise)
+            if (replacingId != null) viewModel.replaceSessionExercise(session.id, replacingId, revised, exercise) { savedId ->
+                selectedItemId = savedId
+            }
             else viewModel.addSessionExercise(session.id, revised, exercise, position)
             pendingItem = null
             selectedExercise = null

@@ -11,12 +11,13 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Check
+import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material3.Button
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Icon
-import androidx.compose.material3.LinearProgressIndicator
+import androidx.compose.material3.IconButton
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.luminance
@@ -68,7 +69,7 @@ fun CompletedTrainingScreen(session: Session, today: java.time.LocalDate, viewMo
                 Text("仅添加到当天训练，不会修改未来计划。", style = MaterialTheme.typography.bodySmall)
             }
         }
-        items(session.items, key = { it.id }) { item ->
+        items(session.items.filter { item -> item.id !in session.skippedItems || session.results.any { it.itemId == item.id } }, key = { it.id }) { item ->
             val exercise = session.exercises.singleOrNull { it.id == item.exerciseId } ?: return@items
             val results = session.results.filter { it.itemId == item.id }.sortedBy { it.setIndex }
             val completedIndices = results.mapTo(hashSetOf()) { it.setIndex }
@@ -76,7 +77,6 @@ fun CompletedTrainingScreen(session: Session, today: java.time.LocalDate, viewMo
             val targetSetIndices = if (skipped) completedIndices.sorted() else item.sets.indices.toList()
             val targetCount = targetSetIndices.size
             val complete = !skipped && targetCount > 0 && targetSetIndices.all { it in completedIndices }
-            var showPlan by rememberSaveable(session.id, item.id) { mutableStateOf(false) }
             var showActual by rememberSaveable(session.id, item.id) { mutableStateOf(false) }
             val dark = MaterialTheme.colorScheme.surface.luminance() < 0.5f
             val bg = if (complete) {
@@ -90,37 +90,32 @@ fun CompletedTrainingScreen(session: Session, today: java.time.LocalDate, viewMo
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Text(exercise.name, style = MaterialTheme.typography.titleMedium, modifier = Modifier.weight(1f))
                         if (complete) Icon(Icons.Default.Check, contentDescription = "动作已完成", tint = if (dark) Color(0xFF81C784) else Color(0xFF2E7D32))
+                        if (session.status == "completed" && item.notes.isNotBlank()) IconButton(onClick = {
+                            editingItemNotes = item.id; itemNotesDraft = item.notes
+                        }) { Icon(Icons.Default.Edit, contentDescription = "修改动作备注") }
                     }
-                    val samePlan = item.sets.map(::targetText).distinct().size <= 1
-                    Text("计划 · ${item.sets.size}组 · ${if (samePlan) item.sets.firstOrNull()?.let(::targetText) ?: "未设置目标" else "各组目标不同"}", style = MaterialTheme.typography.bodySmall)
-                    if (item.sets.isNotEmpty()) {
-                        TextButton(onClick = { showPlan = !showPlan }) { Text(if (showPlan) "收起计划" else "查看各组计划") }
-                        if (showPlan) item.sets.forEachIndexed { index, target ->
-                            Text("第 ${index + 1} 组 · ${targetText(target)}", style = MaterialTheme.typography.bodySmall)
-                        }
-                    }
+                    ExerciseCardImage(exercise, state, viewModel.repository)
+                    if (item.notes.isNotBlank()) Text(item.notes, style = MaterialTheme.typography.bodySmall)
                     val completedCount = targetSetIndices.count { it in completedIndices }
-                    Text("进度 · $completedCount/$targetCount 组", style = MaterialTheme.typography.labelMedium)
-                    LinearProgressIndicator(
-                        progress = { if (targetCount == 0) 0f else (completedCount.toFloat() / targetCount).coerceIn(0f, 1f) },
-                        modifier = Modifier.fillMaxWidth()
-                    )
-                    if (results.isEmpty()) Text("实际记录 · 暂无组", style = MaterialTheme.typography.bodySmall)
-                    else {
+                    Text("$completedCount/$targetCount 组", style = MaterialTheme.typography.labelMedium)
+                    WorkoutSetProgress(completedCount, targetCount)
+                    if (results.isNotEmpty()) {
                         TextButton(onClick = { showActual = !showActual }) {
                             Text(if (showActual) "收起实际记录" else "查看实际记录 ${results.size} 组")
                         }
                         if (showActual) results.forEach { result ->
-                            Text("第 ${result.setIndex + 1} 组 · ${resultText(result)}", style = MaterialTheme.typography.bodySmall)
-                            TextButton(onClick = { editingResult = ResultTarget(item.id, result.setIndex) }) { Text("修改实际结果") }
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Text(workoutResultSummary(result), Modifier.weight(1f), style = MaterialTheme.typography.bodySmall)
+                                IconButton(onClick = { editingResult = ResultTarget(item.id, result.setIndex) }) {
+                                    Icon(Icons.Default.Edit, contentDescription = "修改实际结果")
+                                }
+                            }
                         }
                     }
-                    if (session.status == "completed") {
-                        if (item.notes.isNotBlank()) Text(item.notes, style = MaterialTheme.typography.bodySmall)
-                        TextButton(onClick = { editingItemNotes = item.id; itemNotesDraft = item.notes }) {
-                            Text(if (item.notes.isBlank()) "添加动作备注" else "修改动作备注")
-                        }
-                    } else if (item.notes.isNotBlank()) Text(item.notes, style = MaterialTheme.typography.bodySmall)
+                    if (session.status == "completed" && item.notes.isBlank()) TextButton(onClick = {
+                        editingItemNotes = item.id
+                        itemNotesDraft = item.notes
+                    }) { Text("添加动作备注") }
                     if (session.status == "completed") TextButton(onClick = {
                         correctingItemId = item.id
                         selectingType = exercise.type

@@ -51,6 +51,9 @@ class SessionCorrectionTest {
         assertEquals(listOf(result), replaced.results)
         assertEquals(listOf(item.id), replaced.skippedItems)
         assertEquals(3, replaced.items.last().sets.size)
+        assertFailsWith<IllegalArgumentException> {
+            replaceRemainingSessionExercise(replaced, item.id, replacement.copy(id = "second"), actualExercise)
+        }
     }
     @Test fun `订正和换练不消费分化但新增完成组才消费`() {
         val arranged = session.copy(

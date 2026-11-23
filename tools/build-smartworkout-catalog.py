@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build server-only SmartWorkout guides and additive exercise seed data."""
+"""Build shared SmartWorkout catalog resources and server-only legacy guide data."""
 from __future__ import annotations
 
 import hashlib
@@ -13,11 +13,11 @@ ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "data" / "smartworkout" / "source.json"
 CATALOG = ROOT / "shared" / "src" / "main" / "resources" / "catalog.json"
 GUIDES = ROOT / "server" / "src" / "main" / "resources" / "smartworkout-guides.json"
-DIRECTORY = ROOT / "server" / "src" / "main" / "resources" / "smartworkout-directory.json"
+DIRECTORY = ROOT / "shared" / "src" / "main" / "resources" / "smartworkout-directory.json"
 EQUIPMENT_TAGS = ROOT / "shared" / "src" / "main" / "resources" / "equipment-tags.json"
-SOURCE_GUIDES = ROOT / "server" / "src" / "main" / "resources" / "smartworkout-source-guides.json"
-SELECTIONS = ROOT / "server" / "src" / "main" / "resources" / "smartworkout-selections.json"
-ASSOCIATIONS = ROOT / "server" / "src" / "main" / "resources" / "smartworkout-associations.json"
+SOURCE_GUIDES = ROOT / "shared" / "src" / "main" / "resources" / "smartworkout-source-guides.json"
+SELECTIONS = ROOT / "shared" / "src" / "main" / "resources" / "smartworkout-selections.json"
+ASSOCIATIONS = ROOT / "shared" / "src" / "main" / "resources" / "smartworkout-associations.json"
 FULL_SOURCE = ROOT / "server" / "src" / "main" / "resources" / "smartworkout-source.json"
 REPORT = ROOT / "server" / "src" / "main" / "resources" / "smartworkout-association-report.json"
 

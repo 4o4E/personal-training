@@ -23,5 +23,8 @@
         <provider android:name="androidx.core.content.FileProvider" android:authorities="${applicationId}.updates" android:exported="false" android:grantUriPermissions="true">
             <meta-data android:name="android.support.FILE_PROVIDER_PATHS" android:resource="@xml/update_paths" />
         </provider>
+        <provider android:name=".SelectiveExportFileProvider" android:authorities="${applicationId}.selective-exports" android:exported="false" android:grantUriPermissions="true">
+            <meta-data android:name="android.support.FILE_PROVIDER_PATHS" android:resource="@xml/selective_export_paths" />
+        </provider>
     </application>
 </manifest>

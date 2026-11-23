@@ -40,9 +40,11 @@ import java.io.OutputStream
 import java.nio.file.Files
 import java.nio.file.StandardCopyOption
 import java.util.UUID
+import java.time.LocalDate
 import java.util.concurrent.TimeUnit
 
 private fun sessionDraftKey(sessionId: String) = "session-draft/$sessionId"
+private fun workoutActivityKey(sessionId: String) = "workout-activity/$sessionId"
 internal fun arrangementOverrideToConsume(previous: Session, next: Session): Pair<String, String>? {
     if (next.results.size <= previous.results.size) return null
     val programId = next.snapshot?.programId ?: return null
@@ -184,8 +186,6 @@ data class ExerciseGuideResult(
 )
 @kotlinx.serialization.Serializable
 data class SmartWorkoutExerciseSource(val sourceId: String, val name: String)
-@kotlinx.serialization.Serializable
-private data class SmartWorkoutSelectionRequest(val type: String)
 enum class SyncStatus { offline, syncing, synced, pending, conflict, error }
 @kotlinx.serialization.Serializable
 private data class SessionMigrationBase(val baseline: Document?, val sourceIds: Set<String>)
@@ -237,8 +237,16 @@ class TrainingRepository(
     val data: StateFlow<AppData> = _data
     private val _timer = MutableStateFlow<TimerState?>(null)
     val timer: StateFlow<TimerState?> = _timer
+    private val _workoutDeadline = MutableStateFlow<Long?>(null)
+    internal val workoutDeadline: StateFlow<Long?> = _workoutDeadline
     private val mediaDirectory = File(context.filesDir, "media").also { check(it.exists() || it.mkdirs()) }
     private val mediaDownloadMutex = Mutex()
+    private val smartWorkoutCatalog by lazy {
+        SmartWorkoutCatalog.load { name -> context.assets.open(name).bufferedReader().use { it.readText() } }
+    }
+    private val smartWorkoutSources by lazy {
+        smartWorkoutCatalog.list().map { SmartWorkoutExerciseSource(it.sourceId, it.name) }
+    }
     private val bundledMedia by lazy {
         context.assets.open("catalog.json").bufferedReader().use {
             wireJson.decodeFromString<List<Document>>(it.readText())
@@ -366,15 +374,7 @@ class TrainingRepository(
                 startSync = true
             }
         }
-        if (startSync) {
-            try {
-                sync()
-            } catch (error: IOException) {
-                syncFailure("网络不可用，记录已保存在手机，等待同步")
-            } catch (error: ApiProblem) {
-                syncFailure(error.message!!)
-            }
-        }
+        if (startSync) enqueueSync()
     }
     private fun install(values: List<Cached>) {
         val grouped = _data.value.documents.toMutableMap()
@@ -634,7 +634,7 @@ class TrainingRepository(
     suspend fun remove(original: Document) = save(original.copy(deleted = true), original)
 
     /** 实际组与计时在同一事务内更新；读取和修改也在同一锁内，快速连续操作不会互相覆盖。 */
-    private suspend fun persistSession(session: Session, timer: TimerState?) {
+    private suspend fun persistSession(session: Session, timer: TimerState?, updatedAt: Long? = null) {
         val doc = document(Kind.session, session.id, session)
         validateDocument(doc, ::list, ::lookup)
         val old = cache[doc.key()]
@@ -644,6 +644,11 @@ class TrainingRepository(
         database.withTransaction {
             if (changed) dao.put(entry.row())
             dao.removeValue(sessionDraftKey(session.id))
+            if (session.status != "active" || session.results.isEmpty()) {
+                dao.removeValue(workoutActivityKey(session.id))
+            } else if (updatedAt != null) {
+                dao.putValue(LocalValue(workoutActivityKey(session.id), updatedAt.toString()))
+            }
             if (timerChanged) {
                 if (timer == null) dao.removeValue("timer") else dao.putValue(LocalValue("timer", wireJson.encodeToString(timer)))
             }
@@ -653,6 +658,52 @@ class TrainingRepository(
             _timer.value = timer
             if (timer == null) TimerEngine.cancel(context) else TimerEngine.schedule(context, timer)
         }
+    }
+
+    private fun activeWorkouts(): Sequence<Session> = _data.value.documents.getValue(Kind.session).values.asSequence()
+        .filter { !it.deleted && it.data["status"]?.jsonPrimitive?.content == "active" }
+        .map { it.value<Session>() }
+
+    /** 在写锁内核对活动时间，防止上一轮超时回调关闭刚刚续练的记录。 */
+    internal suspend fun reconcileWorkoutDeadline() = withContext(Dispatchers.IO) {
+        initialize(triggerStartupSync = false)
+        gate.withLock { reconcileWorkoutDeadlineLocked(System.currentTimeMillis()) }
+    }
+
+    private suspend fun reconcileWorkoutDeadlineLocked(now: Long) {
+        var nextDeadline: Long? = null
+        var finished = false
+        for (workout in activeWorkouts().toList()) {
+            if (workout.results.isEmpty()) continue
+            val key = workoutActivityKey(workout.id)
+            val lastUpdate = dao.value(key)?.toLongOrNull()
+            val deadline = workout.workoutIdleDeadline(lastUpdate) ?: run {
+                // Legacy records may have no known training timestamp. Only the idle countdown is anchored here.
+                dao.putValue(LocalValue(key, now.toString()))
+                now + workoutIdleTimeout
+            }
+            if (deadline <= now) {
+                val completed = workout.finishWorkout(cancelled = false, requestedAt = now)
+                persistSession(completed, _timer.value?.takeUnless { it.sessionId == workout.id })
+                if (_preparedTraining.value?.id == completed.id) _preparedTraining.value = completed
+                finished = true
+            } else if (nextDeadline == null || deadline < nextDeadline) {
+                nextDeadline = deadline
+            }
+        }
+        if (finished) enqueueSync()
+        if (nextDeadline == _workoutDeadline.value) return
+        _workoutDeadline.value = nextDeadline
+        if (nextDeadline != null) {
+            val request = OneTimeWorkRequestBuilder<WorkoutIdleWorker>()
+                .setInitialDelay(nextDeadline - now, TimeUnit.MILLISECONDS)
+                .build()
+            WorkManager.getInstance(context).enqueueUniqueWork("training-idle-finish", ExistingWorkPolicy.REPLACE, request)
+        }
+    }
+
+    internal suspend fun finishWorkout(id: String, cancelled: Boolean) = updateSession(id) { session, _ ->
+        session.finishWorkout(cancelled, System.currentTimeMillis()) to null
     }
     private suspend fun persistSessionDraft(session: Session, timer: TimerState?) {
         val timerChanged = _timer.value != timer
@@ -671,11 +722,12 @@ class TrainingRepository(
         initialize()
         var changedData = false
         gate.withLock {
+            reconcileWorkoutDeadlineLocked(System.currentTimeMillis())
             val before = list(Kind.session).map { it.value<Session>() }
             val archived = before.filter { session ->
-                session.status == "active" && java.time.LocalDate.parse(session.localDate).isBefore(date)
+                session.status == "active" && session.results.isEmpty() && LocalDate.parse(session.localDate).isBefore(date)
             }.map { session ->
-                val revised = session.copy(status = if (session.results.isEmpty()) "cancelled" else "completed")
+                val revised = session.copy(status = "cancelled")
                 val doc = document(Kind.session, revised.id, revised)
                 validateDocument(doc, ::list, ::lookup)
                 val old = cache.getValue(doc.key())
@@ -837,12 +889,16 @@ class TrainingRepository(
             } else if (session.status != "active") {
                 val resumed = session.copy(status = "active", endedAt = null)
                 val timer = _timer.value?.takeUnless { it.sessionId == id }
-                persistSession(resumed, timer)
+                persistSession(resumed, timer, updatedAt = System.currentTimeMillis())
                 _preparedTraining.value = resumed
                 changed = true
             } else {
                 _preparedTraining.value = session
+                if (session.results.isNotEmpty()) {
+                    dao.putValue(LocalValue(workoutActivityKey(id), System.currentTimeMillis().toString()))
+                }
             }
+            reconcileWorkoutDeadlineLocked(System.currentTimeMillis())
         }
         if (changed) enqueueSync()
     }
@@ -877,7 +933,8 @@ class TrainingRepository(
                 (saved.status == "active" || saved.results.isNotEmpty() || sessionTimer != null)
             val shouldPersist = persistExisting || began
             val session = if (shouldPersist) {
-                persistSession(next, timer)
+                val updatedAt = operationAt.takeIf { next != current || requestedTimer != sessionTimer }
+                persistSession(next, timer, updatedAt)
                 persisted = true
                 next
             } else {
@@ -886,6 +943,7 @@ class TrainingRepository(
             }
             _preparedTraining.value = session
             completedOverride = arrangementOverrideToConsume(current, session)
+            if (shouldPersist) reconcileWorkoutDeadlineLocked(System.currentTimeMillis())
         }
         completedOverride?.let { (programId, id) ->
             saveArrangement { arrangement ->
@@ -915,7 +973,7 @@ class TrainingRepository(
             val original = requireNotNull(lookup(Kind.session, sessionId)) { "训练不存在" }
             require(!original.deleted) { "训练记录不存在" }
             val current = original.value<Session>()
-            require(current.status == "completed") { "仅可修改已完成的训练" }
+            require(current.status == "active" || current.status == "completed") { "只能修改进行中或已完成训练的实际组" }
             val resultIndex = current.results.indexOfFirst { it.itemId == itemId && it.setIndex == setIndex }
             require(resultIndex >= 0) { "完成组不存在" }
             val oldResult = current.results[resultIndex]
@@ -936,7 +994,13 @@ class TrainingRepository(
                 oldResult.copy(reps = totalReps, segments = updatedSegments)
             } else oldResult.copy(reps = reps, seconds = seconds, load = load)
             val revised = current.copy(results = current.results.toMutableList().apply { set(resultIndex, updatedResult) })
-            saveCompletedSession(original, revised)
+            if (current.status == "active") {
+                val now = System.currentTimeMillis()
+                persistSession(revised, _timer.value, now.takeIf { revised != current })
+                reconcileWorkoutDeadlineLocked(now)
+            } else {
+                saveCompletedSession(original, revised)
+            }
         }
         enqueueSync()
     }
@@ -1036,6 +1100,7 @@ class TrainingRepository(
     suspend fun restoreTimer() {
         initialize(triggerStartupSync = false)
         gate.withLock {
+            reconcileWorkoutDeadlineLocked(System.currentTimeMillis())
             val current = _timer.value
             when {
                 current == null -> TimerEngine.clearActive(context)
@@ -1263,6 +1328,7 @@ class TrainingRepository(
                 }
                 _data.update { it.copy(lastSuccessfulSyncAt = syncedAt) }
                 clearInactiveTimer()
+                reconcileWorkoutDeadlineLocked(System.currentTimeMillis())
             }
             val remoteArrangement = (result.documents + result.accepted)
                 .firstOrNull { it.kind == Kind.arrangement && it.id == "current" }
@@ -1365,12 +1431,7 @@ class TrainingRepository(
             return@withContext
         }
         try {
-            val response = client.get("${connection.url}/v1/health/days") {
-                bearerAuth(connection.token)
-                url { parameters.append("from", from.toString()); parameters.append("to", to.toString()) }
-            }
-            requireSuccess(response)
-            val result = response.body<HealthDaysResponse>()
+            val result = fetchHealthDays(connection, from, to)
             val cachedAt = System.currentTimeMillis()
             val byDate = result.days.associateBy { it.localDate }
             database.withTransaction {
@@ -1395,11 +1456,71 @@ class TrainingRepository(
         }
     }
 
-    suspend fun loadExerciseGuide(exerciseId: String): ExerciseGuideResult =
-        loadGuide("exercise-guide/$exerciseId", "/v1/exercise-guide/${exerciseId.encodeURLPathPart()}")
+    private suspend fun fetchHealthDays(connection: BackendConnection, from: LocalDate, to: LocalDate): HealthDaysResponse {
+        val response = client.get("${connection.url}/v1/health/days") {
+            bearerAuth(connection.token)
+            url { parameters.append("from", from.toString()); parameters.append("to", to.toString()) }
+        }
+        requireSuccess(response)
+        return response.body()
+    }
 
-    suspend fun loadSmartWorkoutExerciseGuide(sourceId: String): ExerciseGuideResult =
-        loadGuide("smartworkout-guide/$sourceId", "/v1/smartworkout/exercises/${sourceId.encodeURLPathPart()}/guide")
+    internal suspend fun readExportHealthDays(from: LocalDate, to: LocalDate): HealthDaysResponse = withContext(Dispatchers.IO) {
+        val connection = vault.load()
+        require(connection.configured) { "未连接后端，只能导出已下载的健康记录" }
+        fetchHealthDays(connection, from, to)
+    }
+
+    private class HealthRevisionChanged : IOException("健康资料在分页读取时发生变化，请重新导出")
+
+    private suspend fun fetchHealthRecords(connection: BackendConnection, date: LocalDate, dataset: HealthDataset): HealthRecordsPage {
+        val dateText = date.toString()
+        val records = linkedMapOf<String, HealthRecord>()
+        var cursor: String? = null
+        var revision: Long? = null
+        do {
+            val response = client.get("${connection.url}/v1/health/records") {
+                bearerAuth(connection.token)
+                url {
+                    parameters.append("date", dateText)
+                    parameters.append("dataset", dataset.name)
+                    cursor?.let { parameters.append("cursor", it) }
+                }
+            }
+            requireSuccess(response)
+            val page = response.body<HealthRecordsPage>()
+            require(page.date == dateText && page.dataset == dataset) { "健康分页返回了不匹配的日期或数据集" }
+            if (revision != null && page.revision != revision) throw HealthRevisionChanged()
+            revision = page.revision
+            page.records.forEach { record ->
+                require(record.localDate == dateText) { "健康分页包含其他日期" }
+                records[record.sourceId] = record
+            }
+            cursor = page.nextCursor
+        } while (cursor != null)
+        return HealthRecordsPage(dateText, dataset, checkNotNull(revision), records.values.toList())
+    }
+
+    internal suspend fun readExportHealthRecords(date: LocalDate, dataset: HealthDataset): HealthRecordsPage = withContext(Dispatchers.IO) {
+        val connection = vault.load()
+        require(connection.configured) { "未连接后端，只能导出已下载的健康记录" }
+        fetchHealthRecords(connection, date, dataset)
+    }
+
+    suspend fun loadExerciseGuide(exerciseId: String): ExerciseGuideResult = withContext(Dispatchers.IO) {
+        smartWorkoutCatalog.guideForExercise(exerciseId)?.localResult()
+            ?: loadGuide("exercise-guide/$exerciseId", "/v1/exercise-guide/${exerciseId.encodeURLPathPart()}")
+    }
+
+    suspend fun loadSmartWorkoutExerciseGuide(sourceId: String): ExerciseGuideResult = withContext(Dispatchers.IO) {
+        smartWorkoutCatalog.guide(sourceId)?.localResult()
+            ?: ExerciseGuideResult(null, ExerciseGuideStatus.notAssociated)
+    }
+
+    private fun SmartWorkoutGuide.localResult() = ExerciseGuideResult(
+        ExerciseGuide(sourceUrl, imageUrl, videoUrl, description, tips, mistakes, instructions),
+        ExerciseGuideStatus.available
+    )
 
     suspend fun selectedExerciseTeaching(exerciseId: String): SmartWorkoutExerciseSource? = withContext(Dispatchers.IO) {
         dao.value("exercise-teaching-selection/$exerciseId")?.let { wireJson.decodeFromString<SmartWorkoutExerciseSource>(it) }
@@ -1458,64 +1579,34 @@ class TrainingRepository(
     }
 
 
-    suspend fun loadSmartWorkoutExercises(): List<SmartWorkoutExerciseSource> = withContext(Dispatchers.IO) {
-        val key = "smartworkout-exercise-list"
-        val cached = dao.value(key)?.let { wireJson.decodeFromString<List<SmartWorkoutExerciseSource>>(it) }
-        val connection = vault.load()
-        if (!connection.configured) return@withContext cached ?: throw IllegalStateException("尚未连接后端，且没有已缓存的来源动作目录")
-        try {
-            val response = client.get("${connection.url}/v1/smartworkout/exercises") {
-                bearerAuth(connection.token)
-            }
-            requireSuccess(response)
-            response.body<List<kotlinx.serialization.json.JsonObject>>().map { source ->
-                SmartWorkoutExerciseSource(
-                    source.getValue("sourceId").jsonPrimitive.content,
-                    source.getValue("name").jsonPrimitive.content
-                )
-            }.also { dao.putValue(LocalValue(key, wireJson.encodeToString(it))) }
-        } catch (error: CancellationException) {
-            throw error
-        } catch (error: Exception) {
-            cached ?: throw error
-        }
-    }
+    suspend fun loadSmartWorkoutExercises(): List<SmartWorkoutExerciseSource> =
+        withContext(Dispatchers.IO) { smartWorkoutSources }
 
     suspend fun selectSmartWorkoutExercise(sourceId: String, type: String): Exercise = withContext(Dispatchers.IO) {
         require(type == "strength" || type == "stretch") { "动作类型无效" }
-        initialize(triggerStartupSync = false)
-        val connection = vault.load()
-        require(connection.configured) { "尚未连接后端" }
-        val response = client.post("${connection.url}/v1/smartworkout/exercises/${sourceId.encodeURLPathPart()}/select") {
-            bearerAuth(connection.token)
-            contentType(ContentType.Application.Json)
-            setBody(SmartWorkoutSelectionRequest(type))
-        }
-        requireSuccess(response)
-        val selected = response.body<Document>()
-        require(selected.kind == Kind.exercise && !selected.deleted) { "后端返回的来源动作文档无效" }
-        val selectedExercise = selected.value<Exercise>()
-        require(selectedExercise.id == selected.id && selectedExercise.type == type) { "后端返回的动作类型或标识不匹配" }
-        var resolved = selected
-        gate.withLock {
-            val existing = cache[selected.key()]
-            if (existing?.dirty == true) {
-                check(!existing.document.deleted) { "该动作在本机有待同步删除，无法直接选择" }
-                resolved = existing.document
-            } else if (existing == null || existing.document.revision < selected.revision ||
-                existing.document.revision == selected.revision && existing.document.data != selected.data ||
-                existing.document.deleted
-            ) {
-                val imported = Cached(selected, false)
-                dao.put(imported.row())
-                install(listOf(imported))
-            } else {
-                resolved = existing.document
+        initialize()
+        val associatedId = smartWorkoutCatalog.associatedExerciseId(sourceId, type)
+        var saved = false
+        val exercise = gate.withLock {
+            val id = associatedId ?: "${sourceId}_$type"
+            val existing = lookup(Kind.exercise, id)
+            if (existing != null) {
+                require(!existing.deleted) { "该动作已删除，不能作为新动作选择" }
+                val exercise = _data.value.record(Kind.exercise, id)!!.value<Exercise>()
+                require(exercise.type == type) { "本机动作类型与当前选择不一致" }
+                return@withLock exercise
             }
+            require(associatedId == null) { "本机缺少已关联的动作资料" }
+            val selected = requireNotNull(smartWorkoutCatalog.exerciseDocument(sourceId, type)) { "来源动作不存在" }
+            validateDocument(selected, ::list, ::lookup)
+            val entry = Cached(selected, true)
+            dao.put(entry.row())
+            install(listOf(entry))
+            saved = true
+            selected.value<Exercise>()
         }
-        val resolvedExercise = resolved.value<Exercise>()
-        require(resolvedExercise.type == type) { "本机该动作资料的类型与当前选择上下文不一致" }
-        resolvedExercise
+        if (saved) enqueueSync()
+        exercise
     }
 
 
@@ -1537,41 +1628,14 @@ class TrainingRepository(
                     current.copy(health = current.health.copy(detailStateByDataset = states))
                 }
                 try {
-                    var restarted = true
-                    var collected = linkedMapOf<String, HealthRecord>()
-                    var revision = 0L
-                    while (restarted) {
-                        restarted = false
-                        collected = linkedMapOf()
-                        var cursor: String? = null
-                        var pageRevision: Long? = null
-                        do {
-                            val response = client.get("${connection.url}/v1/health/records") {
-                                bearerAuth(connection.token)
-                                url {
-                                    parameters.append("date", date.toString())
-                                    parameters.append("dataset", dataset.name)
-                                    cursor?.let { parameters.append("cursor", it) }
-                                }
-                            }
-                            requireSuccess(response)
-                            val page = response.body<HealthRecordsPage>()
-                            require(page.date == date.toString() && page.dataset == dataset) { "健康分页返回了不匹配的日期或数据集" }
-                            if (pageRevision != null && page.revision != pageRevision) {
-                                restarted = true
-                                break
-                            }
-                            pageRevision = page.revision
-                            page.records.forEach { record ->
-                                require(record.localDate == date.toString()) { "健康分页包含其他日期" }
-                                collected[record.sourceId] = record
-                            }
-                            cursor = page.nextCursor
-                        } while (cursor != null)
-                        if (!restarted) revision = pageRevision ?: dao.healthDay(date.toString())?.revision ?: 0L
+                    val collected = try {
+                        fetchHealthRecords(connection, date, dataset)
+                    } catch (_: HealthRevisionChanged) {
+                        fetchHealthRecords(connection, date, dataset)
                     }
+                    val revision = collected.revision
                     val completedAt = System.currentTimeMillis()
-                    val newRows = collected.values.map { it.cacheRow(dataset, revision, completedAt) }
+                    val newRows = collected.records.map { it.cacheRow(dataset, revision, completedAt) }
                     database.withTransaction {
                         dao.clearHealthRecords(date.toString(), dataset.name)
                         if (newRows.isNotEmpty()) dao.putHealthRecords(newRows)
@@ -1701,6 +1765,7 @@ class TrainingRepository(
             }
             install(listOf(entry))
             clearInactiveTimer()
+            if (kind == Kind.session) reconcileWorkoutDeadlineLocked(System.currentTimeMillis())
         }
         enqueueSync()
     }
@@ -1998,5 +2063,12 @@ class SyncWorker(context: Context, parameters: WorkerParameters) : CoroutineWork
         catch (error: IOException) { repository.syncFailure("网络不可用，记录已保存在手机，等待同步"); Result.retry() }
         catch (error: ApiProblem) { repository.syncFailure(error.message!!); Result.failure() }
         catch (error: IllegalArgumentException) { repository.syncFailure(error.message!!); Result.failure() }
+    }
+}
+
+internal class WorkoutIdleWorker(context: Context, parameters: WorkerParameters) : CoroutineWorker(context, parameters) {
+    override suspend fun doWork(): Result {
+        (applicationContext as TrainingApplication).repository.reconcileWorkoutDeadline()
+        return Result.success()
     }
 }

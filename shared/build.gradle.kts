@@ -4,7 +4,14 @@ plugins { kotlin("jvm"); kotlin("plugin.serialization") }
 kotlin { jvmToolchain(21); compilerOptions { jvmTarget.set(JvmTarget.JVM_17) } }
 java { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
 tasks.processResources {
-    exclude("catalog.json", "equipment-tags.json")
+    exclude(
+        "catalog.json",
+        "equipment-tags.json",
+        "smartworkout-directory.json",
+        "smartworkout-source-guides.json",
+        "smartworkout-selections.json",
+        "smartworkout-associations.json",
+    )
 }
 dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.9.0")

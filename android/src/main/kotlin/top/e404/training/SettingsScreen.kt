@@ -8,6 +8,7 @@ import android.os.Build
 import android.provider.Settings
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
@@ -18,11 +19,18 @@ import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
+import androidx.core.content.FileProvider
 import top.e404.training.shared.*
 import android.media.RingtoneManager
+import java.io.File
+import java.time.Instant
+import java.time.LocalDate
+import java.time.ZoneOffset
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable fun SettingsScreen(viewModel: TrainingViewModel, permissionRevision: Int, preferences: AppPreferences) {
     val context = LocalContext.current
     val repository = viewModel.repository
@@ -37,7 +45,40 @@ import android.media.RingtoneManager
     var transferMessage by rememberSaveable { mutableStateOf<String?>(null) }
     var importing by remember { mutableStateOf(false) }
     var choosingCompleteRestore by rememberSaveable { mutableStateOf(false) }
+    var exportFrom by rememberSaveable { mutableStateOf(LocalDate.now(ZoneOffset.ofHours(8)).toString()) }
+    var exportTo by rememberSaveable { mutableStateOf(exportFrom) }
+    var exportItemNames by rememberSaveable { mutableStateOf(arrayListOf(SelectiveExportItem.training.name)) }
+    val exportItems = remember(exportItemNames) { exportItemNames.mapTo(linkedSetOf(), SelectiveExportItem::valueOf) }
+    val from = LocalDate.parse(exportFrom)
+    val to = LocalDate.parse(exportTo)
+    val exportRequest = if (to >= from && exportItems.isNotEmpty()) Triple(from, to, exportItems.toSet()) else null
+    val exportFileName = "所选资料-$exportFrom-$exportTo.zip"
+    var selectiveExportBusy by remember { mutableStateOf(false) }
+    var datePickerTarget by rememberSaveable { mutableStateOf<String?>(null) }
+    var awaitingExportFile by rememberSaveable { mutableStateOf(false) }
+    var selectiveExportMessage by rememberSaveable { mutableStateOf<String?>(null) }
     val askNotifications = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { permissionChanged++ }
+    fun selectedExportMessage(summary: SelectiveExportSummary): String =
+        when {
+            summary.online + summary.cached + summary.missing == 0 -> "ZIP 已生成。"
+            else -> "ZIP 已生成。健康数据：在线 ${summary.online} 项，缓存 ${summary.cached} 项，不完整 ${summary.partial} 项，缺失 ${summary.missing} 项。"
+        }
+    suspend fun makeSelectedExport(request: Triple<LocalDate, LocalDate, Set<SelectiveExportItem>>, output: java.io.OutputStream) =
+        repository.exportSelected(request.first, request.second, request.third,
+            (context.applicationContext as TrainingApplication).database, output)
+    val selectiveSave = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/zip")) { uri ->
+        val request = exportRequest.takeIf { awaitingExportFile }
+        awaitingExportFile = false
+        if (uri != null && request != null) viewModel.action {
+            selectiveExportBusy = true
+            try {
+                val summary = requireNotNull(context.contentResolver.openOutputStream(uri)) { "无法创建所选资料 ZIP" }.use { makeSelectedExport(request, it) }
+                selectiveExportMessage = selectedExportMessage(summary)
+            } finally {
+                selectiveExportBusy = false
+            }
+        }
+    }
     val export = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/zip")) { uri ->
         if (uri != null) viewModel.action {
             requireNotNull(context.contentResolver.openOutputStream(uri)) { "无法创建本机备份文件" }.use { repository.export(it) }
@@ -143,10 +184,83 @@ import android.media.RingtoneManager
             OutlinedButton(onClick = { import.launch(arrayOf("application/zip", "application/octet-stream")) }, enabled = !importing) { Text("选择 ZIP 导入或恢复") }
             transferMessage?.let { Text(it) }
         }
+        InfoCard("按日期导出数据") {
+            Text("选择 UTC+8 日期（含首尾日期）和实际需要的项目。健康数据优先读取后端；离线时只包含手机缓存并标明缺失，不会把未知写成零。")
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedButton(onClick = { datePickerTarget = "from" }, modifier = Modifier.weight(1f)) {
+                    Column(horizontalAlignment = androidx.compose.ui.Alignment.CenterHorizontally) {
+                        Text("开始日期"); Text(exportFrom, maxLines = 1)
+                    }
+                }
+                OutlinedButton(onClick = { datePickerTarget = "to" }, modifier = Modifier.weight(1f)) {
+                    Column(horizontalAlignment = androidx.compose.ui.Alignment.CenterHorizontally) {
+                        Text("结束日期"); Text(exportTo, maxLines = 1)
+                    }
+                }
+            }
+            SelectiveExportItem.entries.forEach { item ->
+                val checked = item in exportItems
+                Row(Modifier.fillMaxWidth().heightIn(min = 48.dp)
+                    .toggleable(value = checked, role = Role.Checkbox) { selected ->
+                        exportItemNames = ArrayList(if (selected) exportItemNames + item.name else exportItemNames - item.name)
+                    }, verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
+                    Checkbox(checked = checked, onCheckedChange = null, modifier = Modifier.padding(horizontal = 12.dp))
+                    Text(item.label)
+                }
+            }
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Button(enabled = exportRequest != null && !selectiveExportBusy, onClick = {
+                    awaitingExportFile = true
+                    selectiveSave.launch(exportFileName)
+                }) { Text("保存 ZIP") }
+                OutlinedButton(enabled = exportRequest != null && !selectiveExportBusy, onClick = {
+                    val selected = requireNotNull(exportRequest)
+                    viewModel.action {
+                        selectiveExportBusy = true
+                        try {
+                            val directory = File(context.cacheDir, "selective-exports")
+                            check(directory.isDirectory || directory.mkdirs()) { "无法创建临时导出目录" }
+                            val file = File(directory, "export-${System.currentTimeMillis()}.zip")
+                            val summary = file.outputStream().use { makeSelectedExport(selected, it) }
+                            val uri = FileProvider.getUriForFile(context, "${context.packageName}.selective-exports", file, exportFileName)
+                            val send = Intent(Intent.ACTION_SEND).setType("application/zip")
+                                .putExtra(Intent.EXTRA_STREAM, uri)
+                                .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                                .apply { clipData = android.content.ClipData.newUri(context.contentResolver, "所选资料 ZIP", uri) }
+                            context.startActivity(Intent.createChooser(send, "分享所选资料 ZIP"))
+                            selectiveExportMessage = selectedExportMessage(summary)
+                        } finally {
+                            selectiveExportBusy = false
+                        }
+                    }
+                }) { Text("分享 ZIP") }
+            }
+            if (selectiveExportBusy) LinearProgressIndicator(Modifier.fillMaxWidth())
+            selectiveExportMessage?.let { Text(it, style = MaterialTheme.typography.bodySmall) }
+        }
         InfoCard("教学素材") {
             Text("动作教学显示主要/辅助部位文字、已有动作图片及在线视频；没有可用图片或视频时显示文字说明。")
             Text("公开动作图片和 SmartWorkout 视频由手机按需直接从来源网站下载并缓存，缓存后可离线查看或播放；自有后端不提供这些公开素材。用户上传的器械图片仍通过后端同步。")
         }
+    }
+    if (datePickerTarget != null) {
+        val target = datePickerTarget!!
+        val current = runCatching { LocalDate.parse(if (target == "from") exportFrom else exportTo) }
+            .getOrElse { LocalDate.now(ZoneOffset.ofHours(8)) }
+        val pickerState = rememberDatePickerState(initialSelectedDateMillis = current.atStartOfDay(ZoneOffset.UTC).toInstant().toEpochMilli())
+        DatePickerDialog(
+            onDismissRequest = { datePickerTarget = null },
+            confirmButton = {
+                TextButton(onClick = {
+                    pickerState.selectedDateMillis?.let { millis ->
+                        val chosen = Instant.ofEpochMilli(millis).atZone(ZoneOffset.UTC).toLocalDate().toString()
+                        if (target == "from") exportFrom = chosen else exportTo = chosen
+                    }
+                    datePickerTarget = null
+                }) { Text("确定") }
+            },
+            dismissButton = { TextButton(onClick = { datePickerTarget = null }) { Text("取消") } }
+        ) { DatePicker(state = pickerState) }
     }
     if (importUri != null && !choosingCompleteRestore) {
         val uri = importUri!!

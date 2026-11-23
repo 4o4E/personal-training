@@ -28,6 +28,7 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
+import coil.compose.AsyncImage
 import coil.compose.SubcomposeAsyncImage
 import kotlinx.serialization.KSerializer
 import top.e404.training.shared.*
@@ -129,6 +130,36 @@ fun doubleInput(text: String, name: String): Double = text.toDoubleOrNull() ?: t
 }
 @Composable private fun CachedExerciseImage(url: String, repository: TrainingRepository) {
     CachedExerciseMedia(url, false, repository)
+}
+@Composable
+internal fun ExerciseCardImage(exercise: Exercise, state: AppData, repository: TrainingRepository) {
+    val media = exercise.mediaIds.firstNotNullOfOrNull { id ->
+        state.record(Kind.media, id)?.value<Media>()
+    }
+    val image by produceState<java.io.File?>(null, exercise.id, media, repository) {
+        value = null
+        if (media != null) {
+            val local = runCatching { repository.ensureMedia(media); repository.mediaModel(media) as java.io.File }
+                .onFailure { if (it is CancellationException) throw it }
+                .getOrNull()
+            if (local != null) {
+                value = local
+                return@produceState
+            }
+        }
+        val selected = repository.selectedExerciseTeaching(exercise.id)
+        val url = selected?.let { repository.loadSmartWorkoutExerciseGuide(it.sourceId).guide?.imageUrl }
+            ?: repository.loadExerciseGuide(exercise.id).guide?.imageUrl
+        if (url != null) {
+            value = runCatching { repository.ensureExternalMedia(url, video = false) }
+                .onFailure { if (it is CancellationException) throw it }
+                .getOrNull()
+        }
+    }
+    image?.let {
+        AsyncImage(model = it, contentDescription = "${exercise.name}动作图",
+            modifier = Modifier.fillMaxWidth().height(132.dp))
+    }
 }
 
 @Composable private fun CachedExerciseMedia(url: String, video: Boolean, repository: TrainingRepository) {
@@ -352,10 +383,10 @@ private fun distinctGuideSteps(steps: List<String>, excluding: List<String> = em
 private fun guideStatusText(status: ExerciseGuideStatus?, cached: Boolean?, failure: String?, label: String): String =
     when (status) {
         ExerciseGuideStatus.unconfigured -> "尚未连接后端${if (cached == true) "；显示本地缓存教学" else ""}。"
-        ExerciseGuideStatus.notAssociated -> "后端未关联在线教学${if (cached == true) "；显示旧缓存" else ""}，可明确选择教学。"
+        ExerciseGuideStatus.notAssociated -> "未找到关联的教学资料${if (cached == true) "；显示旧缓存" else ""}，可明确选择教学。"
         ExerciseGuideStatus.requestFailed -> "教学请求失败${failure?.let { "：$it" } ?: ""}${if (cached == true) "；显示旧缓存" else ""}。"
-        ExerciseGuideStatus.available -> "在线教学已读取。"
-        null -> "正在读取${label}的在线教学…"
+        ExerciseGuideStatus.available -> "教学资料可用。"
+        null -> "正在读取${label}的教学资料…"
     }
 
 @Composable fun equipmentNames(): Map<String, String> {
@@ -384,10 +415,9 @@ internal fun equipmentRequirementText(equipmentTags: List<String>, names: Map<St
     var detail by remember { mutableStateOf<Exercise?>(null) }
     var sourceDetail by remember { mutableStateOf<SmartWorkoutExerciseSource?>(null) }
     var smartWorkoutSources by remember { mutableStateOf<List<SmartWorkoutExerciseSource>>(emptyList()) }
-    var smartWorkoutStatus by remember { mutableStateOf("正在读取网站动作目录…") }
+    var smartWorkoutStatus by remember { mutableStateOf("正在读取内置动作目录…") }
     var smartWorkoutError by remember { mutableStateOf<String?>(null) }
     var selectingSourceId by remember { mutableStateOf<String?>(null) }
-    var sourceReloadRequest by remember { mutableStateOf(0) }
     val scope = rememberCoroutineScope()
     val all = remember(state.documents[Kind.exercise]) { state.records(Kind.exercise).map { it.value<Exercise>() } }
     val equipment = remember(state.documents[Kind.equipment]) { state.records(Kind.equipment).map { it.value<Equipment>() } }
@@ -399,16 +429,14 @@ internal fun equipmentRequirementText(equipmentTags: List<String>, names: Map<St
     val sourceChoices = remember(smartWorkoutSources, query) {
         smartWorkoutSources.filter { it.name.contains(query, true) }
     }
-    LaunchedEffect(repository, sourceReloadRequest) {
+    LaunchedEffect(repository) {
         smartWorkoutStatus = try {
             smartWorkoutSources = repository.loadSmartWorkoutExercises()
-            "网站动作目录已载入 ${smartWorkoutSources.size} 个动作。"
+            "内置动作目录已载入 ${smartWorkoutSources.size} 个动作，可离线浏览。"
         } catch (error: kotlinx.coroutines.CancellationException) {
             throw error
         } catch (error: Exception) {
-            if (error.message?.contains("尚未连接后端，且没有已缓存的来源动作目录") == true)
-                "尚未连接后端，且没有已缓存的网站动作目录；本地动作仍可选择。"
-            else "网站动作目录暂不可用：${error.message ?: "未知错误"}；本地动作仍可选择。"
+            "内置动作目录暂不可用：${error.message ?: "未知错误"}"
         }
     }
     Dialog(onDismiss, properties = DialogProperties(usePlatformDefaultWidth = false)) {
@@ -427,7 +455,7 @@ internal fun equipmentRequirementText(equipmentTags: List<String>, names: Map<St
                 if (filterType == "stretch" && initialMuscles.isEmpty()) Text("没有已选力量动作作为匹配来源，可以手动筛选拉伸部位。", style = MaterialTheme.typography.bodySmall)
                 LazyColumn(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     if (choices.isNotEmpty()) item { Text("本地动作", style = MaterialTheme.typography.titleSmall) }
-                    if (choices.isEmpty()) item { EmptyMessage("当前条件没有匹配的本地动作；也可从网站动作目录中选择。") }
+                    if (choices.isEmpty()) item { EmptyMessage("当前条件没有匹配的本地动作；也可从内置 SmartWorkout 动作目录中选择。") }
                     items(choices, key = { "local-${it.id}" }) { exercise ->
                         Card(Modifier.fillMaxWidth()) {
                             Row(Modifier.padding(10.dp), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
@@ -444,8 +472,7 @@ internal fun equipmentRequirementText(equipmentTags: List<String>, names: Map<St
                     }
                     item {
                         Row(Modifier.fillMaxWidth(), verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
-                            Text("SmartWorkout 网站动作", style = MaterialTheme.typography.titleSmall, modifier = Modifier.weight(1f))
-                            TextButton(onClick = { sourceReloadRequest++ }) { Text("重新加载") }
+                            Text("SmartWorkout 内置动作", style = MaterialTheme.typography.titleSmall, modifier = Modifier.weight(1f))
                         }
                         Text(smartWorkoutStatus, style = MaterialTheme.typography.bodySmall)
                         Text("网站动作未按部位或健身房器械筛选。", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -482,7 +509,7 @@ internal fun equipmentRequirementText(equipmentTags: List<String>, names: Map<St
                             }
                         }
                     }
-                    if (sourceChoices.isEmpty() && smartWorkoutSources.isNotEmpty()) item { Text("网站动作目录中没有匹配名称的动作。", style = MaterialTheme.typography.bodySmall) }
+                    if (sourceChoices.isEmpty() && smartWorkoutSources.isNotEmpty()) item { Text("内置目录中没有匹配名称的动作。", style = MaterialTheme.typography.bodySmall) }
                 }
                 TextButton(onClick = onDismiss) { Text("返回") }
             }

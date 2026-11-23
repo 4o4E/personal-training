@@ -469,6 +469,7 @@ fun correctSessionExercise(session: Session, itemId: String, exercise: Exercise,
 }
 /** 只转移未完成目标；已完成动作及其结果留在原位置，开始时计划保持不变。 */
 fun replaceRemainingSessionExercise(session: Session, itemId: String, replacement: PlanItem, exercise: Exercise): Session {
+    require(itemId !in session.skippedItems) { "该动作的未完成目标已转移" }
     val itemIndex = session.items.indexOfFirst { it.id == itemId }
     require(itemIndex >= 0) { "训练动作不存在" }
     val original = session.items[itemIndex]
@@ -481,7 +482,7 @@ fun replaceRemainingSessionExercise(session: Session, itemId: String, replacemen
     val referencedBySource = session.sourceRecords.any { itemId in it.itemIds }
     if (originalResults.isEmpty() && !referencedBySource) items[itemIndex] = replacement
     else {
-        if (itemId !in skipped) skipped += itemId
+        skipped += itemId
         items.add(itemIndex + 1, replacement)
     }
     val exercises = if (session.exercises.any { it.id == exercise.id }) session.exercises else session.exercises + exercise
