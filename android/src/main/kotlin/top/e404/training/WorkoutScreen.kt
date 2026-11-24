@@ -45,23 +45,13 @@ import kotlinx.coroutines.delay
 import kotlinx.serialization.builtins.nullable
 import top.e404.training.shared.*
 
-internal fun workoutResultSummary(result: SetResult, compact: Boolean = false): String {
-    fun reading(load: Load?): String? = load?.let {
-        if (compact) return@let "${numericText(it.value)} ${it.unit}"
-        val modifier = when (it.meaning) {
-            "per_hand" -> " / 只"
-            "per_side" -> " / 侧"
-            else -> ""
-        }
-        "${numericText(it.value)} ${it.unit}$modifier${if (it.mode == "assistance") " 助力" else ""}"
+internal fun workoutResultSummary(result: SetResult): String {
+    fun reading(load: Load?): String? = load?.let { "${numericText(it.value)} ${it.unit}" }
+    if (result.segments.isNotEmpty()) {
+        return result.segments.joinToString("，") { listOfNotNull(reading(it.load), it.reps.toString()).joinToString(" × ") }
     }
-    val value = if (result.segments.isNotEmpty()) {
-        result.segments.joinToString("，") { listOfNotNull(reading(it.load), it.reps.toString()).joinToString(" × ") }
-    } else {
-        val reps = result.reps?.let { if (result.load == null) "$it 次" else it.toString() }
-        listOfNotNull(reading(result.load), reps, result.seconds?.let { "$it 秒" }).joinToString(" × ")
-    }
-    return if (compact || result.side == "both") value else "$value · ${sideText(result.side)}"
+    val reps = result.reps?.let { if (result.load == null) "$it 次" else it.toString() }
+    return listOfNotNull(reading(result.load), reps, result.seconds?.let { "$it 秒" }).joinToString(" × ")
 }
 
 @Composable
@@ -263,7 +253,7 @@ private fun willStartRestTimer(session: Session, itemId: String, setIndex: Int, 
                     Row(Modifier.fillMaxWidth().padding(start = 12.dp), verticalAlignment = Alignment.CenterVertically) {
                         if (!isCurrent) ExerciseCardImage(
                             exercise, state, viewModel.repository,
-                            Modifier.padding(end = 8.dp).size(56.dp), thumbnail = true
+                            Modifier.padding(top = 8.dp, end = 8.dp).size(56.dp)
                         )
                         Text(exercise.name, style = MaterialTheme.typography.titleMedium, modifier = Modifier.weight(1f))
                         if (isComplete) Icon(Icons.Default.Check, contentDescription = "动作已完成", tint = completeColor)
@@ -319,7 +309,7 @@ private fun willStartRestTimer(session: Session, itemId: String, setIndex: Int, 
                             }
                             if (showCompleted) results.sortedBy { it.setIndex }.forEach { result ->
                                 Row(verticalAlignment = Alignment.CenterVertically) {
-                                    Text(workoutResultSummary(result, compact = true), style = MaterialTheme.typography.bodyMedium, modifier = Modifier.weight(1f))
+                                    Text(workoutResultSummary(result), style = MaterialTheme.typography.bodyMedium, modifier = Modifier.weight(1f))
                                     IconButton(onClick = {
                                         actualDraft = null
                                         editingResult = item.id
@@ -338,7 +328,7 @@ private fun willStartRestTimer(session: Session, itemId: String, setIndex: Int, 
                                     session, item, nextIndex, item.sets[nextIndex], exercise, equipment, viewModel,
                                     choices, completed, targetCount,
                                     image = { modifier -> ExerciseCardImage(
-                                        exercise, state, viewModel.repository, modifier, preferMotion = true
+                                        exercise, state, viewModel.repository, modifier, animate = true
                                     ) },
                                     onExerciseTimer = { seconds ->
                                         runTimerAction(true) { viewModel.exerciseTimer(session.id, item.id, nextIndex, seconds) }

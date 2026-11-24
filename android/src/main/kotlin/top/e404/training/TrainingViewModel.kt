@@ -263,13 +263,6 @@ class TrainingViewModel(application: Application) : AndroidViewModel(application
             top.e404.training.shared.correctSessionExercise(session, itemId, exercise, equipmentId) to timer
         }
     }
-    fun correctCompletedExercise(sessionId: String, itemId: String, exercise: Exercise, equipmentId: String?) = action {
-        repository.updateCompletedExercise(sessionId, itemId, exercise, equipmentId)
-    }
-
-    fun updateCompletedItemNotes(sessionId: String, itemId: String, notes: String) = action {
-        repository.updateCompletedItemNotes(sessionId, itemId, notes)
-    }
     fun addSessionExercise(sessionId: String, item: PlanItem, exercise: Exercise, position: Int) = action {
         repository.updateSession(sessionId) { session, timer ->
             require(session.status == "active" || session.status == "completed") { "仅可在当天训练中添加动作" }

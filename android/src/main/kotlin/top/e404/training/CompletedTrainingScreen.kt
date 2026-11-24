@@ -9,6 +9,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.size
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Edit
@@ -47,14 +48,9 @@ fun CompletedTrainingScreen(session: Session, today: java.time.LocalDate, viewMo
     val state by viewModel.repository.data.collectAsStateWithLifecycle()
     val choices by preferences.data.collectAsStateWithLifecycle()
     var editingResult by rememberSaveable(stateSaver = jsonSaver(ResultTarget.serializer().nullable)) { mutableStateOf<ResultTarget?>(null) }
-    var editingItemNotes by rememberSaveable { mutableStateOf<String?>(null) }
-    var itemNotesDraft by rememberSaveable { mutableStateOf("") }
     var selectingType by rememberSaveable { mutableStateOf<String?>(null) }
     var pendingItem by rememberSaveable(stateSaver = jsonSaver(PlanItem.serializer().nullable)) { mutableStateOf<PlanItem?>(null) }
     var selectedExercise by rememberSaveable(stateSaver = jsonSaver(Exercise.serializer().nullable)) { mutableStateOf<Exercise?>(null) }
-    var correctingItemId by rememberSaveable { mutableStateOf<String?>(null) }
-    var correctingExercise by rememberSaveable(stateSaver = jsonSaver(Exercise.serializer().nullable)) { mutableStateOf<Exercise?>(null) }
-    var correctingEquipmentId by rememberSaveable { mutableStateOf<String?>(null) }
     LazyColumn(Modifier.fillMaxSize().padding(horizontal = 12.dp), verticalArrangement = Arrangement.spacedBy(10.dp), contentPadding = PaddingValues(bottom = 24.dp)) {
         item {
             Text("今日训练记录", style = MaterialTheme.typography.titleMedium)
@@ -66,18 +62,13 @@ fun CompletedTrainingScreen(session: Session, today: java.time.LocalDate, viewMo
                     Button(onClick = { selectingType = "strength" }) { Text("添加训练动作") }
                     OutlinedButton(onClick = { selectingType = "stretch" }) { Text("添加拉伸") }
                 }
-                Text("仅添加到当天训练，不会修改未来计划。", style = MaterialTheme.typography.bodySmall)
             }
         }
         items(session.items.filter { item -> item.id !in session.skippedItems || session.results.any { it.itemId == item.id } }, key = { it.id }) { item ->
             val exercise = session.exercises.singleOrNull { it.id == item.exerciseId } ?: return@items
             val results = session.results.filter { it.itemId == item.id }.sortedBy { it.setIndex }
-            val completedIndices = results.mapTo(hashSetOf()) { it.setIndex }
-            val skipped = item.id in session.skippedItems
-            val targetSetIndices = if (skipped) completedIndices.sorted() else item.sets.indices.toList()
-            val targetCount = targetSetIndices.size
-            val complete = !skipped && targetCount > 0 && targetSetIndices.all { it in completedIndices }
-            var showActual by rememberSaveable(session.id, item.id) { mutableStateOf(false) }
+            val complete = item.id !in session.skippedItems && item.sets.isNotEmpty() &&
+                item.sets.indices.all { index -> results.binarySearchBy(index) { it.setIndex } >= 0 }
             val dark = MaterialTheme.colorScheme.surface.luminance() < 0.5f
             val bg = if (complete) {
                 if (dark) Color(0xFF1B3A25) else Color(0xFFE8F5E9)
@@ -90,36 +81,21 @@ fun CompletedTrainingScreen(session: Session, today: java.time.LocalDate, viewMo
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Text(exercise.name, style = MaterialTheme.typography.titleMedium, modifier = Modifier.weight(1f))
                         if (complete) Icon(Icons.Default.Check, contentDescription = "动作已完成", tint = if (dark) Color(0xFF81C784) else Color(0xFF2E7D32))
-                        if (session.status == "completed" && item.notes.isNotBlank()) IconButton(onClick = {
-                            editingItemNotes = item.id; itemNotesDraft = item.notes
-                        }) { Icon(Icons.Default.Edit, contentDescription = "修改动作备注") }
                     }
-                    ExerciseCardImage(exercise, state, viewModel.repository)
-                    if (item.notes.isNotBlank()) Text(item.notes, style = MaterialTheme.typography.bodySmall)
-                    val completedCount = targetSetIndices.count { it in completedIndices }
-                    Text("$completedCount/$targetCount 组", style = MaterialTheme.typography.labelMedium)
-                    WorkoutSetProgress(completedCount, targetCount)
-                    if (results.isNotEmpty()) {
-                        TextButton(onClick = { showActual = !showActual }) {
-                            Text(if (showActual) "收起实际记录" else "查看实际记录 ${results.size} 组")
-                        }
-                        if (showActual) results.forEach { result ->
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                Text(workoutResultSummary(result), Modifier.weight(1f), style = MaterialTheme.typography.bodySmall)
-                                IconButton(onClick = { editingResult = ResultTarget(item.id, result.setIndex) }) {
-                                    Icon(Icons.Default.Edit, contentDescription = "修改实际结果")
+                    Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                        ExerciseCardImage(exercise, state, viewModel.repository, Modifier.size(96.dp))
+                        Column(Modifier.weight(1f)) {
+                            if (results.isEmpty()) Text("无实际记录", style = MaterialTheme.typography.bodySmall)
+                            results.forEach { result ->
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Text(workoutResultSummary(result), Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium)
+                                    IconButton(onClick = { editingResult = ResultTarget(item.id, result.setIndex) }) {
+                                        Icon(Icons.Default.Edit, contentDescription = "修改实际结果")
+                                    }
                                 }
                             }
                         }
                     }
-                    if (session.status == "completed" && item.notes.isBlank()) TextButton(onClick = {
-                        editingItemNotes = item.id
-                        itemNotesDraft = item.notes
-                    }) { Text("添加动作备注") }
-                    if (session.status == "completed") TextButton(onClick = {
-                        correctingItemId = item.id
-                        selectingType = exercise.type
-                    }) { Text("订正实际动作 / 器械") }
                 }
             }
         }
@@ -180,14 +156,6 @@ fun CompletedTrainingScreen(session: Session, today: java.time.LocalDate, viewMo
             }
         }
     }
-    editingItemNotes?.let { itemId ->
-        FormDialog("动作备注", { editingItemNotes = null }, {
-            viewModel.updateCompletedItemNotes(session.id, itemId, itemNotesDraft)
-            editingItemNotes = null
-        }) {
-            TextInput("仅属于本次训练此动作", itemNotesDraft, { itemNotesDraft = it }, singleLine = false)
-        }
-    }
     selectingType?.let { type ->
         val targets = session.items.flatMap { item ->
             session.exercises.singleOrNull { it.id == item.exerciseId }?.let {
@@ -195,40 +163,10 @@ fun CompletedTrainingScreen(session: Session, today: java.time.LocalDate, viewMo
             }.orEmpty()
         }.toSet()
         ExercisePicker(state, viewModel.repository, session.snapshot?.gymId, targets,
-            if (correctingItemId != null) null else type,
-            { selectingType = null; correctingItemId = null }) { exercise ->
+            type, { selectingType = null }) { exercise ->
             selectingType = null
-            val correctingId = correctingItemId
-            if (correctingId != null) {
-                val oldItem = session.items.single { it.id == correctingId }
-                val equipment = state.records(Kind.equipment).map { it.value<Equipment>() }
-                    .filter { it.gymId == session.snapshot?.gymId && exercise.equipmentTags.firstOrNull() in it.tags }
-                correctingExercise = exercise
-                correctingEquipmentId = oldItem.equipmentId.takeIf { id -> equipment.any { it.id == id } }
-            } else {
-                selectedExercise = exercise
-                pendingItem = newPlanItem(exercise, session.snapshot?.gymId, state)
-            }
-        }
-    }
-    correctingItemId?.let { itemId ->
-        val exercise = correctingExercise
-        if (exercise != null) {
-            val equipment = state.records(Kind.equipment).map { it.value<Equipment>() }
-                .filter { it.gymId == session.snapshot?.gymId && exercise.equipmentTags.firstOrNull() in it.tags }
-            val equipmentChoices = listOf(null to "不指定器械") + equipment.map { it.id to it.name }
-            val unknown = SOURCE_UNKNOWN_EQUIPMENT_TAG in exercise.equipmentTags
-            FormDialog("订正实际动作", {
-                correctingExercise = null; correctingItemId = null
-            }, {
-                viewModel.correctCompletedExercise(session.id, itemId, exercise, if (unknown) null else correctingEquipmentId)
-                correctingExercise = null; correctingItemId = null
-            }) {
-                Text("仅更正实际动作和器械身份；组数、实际读数、时间及开始时计划保持不变。", style = MaterialTheme.typography.bodySmall)
-                if (!unknown && exercise.equipmentTags.isNotEmpty())
-                    Choice("实际器械", correctingEquipmentId, equipmentChoices, { correctingEquipmentId = it })
-                if (unknown) Text("器械条件未知；不关联具体器械。", style = MaterialTheme.typography.bodySmall)
-            }
+            selectedExercise = exercise
+            pendingItem = newPlanItem(exercise, session.snapshot?.gymId, state)
         }
     }
     pendingItem?.let { item ->

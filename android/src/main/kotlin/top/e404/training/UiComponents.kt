@@ -140,9 +140,7 @@ fun doubleInput(text: String, name: String): Double = text.toDoubleOrNull() ?: t
 @Composable
 internal fun ExerciseCardImage(
     exercise: Exercise, state: AppData, repository: TrainingRepository,
-    modifier: Modifier = Modifier.fillMaxWidth().height(132.dp),
-    thumbnail: Boolean = false,
-    preferMotion: Boolean = false
+    modifier: Modifier, animate: Boolean = false
 ) {
     val media = exercise.mediaIds.firstNotNullOfOrNull { id ->
         state.record(Kind.media, id)?.value<Media>()
@@ -150,7 +148,7 @@ internal fun ExerciseCardImage(
     val cached = remember(media, repository) {
         media?.takeIf { repository.hasMedia(it.fileName) }?.let { repository.mediaModel(it) as File }
     }
-    val image by produceState(cached, exercise.id, media, repository, preferMotion) {
+    val image by produceState(cached, exercise.id, media, repository, animate) {
         value = cached
         suspend fun sourceImage(): File? {
             val url = repository.exerciseCardImageUrl(exercise.id) ?: return null
@@ -158,7 +156,7 @@ internal fun ExerciseCardImage(
                 .onFailure { if (it is CancellationException) throw it }
                 .getOrNull()
         }
-        if (preferMotion) {
+        if (animate) {
             sourceImage()?.let { value = it; return@produceState }
         }
         if (cached != null) return@produceState
@@ -171,21 +169,20 @@ internal fun ExerciseCardImage(
                 return@produceState
             }
         }
-        if (!preferMotion) value = sourceImage()
+        if (!animate) value = sourceImage()
     }
     image?.let {
         val context = LocalContext.current
-        val model = remember(context, it, thumbnail) {
-            if (thumbnail && !it.extension.equals("svg", ignoreCase = true)) {
+        val model = remember(context, it, animate) {
+            if (!animate && !it.extension.equals("svg", ignoreCase = true)) {
                 ImageRequest.Builder(context).data(it).decoderFactory(BitmapFactoryDecoder.Factory()).build()
             }
             else it
         }
-        val compact = thumbnail || preferMotion
         AsyncImage(
             model = model, contentDescription = "${exercise.name}动作图",
-            modifier = if (compact) modifier.clip(RoundedCornerShape(12.dp)) else modifier,
-            contentScale = if (compact) ContentScale.Crop else ContentScale.Fit
+            modifier = modifier.clip(RoundedCornerShape(12.dp)),
+            contentScale = ContentScale.Crop
         )
     }
 }

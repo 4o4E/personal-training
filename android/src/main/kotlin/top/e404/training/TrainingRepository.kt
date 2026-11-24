@@ -1012,35 +1012,6 @@ class TrainingRepository(
         database.withTransaction { dao.put(entry.row()) }
         install(listOf(entry))
     }
-    suspend fun updateCompletedItemNotes(sessionId: String, itemId: String, notes: String) = withContext(Dispatchers.IO) {
-        initialize()
-        gate.withLock {
-            val original = requireNotNull(lookup(Kind.session, sessionId)) { "训练不存在" }
-            require(!original.deleted) { "训练记录不存在" }
-            val current = original.value<Session>()
-            require(current.status == "completed") { "仅可修改已完成的训练" }
-            require(current.localDate == java.time.LocalDate.now(java.time.ZoneId.of("Asia/Shanghai")).toString()) { "仅可修改当天训练" }
-            val revisedItems = current.items.map { item ->
-                if (item.id == itemId) item.copy(notes = notes) else item
-            }
-            require(revisedItems.any { it.id == itemId }) { "训练动作不存在" }
-            saveCompletedSession(original, current.copy(items = revisedItems))
-        }
-        enqueueSync()
-    }
-    suspend fun updateCompletedExercise(
-        sessionId: String, itemId: String, exercise: Exercise, equipmentId: String?
-    ) = withContext(Dispatchers.IO) {
-        initialize()
-        gate.withLock {
-            val original = requireNotNull(lookup(Kind.session, sessionId)) { "训练不存在" }
-            require(!original.deleted) { "训练记录不存在" }
-            val current = original.value<Session>()
-            require(current.status == "completed") { "仅可修改已完成的训练" }
-            saveCompletedSession(original, correctSessionExercise(current, itemId, exercise, equipmentId))
-        }
-        enqueueSync()
-    }
     suspend fun appendSessionSet(sessionId: String, itemId: String) = withContext(Dispatchers.IO) {
         updateSession(sessionId) { session, timer ->
             require(session.status == "active") { "只有进行中的训练可以追加目标组" }
