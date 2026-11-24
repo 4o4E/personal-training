@@ -24,7 +24,6 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.luminance
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.runtime.getValue
@@ -53,14 +52,18 @@ fun CompletedTrainingScreen(session: Session, today: java.time.LocalDate, viewMo
     var selectedExercise by rememberSaveable(stateSaver = jsonSaver(Exercise.serializer().nullable)) { mutableStateOf<Exercise?>(null) }
     LazyColumn(Modifier.fillMaxSize().padding(horizontal = 12.dp), verticalArrangement = Arrangement.spacedBy(10.dp), contentPadding = PaddingValues(bottom = 24.dp)) {
         item {
-            Text("今日训练记录", style = MaterialTheme.typography.titleMedium)
-            Text(session.name, style = MaterialTheme.typography.headlineSmall)
-            Text("${if (session.status == "cancelled") "已取消" else "已完成"} · ${session.startedAt?.let(::localDateTime) ?: session.localDate}")
-            TextButton(onClick = { viewModel.resumeToday(today) }) { Text("继续当天训练") }
-            if (session.status == "completed") {
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Button(onClick = { selectingType = "strength" }) { Text("添加训练动作") }
-                    OutlinedButton(onClick = { selectingType = "stretch" }) { Text("添加拉伸") }
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                val padding = PaddingValues(horizontal = 8.dp)
+                Button(onClick = { viewModel.resumeToday(today) }, modifier = Modifier.weight(1f), contentPadding = padding) {
+                    Text("继续训练")
+                }
+                if (session.status == "completed") {
+                    OutlinedButton(onClick = { selectingType = "strength" }, modifier = Modifier.weight(1f), contentPadding = padding) {
+                        Text("添加动作")
+                    }
+                    OutlinedButton(onClick = { selectingType = "stretch" }, modifier = Modifier.weight(1f), contentPadding = padding) {
+                        Text("添加拉伸")
+                    }
                 }
             }
         }
