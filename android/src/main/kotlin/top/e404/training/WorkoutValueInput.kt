@@ -5,6 +5,9 @@ import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.gestures.awaitLongPressOrCancellation
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.waitForUpOrCancellation
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.gestures.verticalDrag
 import androidx.compose.foundation.layout.Arrangement
@@ -12,6 +15,7 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -41,15 +45,21 @@ import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.input.pointer.positionChange
 import androidx.compose.ui.platform.LocalHapticFeedback
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.onClick
+import androidx.compose.ui.semantics.role
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
@@ -57,6 +67,7 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Popup
 import androidx.compose.ui.window.PopupProperties
 import java.math.BigDecimal
+import java.util.Locale
 import kotlin.math.abs
 
 private val weightSteps = listOf(0.5, 1.0, 2.5, 5.0, 10.0)
@@ -72,9 +83,130 @@ internal fun adjustedValue(value: String, step: Double, direction: Int, minimum:
     return next.takeIf { it >= minimum }?.stripTrailingZeros()?.toPlainString()
 }
 
+internal fun poundsAsKilograms(value: String): String? =
+    value.toDoubleOrNull()?.takeIf { it.isFinite() }?.let { String.format(Locale.ROOT, "%.1f kg", it * 0.45359237) }
+
+@Composable
+internal fun WorkoutWeightRocker(
+    value: String, onValueChange: (String) -> Unit, unit: String, step: Double, onUnitClick: () -> Unit
+) {
+    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        WorkoutRockerInput(value, onValueChange, unit, Modifier.width(128.dp), step, onUnitClick)
+        if (unit == "lb") poundsAsKilograms(value)?.let {
+            Text(it, style = MaterialTheme.typography.labelLarge, maxLines = 1, softWrap = false)
+        }
+    }
+}
+
+@Composable
+internal fun WorkoutRockerInput(
+    value: String, onValueChange: (String) -> Unit, unit: String, modifier: Modifier = Modifier,
+    step: Double = 1.0, onUnitClick: (() -> Unit)? = null
+) {
+    val weight = onUnitClick != null
+    val minimum = if (weight) BigDecimal.ZERO else BigDecimal.ONE
+    val current by rememberUpdatedState(value)
+    val update by rememberUpdatedState(onValueChange)
+    val currentStep by rememberUpdatedState(step)
+    val focus = LocalFocusManager.current
+    val haptic = LocalHapticFeedback.current
+    val colors = MaterialTheme.colorScheme
+    val dark = colors.surface.luminance() < 0.5f
+    val fieldColor = if (dark) Color(0xFF10263B) else Color(0xFFF0F7FE)
+    val rockerColor = if (dark) Color(0xFF23445F) else Color(0xFFD3E8FB)
+    val outline = if (dark) Color(0xFF456581) else Color(0xFFA3BED3)
+    val style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.SemiBold)
+
+    fun tap(direction: Int) {
+        focus.clearFocus()
+        adjustedValue(current, currentStep, direction, minimum)?.let {
+            update(it)
+            haptic.performHapticFeedback(HapticFeedbackType.SegmentTick)
+        }
+    }
+
+    Surface(
+        modifier.height(48.dp), shape = RoundedCornerShape(10.dp),
+        color = fieldColor, contentColor = colors.onSurface,
+        border = BorderStroke(1.dp, outline)
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            BasicTextField(
+                value, { if (validWorkoutNumber(it, weight)) onValueChange(it) },
+                Modifier.weight(1f).padding(start = 10.dp).semantics { contentDescription = "输入$unit" },
+                textStyle = style.copy(color = colors.onSurface), singleLine = true, cursorBrush = SolidColor(colors.primary),
+                keyboardOptions = KeyboardOptions(keyboardType = if (weight) KeyboardType.Decimal else KeyboardType.Number)
+            )
+            Box(
+                Modifier.fillMaxHeight().then(if (onUnitClick != null) Modifier.clickable(
+                    role = Role.Button, onClickLabel = "切换重量单位", onClick = onUnitClick
+                ) else Modifier).padding(start = 4.dp, end = 12.dp),
+                contentAlignment = Alignment.Center
+            ) {
+                Text(unit, color = if (weight) colors.primary else colors.onSurface, style = style, maxLines = 1)
+            }
+            Column(Modifier.width(34.dp).fillMaxHeight().background(rockerColor).pointerInput(unit, minimum) {
+                val threshold = 14.dp.toPx()
+                awaitEachGesture {
+                    val down = awaitFirstDown().also { it.consume() }
+                    val shortPress = withTimeoutOrNull(viewConfiguration.longPressTimeoutMillis) {
+                        waitForUpOrCancellation()?.let {
+                            it.consume()
+                            tap(if (down.position.y < size.height / 2f) 1 else -1)
+                        }
+                        true
+                    }
+                    if (shortPress == null) {
+                        focus.clearFocus()
+                        haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                        var remainder = 0f
+                        var dragValue = current
+                        verticalDrag(down.id) { change ->
+                            remainder -= change.positionChange().y
+                            val previous = dragValue
+                            while (abs(remainder) >= threshold) {
+                                val direction = if (remainder > 0f) 1 else -1
+                                val next = adjustedValue(dragValue, currentStep, direction, minimum)
+                                if (next == null) {
+                                    remainder = 0f
+                                    break
+                                }
+                                dragValue = next
+                                remainder -= direction * threshold
+                            }
+                            if (dragValue != previous) {
+                                update(dragValue)
+                                haptic.performHapticFeedback(HapticFeedbackType.SegmentFrequentTick)
+                            }
+                            change.consume()
+                        }
+                    }
+                }
+            }) {
+                repeat(2) { index ->
+                    val up = index == 0
+                    Box(Modifier.weight(1f).fillMaxWidth().semantics {
+                        role = Role.Button
+                        contentDescription = if (up) "增加$unit" else "减少$unit"
+                        onClick { tap(if (up) 1 else -1); true }
+                    }, contentAlignment = Alignment.Center) {
+                        Icon(
+                            if (up) Icons.Default.KeyboardArrowUp else Icons.Default.KeyboardArrowDown,
+                            null, Modifier.size(20.dp), tint = colors.primary
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+private fun validWorkoutNumber(text: String, weight: Boolean): Boolean =
+    text.isEmpty() || if (weight) weightInputPattern.matches(text) else (text.toIntOrNull() ?: 0) >= 1
+
 @Composable
 internal fun WorkoutCountInput(value: String, onValueChange: (String) -> Unit, modifier: Modifier = Modifier) =
-    WorkoutNumberInput(value, onValueChange, 1.0, "次", true, modifier, null, emptyList())
+    WorkoutNumberInput(value, onValueChange, 1.0, "次", true, modifier, null)
 
 @Composable
 internal fun WorkoutWeightInput(
@@ -83,12 +215,11 @@ internal fun WorkoutWeightInput(
     unit: String,
     step: Double,
     onStepChange: (Double) -> Unit,
-    modifier: Modifier = Modifier,
-    commonWeights: List<Double> = emptyList()
-) = WorkoutNumberInput(value, onValueChange, step, unit, false, modifier, onStepChange, commonWeights)
+    modifier: Modifier = Modifier
+) = WorkoutNumberInput(value, onValueChange, step, unit, false, modifier, onStepChange)
 
 @Composable
-private fun WorkoutNumberInput(value: String, onValueChange: (String) -> Unit, step: Double, unit: String, count: Boolean, modifier: Modifier, onStepChange: ((Double) -> Unit)?, commonWeights: List<Double>) {
+private fun WorkoutNumberInput(value: String, onValueChange: (String) -> Unit, step: Double, unit: String, count: Boolean, modifier: Modifier, onStepChange: ((Double) -> Unit)?) {
     val minimum = if (count) BigDecimal.ONE else BigDecimal.ZERO
     val currentValue by rememberUpdatedState(value)
     val onValueChangeState by rememberUpdatedState(onValueChange)
@@ -130,11 +261,7 @@ private fun WorkoutNumberInput(value: String, onValueChange: (String) -> Unit, s
                 ) {
                     BasicTextField(
                         value = value,
-                        onValueChange = { text ->
-                            val valid = if (count) text.isEmpty() || text.toIntOrNull()?.let { it >= 1 } == true
-                            else text.isEmpty() || weightInputPattern.matches(text)
-                            if (valid) onValueChange(text)
-                        },
+                        onValueChange = { if (validWorkoutNumber(it, !count)) onValueChange(it) },
                         singleLine = true,
                         textStyle = MaterialTheme.typography.bodyMedium.copy(color = MaterialTheme.colorScheme.onSurface),
                         cursorBrush = SolidColor(MaterialTheme.colorScheme.primary),
@@ -216,22 +343,13 @@ private fun WorkoutNumberInput(value: String, onValueChange: (String) -> Unit, s
             }
             if (onStepChange != null) {
                 Box {
-                    IconButton(onClick = { focusManager.clearFocus(); menuOpen = true }, modifier = Modifier.size(48.dp).semantics { contentDescription = "重量步长与常用重量" }) {
-                        Icon(Icons.Default.MoreVert, contentDescription = "重量步长与常用重量", modifier = Modifier.size(24.dp))
+                    IconButton(onClick = { focusManager.clearFocus(); menuOpen = true }, modifier = Modifier.size(48.dp)) {
+                        Icon(Icons.Default.MoreVert, contentDescription = "重量步长", modifier = Modifier.size(24.dp))
                     }
                     DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
                         Text("调整步长", modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp), style = MaterialTheme.typography.labelMedium)
                         weightSteps.forEach { amount ->
                             DropdownMenuItem(text = { Text(amount.toString()) }, onClick = { onStepChange(amount); menuOpen = false })
-                        }
-                        if (commonWeights.isNotEmpty()) {
-                            Text("常用重量", modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp), style = MaterialTheme.typography.labelMedium)
-                            commonWeights.forEach { commonWeight ->
-                                DropdownMenuItem(text = { Text("$commonWeight $unit") }, onClick = {
-                                    onValueChange(commonWeight.toString())
-                                    menuOpen = false
-                                })
-                            }
                         }
                     }
                 }

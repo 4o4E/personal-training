@@ -4,6 +4,7 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
@@ -22,7 +23,9 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
@@ -30,6 +33,9 @@ import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import coil.compose.AsyncImage
 import coil.compose.SubcomposeAsyncImage
+import coil.decode.BitmapFactoryDecoder
+import coil.request.ImageRequest
+import java.io.File
 import kotlinx.serialization.KSerializer
 import top.e404.training.shared.*
 
@@ -132,14 +138,32 @@ fun doubleInput(text: String, name: String): Double = text.toDoubleOrNull() ?: t
     CachedExerciseMedia(url, false, repository)
 }
 @Composable
-internal fun ExerciseCardImage(exercise: Exercise, state: AppData, repository: TrainingRepository) {
+internal fun ExerciseCardImage(
+    exercise: Exercise, state: AppData, repository: TrainingRepository,
+    modifier: Modifier = Modifier.fillMaxWidth().height(132.dp),
+    thumbnail: Boolean = false,
+    preferMotion: Boolean = false
+) {
     val media = exercise.mediaIds.firstNotNullOfOrNull { id ->
         state.record(Kind.media, id)?.value<Media>()
     }
-    val image by produceState<java.io.File?>(null, exercise.id, media, repository) {
-        value = null
+    val cached = remember(media, repository) {
+        media?.takeIf { repository.hasMedia(it.fileName) }?.let { repository.mediaModel(it) as File }
+    }
+    val image by produceState(cached, exercise.id, media, repository, preferMotion) {
+        value = cached
+        suspend fun sourceImage(): File? {
+            val url = repository.exerciseCardImageUrl(exercise.id) ?: return null
+            return runCatching { repository.ensureExternalMedia(url, video = false) }
+                .onFailure { if (it is CancellationException) throw it }
+                .getOrNull()
+        }
+        if (preferMotion) {
+            sourceImage()?.let { value = it; return@produceState }
+        }
+        if (cached != null) return@produceState
         if (media != null) {
-            val local = runCatching { repository.ensureMedia(media); repository.mediaModel(media) as java.io.File }
+            val local = runCatching { repository.ensureMedia(media); repository.mediaModel(media) as File }
                 .onFailure { if (it is CancellationException) throw it }
                 .getOrNull()
             if (local != null) {
@@ -147,18 +171,22 @@ internal fun ExerciseCardImage(exercise: Exercise, state: AppData, repository: T
                 return@produceState
             }
         }
-        val selected = repository.selectedExerciseTeaching(exercise.id)
-        val url = selected?.let { repository.loadSmartWorkoutExerciseGuide(it.sourceId).guide?.imageUrl }
-            ?: repository.loadExerciseGuide(exercise.id).guide?.imageUrl
-        if (url != null) {
-            value = runCatching { repository.ensureExternalMedia(url, video = false) }
-                .onFailure { if (it is CancellationException) throw it }
-                .getOrNull()
-        }
+        if (!preferMotion) value = sourceImage()
     }
     image?.let {
-        AsyncImage(model = it, contentDescription = "${exercise.name}动作图",
-            modifier = Modifier.fillMaxWidth().height(132.dp))
+        val context = LocalContext.current
+        val model = remember(context, it, thumbnail) {
+            if (thumbnail && !it.extension.equals("svg", ignoreCase = true)) {
+                ImageRequest.Builder(context).data(it).decoderFactory(BitmapFactoryDecoder.Factory()).build()
+            }
+            else it
+        }
+        val compact = thumbnail || preferMotion
+        AsyncImage(
+            model = model, contentDescription = "${exercise.name}动作图",
+            modifier = if (compact) modifier.clip(RoundedCornerShape(12.dp)) else modifier,
+            contentScale = if (compact) ContentScale.Crop else ContentScale.Fit
+        )
     }
 }
 

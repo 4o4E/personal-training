@@ -1517,6 +1517,13 @@ class TrainingRepository(
             ?: ExerciseGuideResult(null, ExerciseGuideStatus.notAssociated)
     }
 
+    internal suspend fun exerciseCardImageUrl(exerciseId: String): String? = withContext(Dispatchers.IO) {
+        val selected = selectedExerciseTeaching(exerciseId)
+        selected?.let { smartWorkoutCatalog.guide(it.sourceId)?.imageUrl }
+            ?: smartWorkoutCatalog.guideForExercise(exerciseId)?.imageUrl
+            ?: dao.value("exercise-guide/$exerciseId")?.let { wireJson.decodeFromString<ExerciseGuide>(it).imageUrl }
+    }
+
     private fun SmartWorkoutGuide.localResult() = ExerciseGuideResult(
         ExerciseGuide(sourceUrl, imageUrl, videoUrl, description, tips, mistakes, instructions),
         ExerciseGuideStatus.available

@@ -92,7 +92,7 @@ import top.e404.training.shared.*
     var seconds by rememberSaveable { mutableStateOf(original.seconds?.toString() ?: "") }
     var rest by rememberSaveable { mutableStateOf(original.restSeconds.toString()) }
     var hasLoad by rememberSaveable { mutableStateOf(original.load != null) }
-    var weight by rememberSaveable { mutableStateOf(original.load?.let { numericText(it.value) } ?: "") }
+    var weight by rememberSaveable { mutableStateOf(original.load?.let { numericText(it.value) } ?: if (actual) "0" else "") }
     var unit by rememberSaveable { mutableStateOf(original.load?.unit ?: equipment?.unit ?: "kg") }
     var meaning by rememberSaveable { mutableStateOf(original.load?.meaning ?: equipment?.meaning ?: "total") }
     val mode = original.load?.mode ?: "external"
@@ -104,11 +104,14 @@ import top.e404.training.shared.*
     val choices by preferences.data.collectAsStateWithLifecycle()
     FormDialog(if (actual) "实际完成情况" else "计划组要求", onDismiss, {
         viewModel.action {
+            val weightValue = if (actual || hasLoad) doubleInput(weight, "重量") else null
+            val load = weightValue?.takeIf { !actual || original.load != null || it != 0.0 }
+                ?.let { Load(it, unit, meaning, mode) }
             val target = SetTarget(
                 reps = if (measurement == "reps") intInput(reps, "次数") else null,
                 repsMax = if (!actual && maximum.isNotBlank() && measurement == "reps") intInput(maximum, "次数上限") else null,
                 seconds = if (measurement == "seconds") intInput(seconds, "时长") else null,
-                load = if (hasLoad) Load(doubleInput(weight, "重量"), unit, meaning, mode) else null,
+                load = load,
                 side = side, restSeconds = intInput(rest, "休息秒数")
             )
             checkTarget(target); onSave(target, applyAll)
@@ -116,22 +119,29 @@ import top.e404.training.shared.*
     }, confirmLabel = if (actual) "完成并记录" else "保存") {
         if (actual) Text("新组确认后保存实际结果并按该组休息时长计时；修改已完成组不会重启计时。", style = MaterialTheme.typography.bodySmall)
         Text(exercise.name, style = MaterialTheme.typography.titleMedium)
-        if (measurement == "reps") {
-            if (actual) WorkoutCountInput(reps, { reps = it })
-            else TextInput("目标次数或范围下限", reps, { reps = it }, numeric = true)
-            if (!actual) TextInput("次数范围上限（可不填写）", maximum, { maximum = it }, numeric = true)
-        } else TextInput(if (actual) "实际时长（秒）" else "目标时长（秒）", seconds, { seconds = it }, numeric = true)
-        Choice("左右侧", side, listOf("both" to "双侧 / 不分侧", "left" to "左侧", "right" to "右侧"), { side = it })
-        Row { Checkbox(hasLoad, { hasLoad = it }); Text("填写实际重量读数", Modifier.padding(top = 12.dp)) }
-        if (hasLoad) {
-            if (actual) {
-                val key = weightStepKey(exercise.id, equipment?.id, unit)
-                WorkoutWeightInput(weight, { weight = it }, unit, choices.weightSteps[key] ?: 1.0,
-                    { value -> preferences.weightStep(key, value) })
-            } else TextInput("器械原始重量", weight, { weight = it }, numeric = true)
-            Choice("原始单位", unit, listOf("kg" to "公斤 kg", "lb" to "磅 lb"), { unit = it })
-            Choice("重量含义", meaning, listOf("total" to "总重量", "per_hand" to "单只重量", "per_side" to "单侧配重"), { meaning = it })
-        } else Text(if (exercise.bodyweight) "自重练习，不填写外部读数。" else "未填写重量不会被记录为零重量。", style = MaterialTheme.typography.bodySmall)
+        if (actual) {
+            val timed = measurement == "seconds"
+            val key = weightStepKey(exercise.id, equipment?.id, unit)
+            WorkoutWeightRocker(weight, { weight = it }, unit, choices.weightSteps[key] ?: 1.0) {
+                unit = if (unit == "kg") "lb" else "kg"
+            }
+            WorkoutRockerInput(
+                if (timed) seconds else reps, { if (timed) seconds = it else reps = it },
+                if (timed) "秒" else "次", Modifier.width(128.dp)
+            )
+        } else {
+            if (measurement == "reps") {
+                TextInput("目标次数或范围下限", reps, { reps = it }, numeric = true)
+                TextInput("次数范围上限（可不填写）", maximum, { maximum = it }, numeric = true)
+            } else TextInput("目标时长（秒）", seconds, { seconds = it }, numeric = true)
+            Choice("左右侧", side, listOf("both" to "双侧 / 不分侧", "left" to "左侧", "right" to "右侧"), { side = it })
+            Row { Checkbox(hasLoad, { hasLoad = it }); Text("填写实际重量读数", Modifier.padding(top = 12.dp)) }
+            if (hasLoad) {
+                TextInput("器械原始重量", weight, { weight = it }, numeric = true)
+                Choice("原始单位", unit, listOf("kg" to "公斤 kg", "lb" to "磅 lb"), { unit = it })
+                Choice("重量含义", meaning, listOf("total" to "总重量", "per_hand" to "单只重量", "per_side" to "单侧配重"), { meaning = it })
+            } else Text(if (exercise.bodyweight) "自重练习，不填写外部读数。" else "未填写重量不会被记录为零重量。", style = MaterialTheme.typography.bodySmall)
+        }
         TextInput("该组之后休息（秒，零表示不自动计时）", rest, { rest = it }, numeric = true)
         if (!actual) Row { Checkbox(applyAll, { applyAll = it }); Text("应用到该动作所有组", Modifier.padding(top = 12.dp)) }
     }

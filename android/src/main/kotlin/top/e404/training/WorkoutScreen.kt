@@ -23,6 +23,9 @@ import androidx.compose.ui.Alignment
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Edit
+import androidx.compose.material.icons.filled.KeyboardArrowDown
+import androidx.compose.material.icons.filled.KeyboardArrowUp
+import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.foundation.Canvas
 import androidx.compose.ui.geometry.Offset
@@ -42,8 +45,9 @@ import kotlinx.coroutines.delay
 import kotlinx.serialization.builtins.nullable
 import top.e404.training.shared.*
 
-internal fun workoutResultSummary(result: SetResult): String {
+internal fun workoutResultSummary(result: SetResult, compact: Boolean = false): String {
     fun reading(load: Load?): String? = load?.let {
+        if (compact) return@let "${numericText(it.value)} ${it.unit}"
         val modifier = when (it.meaning) {
             "per_hand" -> " / 只"
             "per_side" -> " / 侧"
@@ -57,7 +61,7 @@ internal fun workoutResultSummary(result: SetResult): String {
         val reps = result.reps?.let { if (result.load == null) "$it 次" else it.toString() }
         listOfNotNull(reading(result.load), reps, result.seconds?.let { "$it 秒" }).joinToString(" × ")
     }
-    return if (result.side == "both") value else "$value · ${sideText(result.side)}"
+    return if (compact || result.side == "both") value else "$value · ${sideText(result.side)}"
 }
 
 @Composable
@@ -221,33 +225,9 @@ private fun willStartRestTimer(session: Session, itemId: String, setIndex: Int, 
     LaunchedEffect(session.id, currentItemId) {
         if (selectedItemId != currentItemId) selectedItemId = currentItemId
     }
-    val done = itemProgress.sumOf { progress -> progress.targetSetIndices.count { it in progress.completedSetIndices } }
-    val total = itemProgress.sumOf { it.targetSetIndices.size }
-    val historicalLoads = remember(state.documents.getValue(Kind.session), session.id) {
-        buildMap<Pair<String, String?>, MutableSet<Load>> {
-            state.documents.getValue(Kind.session).values
-                .filterNot { it.deleted || it.id == session.id }
-                .forEach { document ->
-                    val historical = document.value<Session>()
-                    historical.items.forEach { historicalItem ->
-                        val historicalExercise = historical.exercises.singleOrNull { it.id == historicalItem.exerciseId }
-                        if (historicalExercise != null) {
-                            val loads = historical.results.filter { it.itemId == historicalItem.id }
-                                .flatMap { result -> result.segments.mapNotNull { it.load } + listOfNotNull(result.load) }
-                            val key = historicalExercise.id to historicalItem.equipmentId
-                            getOrPut(key) { linkedSetOf() }.addAll(loads)
-                        }
-                    }
-                }
-        }.mapValues { it.value.toList() }
-    }
     Column(Modifier.fillMaxSize().padding(horizontal = 12.dp)) {
         RestTimerCard(viewModel)
         LazyColumn(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(10.dp), contentPadding = PaddingValues(bottom = 24.dp)) {
-            item {
-                Text(session.name, style = MaterialTheme.typography.headlineSmall)
-                Text("已完成 $done / $total 组 · ${session.startedAt?.let(::localDateTime) ?: session.localDate}")
-            }
             items(session.items.filter { it.id !in session.skippedItems || resultsByItem[it.id].orEmpty().isNotEmpty() }, key = { it.id }) { item ->
                 val exercise = session.exercises.single { it.id == item.exerciseId }
                 val results = resultsByItem[item.id].orEmpty()
@@ -257,14 +237,9 @@ private fun willStartRestTimer(session: Session, itemId: String, setIndex: Int, 
                 val skipped = progress.skipped
                 val targetCount = progress.targetSetIndices.size
                 val nextIndex = nextWorkoutTargetIndex(progress)
-                val previousResult = results.filter { it.setIndex < (nextIndex ?: 0) }.maxByOrNull { it.setIndex }
-                val inputWeightUnit = previousResult?.segments?.lastOrNull()?.load?.unit
-                    ?: previousResult?.load?.unit
-                    ?: nextIndex?.let { item.sets.getOrNull(it)?.load?.unit } ?: ""
                 val isCurrent = item.id == currentItemId
                 val isComplete = !skipped && targetCount > 0 && nextIndex == null
                 val darkTheme = MaterialTheme.colorScheme.surface.luminance() < 0.5f
-                val currentColor = if (darkTheme) Color(0xFF90CAF9) else Color(0xFF1565C0)
                 val completeColor = if (darkTheme) Color(0xFF81C784) else Color(0xFF2E7D32)
                 val cardColor = when {
                     isCurrent -> if (darkTheme) Color(0xFF17324D) else Color(0xFFE3F2FD)
@@ -276,84 +251,115 @@ private fun willStartRestTimer(session: Session, itemId: String, setIndex: Int, 
                     isComplete -> if (darkTheme) Color(0xFFD9F2DC) else Color(0xFF1B5E20)
                     else -> MaterialTheme.colorScheme.onSurfaceVariant
                 }
-                Card(Modifier.fillMaxWidth().clickable(enabled = nextIndex != null) { selectedItemId = item.id },
-                    colors = CardDefaults.cardColors(containerColor = cardColor, contentColor = contentColor)) {
-                    Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
+                var showItemActions by remember(session.id, item.id) { mutableStateOf(false) }
+                var showCompleted by rememberSaveable(session.id, item.id) { mutableStateOf(false) }
+                val editNotes = { editingItemNotes = item.id; itemNotesDraft = item.notes }
+                Card(
+                    Modifier.fillMaxWidth().then(
+                        if (nextIndex != null && !isCurrent) Modifier.clickable { selectedItemId = item.id } else Modifier
+                    ),
+                    colors = CardDefaults.cardColors(containerColor = cardColor, contentColor = contentColor)
+                ) {
+                    Row(Modifier.fillMaxWidth().padding(start = 12.dp), verticalAlignment = Alignment.CenterVertically) {
+                        if (!isCurrent) ExerciseCardImage(
+                            exercise, state, viewModel.repository,
+                            Modifier.padding(end = 8.dp).size(56.dp), thumbnail = true
+                        )
                         Text(exercise.name, style = MaterialTheme.typography.titleMedium, modifier = Modifier.weight(1f))
-                        if (isCurrent) Text("当前动作", style = MaterialTheme.typography.labelMedium, color = currentColor)
                         if (isComplete) Icon(Icons.Default.Check, contentDescription = "动作已完成", tint = completeColor)
-                        if (item.notes.isNotBlank()) IconButton(onClick = { editingItemNotes = item.id; itemNotesDraft = item.notes }) {
+                        if (item.notes.isNotBlank()) IconButton(onClick = editNotes) {
                             Icon(Icons.Default.Edit, contentDescription = "修改动作备注")
                         }
                         IconButton(onClick = { detail = exercise }) {
                             Icon(Icons.Default.Info, contentDescription = "查看${exercise.name}教学")
                         }
                     }
-                    ExerciseCardImage(exercise, state, viewModel.repository)
-                    if (item.notes.isNotBlank()) Text(item.notes, style = MaterialTheme.typography.bodySmall)
-                    Text("$completed/$targetCount 组", style = MaterialTheme.typography.labelMedium)
-                    WorkoutSetProgress(completed, targetCount)
-                    var showItemActions by rememberSaveable(session.id, item.id) { mutableStateOf(false) }
-                    Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                        if (nextIndex != null) TextButton(onClick = {
-                            replacingItemId = item.id
-                            selectingType = exercise.type
-                        }) { Text("更换动作") }
-                        TextButton(onClick = { showItemActions = !showItemActions }) { Text(if (showItemActions) "收起动作操作" else "更多动作操作") }
-                    }
-                    if (showItemActions) {
-                        TextButton(onClick = { correctingItemId = item.id; selectingType = exercise.type }) { Text("订正实际动作 / 器械") }
-                        if (item.notes.isBlank()) TextButton(onClick = { editingItemNotes = item.id; itemNotesDraft = "" }) { Text("添加动作备注") }
-                    }
-                    if (nextIndex != null && !isCurrent) TextButton(onClick = { selectedItemId = item.id }) { Text("切换到此动作") }
-                    if (completed > 0) {
-                        var showCompleted by rememberSaveable(session.id, item.id) { mutableStateOf(false) }
-                        TextButton(onClick = { showCompleted = !showCompleted }) {
-                            Text(if (showCompleted) "收起已完成 $completed 组" else "查看已完成 $completed 组")
-                        }
-                        if (showCompleted) results.sortedBy { it.setIndex }.forEach { result ->
-                            HorizontalDivider()
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                Text(workoutResultSummary(result), style = MaterialTheme.typography.bodySmall, modifier = Modifier.weight(1f))
-                                IconButton(onClick = {
-                                    actualDraft = null
-                                    editingResult = item.id
-                                    editingIndex = result.setIndex
-                                }) { Icon(Icons.Default.Edit, contentDescription = "修改实际记录") }
-                                IconButton(onClick = { viewModel.undoSet(session.id, item.id, result.setIndex) }) {
-                                    Icon(painterResource(R.drawable.ic_workout_undo), contentDescription = "撤销完成")
+                    Column(
+                        Modifier.padding(start = 12.dp, top = 8.dp, end = 12.dp, bottom = 12.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        val actions: @Composable ((() -> Unit)?) -> Unit = { editActual ->
+                            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                                if (completed > 0) TextButton(onClick = { showCompleted = !showCompleted }) {
+                                    Text(if (showCompleted) "收起记录" else "查看记录")
+                                    Icon(
+                                        if (showCompleted) Icons.Default.KeyboardArrowUp else Icons.Default.KeyboardArrowDown,
+                                        null, Modifier.size(18.dp)
+                                    )
+                                }
+                                Spacer(Modifier.weight(1f))
+                                if (nextIndex != null) TextButton(onClick = {
+                                    replacingItemId = item.id
+                                    selectingType = exercise.type
+                                }) { Text("更换动作") }
+                                Box {
+                                    IconButton(onClick = { showItemActions = true }) {
+                                        Icon(Icons.Default.MoreVert, contentDescription = "更多动作操作")
+                                    }
+                                    DropdownMenu(showItemActions, { showItemActions = false }) {
+                                        if (editActual != null) DropdownMenuItem(text = { Text("调整实际读数") }, onClick = {
+                                            showItemActions = false
+                                            editActual()
+                                        })
+                                        DropdownMenuItem(text = { Text("订正实际动作 / 器械") }, onClick = {
+                                            showItemActions = false
+                                            correctingItemId = item.id
+                                            selectingType = exercise.type
+                                        })
+                                        if (item.notes.isBlank()) DropdownMenuItem(text = { Text("添加动作备注") }, onClick = {
+                                            showItemActions = false
+                                            editNotes()
+                                        })
+                                        if (isComplete) DropdownMenuItem(text = { Text("追加一组待执行目标") }, onClick = {
+                                            showItemActions = false
+                                            viewModel.appendSessionSet(session.id, item.id)
+                                        })
+                                    }
+                                }
+                            }
+                            if (showCompleted) results.sortedBy { it.setIndex }.forEach { result ->
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Text(workoutResultSummary(result, compact = true), style = MaterialTheme.typography.bodyMedium, modifier = Modifier.weight(1f))
+                                    IconButton(onClick = {
+                                        actualDraft = null
+                                        editingResult = item.id
+                                        editingIndex = result.setIndex
+                                    }) { Icon(Icons.Default.Edit, contentDescription = "修改实际记录") }
+                                    IconButton(onClick = { viewModel.undoSet(session.id, item.id, result.setIndex) }) {
+                                        Icon(painterResource(R.drawable.ic_workout_undo), contentDescription = "撤销完成")
+                                    }
                                 }
                             }
                         }
-                    }
-                    when {
-                        skipped -> Unit
-                        nextIndex != null && isCurrent -> {
-                            val target = item.sets[nextIndex]
+                        if (nextIndex != null && isCurrent) {
+                            val equipment = item.equipmentId?.let { state.record(Kind.equipment, it)?.value<Equipment>() }
                             expandedState.SaveableStateProvider("${session.id}/${item.id}/$nextIndex") {
-                                ActualSetRow(session, item, nextIndex, target, exercise, viewModel,
-                                    historicalLoads[exercise.id to item.equipmentId].orEmpty(),
-                                    choices.weightSteps[weightStepKey(exercise.id, item.equipmentId, inputWeightUnit)] ?: 1.0,
-                                    { value -> preferences.weightStep(weightStepKey(exercise.id, item.equipmentId, inputWeightUnit), value) },
+                                ActualSetRow(
+                                    session, item, nextIndex, item.sets[nextIndex], exercise, equipment, viewModel,
+                                    choices, completed, targetCount,
+                                    image = { modifier -> ExerciseCardImage(
+                                        exercise, state, viewModel.repository, modifier, preferMotion = true
+                                    ) },
                                     onExerciseTimer = { seconds ->
                                         runTimerAction(true) { viewModel.exerciseTimer(session.id, item.id, nextIndex, seconds) }
                                     },
                                     onCompleteSet = { actual ->
                                         val startsRest = willStartRestTimer(session, item.id, nextIndex, actual.restSeconds)
                                         runTimerAction(startsRest) { viewModel.completeSet(session.id, item.id, nextIndex, actual) }
-                                    }) { draft ->
-                                    actualDraft = draft
-                                    editingResult = item.id
-                                    editingIndex = nextIndex
-                                }
+                                    },
+                                    onEditReadings = { draft ->
+                                        actualDraft = draft
+                                        editingResult = item.id
+                                        editingIndex = nextIndex
+                                    },
+                                    actions = actions
+                                )
                             }
+                        } else {
+                            if (item.notes.isNotBlank()) Text(item.notes, style = MaterialTheme.typography.bodySmall)
+                            WorkoutSetProgress(completed, targetCount)
+                            actions(null)
                         }
-                        nextIndex != null -> Text("下一组待执行 · 第 ${nextIndex + 1} 组", style = MaterialTheme.typography.bodySmall)
-                        else -> {
-                            if (completed > 0) TextButton(onClick = { viewModel.appendSessionSet(session.id, item.id) }) { Text("追加一组待执行目标") }
-                        }
-                    }
                     }
                 }
             }
@@ -362,7 +368,6 @@ private fun willStartRestTimer(session: Session, itemId: String, setIndex: Int, 
                     Button(onClick = { selectingType = "strength" }) { Text("添加训练动作") }
                     OutlinedButton(onClick = { selectingType = "stretch" }) { Text("添加拉伸") }
                 }
-                Text("只添加到当天训练，不会修改训练计划。", style = MaterialTheme.typography.bodySmall)
                 TextButton(onClick = { notes = session.notes; editingNotes = true }) { Text("记录训练反馈") }
                 Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                     Button(onClick = { finishMode = "complete" }, enabled = session.results.isNotEmpty()) { Text("完成本次训练") }
@@ -387,8 +392,9 @@ private fun willStartRestTimer(session: Session, itemId: String, setIndex: Int, 
                 side = result?.side ?: "both",
                 restSeconds = if (exercise.type == "stretch") 15 else 90
             )
-            val input = actualDraft ?: target.copy(reps = result?.reps ?: target.reps, seconds = result?.seconds ?: target.seconds,
-                load = result?.load ?: target.load, side = result?.side ?: target.side)
+            val input = actualDraft ?: result?.let {
+                target.copy(reps = it.reps, seconds = it.seconds, load = it.load, side = it.side)
+            } ?: target
             val equipment = item.equipmentId?.let { state.record(Kind.equipment, it)?.value<Equipment>() }
             SetEditor(input, exercise, equipment, true, viewModel,
                 { editingResult = null; actualDraft = null }) { actual, _ ->
@@ -598,12 +604,14 @@ private data class WorkoutSegmentDraft(val reps: String, val load: String, val u
 }
 
 @Composable private fun ActualSetRow(
-    session: Session, item: PlanItem, index: Int, planned: SetTarget, exercise: Exercise, viewModel: TrainingViewModel,
-    historicalLoads: List<Load>, step: Double, onStepChange: (Double) -> Unit,
-    onCompleteSet: (SetTarget) -> Unit, onExerciseTimer: (Int) -> Unit, onEditReadings: (SetTarget) -> Unit
+    session: Session, item: PlanItem, index: Int, planned: SetTarget, exercise: Exercise, equipment: Equipment?,
+    viewModel: TrainingViewModel, choices: DeviceChoices, completed: Int, targetCount: Int,
+    image: @Composable (Modifier) -> Unit, onCompleteSet: (SetTarget) -> Unit,
+    onExerciseTimer: (Int) -> Unit, onEditReadings: (SetTarget) -> Unit,
+    actions: @Composable ((() -> Unit)?) -> Unit
 ) {
     val sessionId = session.id
-    val previous = session.results
+    val previous = session.results.asSequence()
         .filter { it.itemId == item.id && it.setIndex < index }
         .maxByOrNull { it.setIndex }
     val previousSegment = previous?.segments?.lastOrNull()
@@ -615,37 +623,53 @@ private data class WorkoutSegmentDraft(val reps: String, val load: String, val u
     val measurement = targetMeasurement(planned, exercise.measurement)
     val inputGoal = rememberSaveable(sessionId, item.id, index, saver = jsonSaver(SetTarget.serializer())) { inherited }
     val loadTemplate = inputGoal.load ?: planned.load
-    var amount by rememberSaveable(sessionId, item.id, index) { mutableStateOf(inputGoal.load?.let { numericText(it.value) } ?: "") }
-    var reps by rememberSaveable(sessionId, item.id, index) { mutableStateOf(inputGoal.reps?.toString() ?: "") }
-    var seconds by rememberSaveable(sessionId, item.id, index) { mutableStateOf(inputGoal.seconds?.toString() ?: "") }
+    var amount by rememberSaveable(sessionId, item.id, index) { mutableStateOf(inputGoal.load?.let { numericText(it.value) } ?: "0") }
+    var unit by rememberSaveable(sessionId, item.id, index) { mutableStateOf(loadTemplate?.unit ?: equipment?.unit ?: "kg") }
+    var measurementText by rememberSaveable(sessionId, item.id, index) {
+        mutableStateOf(
+            if (measurement == "seconds") (inputGoal.seconds ?: planned.seconds)?.toString().orEmpty()
+            else (inputGoal.reps ?: planned.reps)?.toString().orEmpty()
+        )
+    }
     var submitting by remember(sessionId, item.id, index) { mutableStateOf(false) }
     val persisted = session.results.any { it.itemId == item.id && it.setIndex == index }
     val message by viewModel.message.collectAsStateWithLifecycle()
     LaunchedEffect(persisted, message) {
         if (persisted || message != null) submitting = false
     }
-    fun input() = inputGoal.copy(reps = if (measurement == "reps") intInput(reps, "实际次数") else null, repsMax = null,
-        seconds = if (measurement == "seconds") intInput(seconds, "实际秒数") else null,
-        load = if (amount.isBlank()) null else loadTemplate?.copy(value = doubleInput(amount, "重量")),
-        restSeconds = planned.restSeconds)
-    val commonLoads = remember(historicalLoads, session.items, session.results, item.id, loadTemplate?.unit) {
-        buildList {
-            addAll(historicalLoads)
-            session.results.filter { it.itemId == item.id }.forEach { result ->
-                addAll(result.segments.mapNotNull { it.load } + listOfNotNull(result.load))
+    val timed = measurement == "seconds"
+    fun input(): SetTarget {
+        val value = doubleInput(amount, "重量")
+        val load = when {
+            loadTemplate != null -> loadTemplate.copy(value = value, unit = unit)
+            exercise.type == "strength" || value != 0.0 -> Load(value, unit, equipment?.meaning ?: "total")
+            else -> null
+        }
+        return inputGoal.copy(
+            reps = if (timed) null else intInput(measurementText, "实际次数"), repsMax = null,
+            seconds = if (timed) intInput(measurementText, "实际秒数") else null,
+            load = load, restSeconds = planned.restSeconds
+        )
+    }
+    BoxWithConstraints(Modifier.fillMaxWidth()) {
+        val imageWidth = (maxWidth - 200.dp).coerceIn(64.dp, 112.dp)
+        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            image(Modifier.width(imageWidth).height(106.dp))
+            Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                val field = Modifier.width(128.dp)
+                WorkoutWeightRocker(
+                    amount, { amount = it }, unit,
+                    step = choices.weightSteps[weightStepKey(exercise.id, item.equipmentId, unit)] ?: 1.0,
+                    onUnitClick = { unit = if (unit == "kg") "lb" else "kg" }
+                )
+                WorkoutRockerInput(measurementText, { measurementText = it }, if (timed) "秒" else "次", field)
             }
-            addAll(item.sets.mapNotNull { it.load })
-        }.filter { loadTemplate != null && it.unit == loadTemplate.unit }
-            .distinctBy { it.value }.sortedBy { it.value }
+        }
     }
-    val commonWeights = remember(commonLoads) { commonLoads.map { it.value } }
-    if (loadTemplate != null) {
-        WorkoutWeightInput(amount, { amount = it }, loadTemplate.unit, step, onStepChange, commonWeights = commonWeights)
-    }
-    if (measurement == "seconds") TextInput("实际秒数", seconds, { seconds = it }, numeric = true)
-    else WorkoutCountInput(reps, { reps = it })
-    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-        Button(enabled = !submitting && !persisted, onClick = {
+    if (item.notes.isNotBlank()) Text(item.notes, style = MaterialTheme.typography.bodySmall)
+    WorkoutSetProgress(completed, targetCount)
+    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        Button(enabled = !submitting && !persisted, modifier = Modifier.weight(1f), onClick = {
             submitting = true
             viewModel.dismissMessage()
             viewModel.action {
@@ -654,16 +678,16 @@ private data class WorkoutSegmentDraft(val reps: String, val load: String, val u
                 onCompleteSet(target)
             }
         }) { Text(if (submitting) "正在保存…" else "完成一组") }
-        TextButton(enabled = !submitting && !persisted, onClick = {
-            viewModel.dismissMessage()
-            viewModel.action {
-                val target = input()
-                checkTarget(target)
-                onEditReadings(target)
-            }
-        }) { Text("调整实际读数") }
-        if (measurement == "seconds") TextButton(onClick = {
-            viewModel.action { onExerciseTimer(intInput(seconds, "计时秒数")) }
+        if (timed) TextButton(onClick = {
+            viewModel.action { onExerciseTimer(intInput(measurementText, "计时秒数")) }
         }) { Text("开始计时") }
     }
+    actions(if (submitting || persisted) null else { ->
+        viewModel.dismissMessage()
+        viewModel.action {
+            val target = input()
+            checkTarget(target)
+            onEditReadings(target)
+        }
+    })
 }
