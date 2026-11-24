@@ -1,5 +1,6 @@
 package top.e404.training
 
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
@@ -9,6 +10,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.size
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Check
@@ -18,7 +20,6 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Icon
-import androidx.compose.material3.IconButton
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.luminance
@@ -32,6 +33,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.unit.dp
 import kotlinx.serialization.builtins.nullable
 import top.e404.training.shared.*
@@ -85,16 +87,22 @@ fun CompletedTrainingScreen(session: Session, today: java.time.LocalDate, viewMo
                         Text(exercise.name, style = MaterialTheme.typography.titleMedium, modifier = Modifier.weight(1f))
                         if (complete) Icon(Icons.Default.Check, contentDescription = "动作已完成", tint = if (dark) Color(0xFF81C784) else Color(0xFF2E7D32))
                     }
-                    Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Row(horizontalArrangement = Arrangement.spacedBy(12.dp), verticalAlignment = Alignment.CenterVertically) {
                         ExerciseCardImage(exercise, state, viewModel.repository, Modifier.size(96.dp))
                         Column(Modifier.weight(1f)) {
                             if (results.isEmpty()) Text("无实际记录", style = MaterialTheme.typography.bodySmall)
                             results.forEach { result ->
-                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                Row(
+                                    Modifier.fillMaxWidth().heightIn(min = 36.dp)
+                                        .clickable(role = Role.Button, onClickLabel = "修改实际结果") {
+                                            editingResult = ResultTarget(item.id, result.setIndex)
+                                        }
+                                        .padding(end = 14.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                ) {
                                     Text(workoutResultSummary(result), Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium)
-                                    IconButton(onClick = { editingResult = ResultTarget(item.id, result.setIndex) }) {
-                                        Icon(Icons.Default.Edit, contentDescription = "修改实际结果")
-                                    }
+                                    Icon(Icons.Default.Edit, contentDescription = null, modifier = Modifier.size(20.dp))
                                 }
                             }
                         }
